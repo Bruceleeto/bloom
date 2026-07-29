@@ -263,8 +263,6 @@ lightrec_get_map(struct lightrec_state *state, void **host, u32 kaddr)
 	return map;
 }
 
-unsigned int bloom_n_rw;
-
 u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 		u32 data, u32 *flags, struct block *block, u16 offset)
 {
@@ -272,8 +270,6 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 	const struct lightrec_mem_map_ops *ops;
 	u32 opcode = op.opcode;
 	bool was_tagged = true;
-
-	bloom_n_rw++;
 	u16 old_flags;
 	u32 addr;
 	void *host;
