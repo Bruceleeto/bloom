@@ -263,6 +263,8 @@ lightrec_get_map(struct lightrec_state *state, void **host, u32 kaddr)
 	return map;
 }
 
+unsigned int bloom_n_rw;
+
 u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 		u32 data, u32 *flags, struct block *block, u16 offset)
 {
@@ -270,6 +272,8 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 	const struct lightrec_mem_map_ops *ops;
 	u32 opcode = op.opcode;
 	bool was_tagged = true;
+
+	bloom_n_rw++;
 	u16 old_flags;
 	u32 addr;
 	void *host;
@@ -316,10 +320,32 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 		old_flags = block_set_flags(block, BLOCK_SHOULD_RECOMPILE);
 
 		if (!(old_flags & BLOCK_SHOULD_RECOMPILE)) {
+			unsigned int i;
+
 			pr_debug("Opcode of block at "PC_FMT" has been tagged"
 				 " - flag for recompilation\n", block->pc);
 
-			lut_write(state, lut_offset(block->pc), NULL);
+			/* A block has a LUT entry for every internal branch
+			 * target, not just for its start address. Clearing
+			 * only the start means that re-entering the block
+			 * through any other entry point takes the early exit
+			 * in get_next_block_func(), which never looks at
+			 * BLOCK_SHOULD_RECOMPILE - so the block would stay on
+			 * its stale, untagged code forever.
+			 *
+			 * Clear every entry that points into this block's
+			 * compiled function. Slots covered by this block but
+			 * owned by another one point elsewhere and must be
+			 * left alone: get_next_block_func() never re-installs
+			 * a LUT entry, so clearing them would permanently
+			 * demote those blocks to the slow dispatch path. */
+			for (i = 0; i < block->nb_ops; i++) {
+				u32 offset = lut_offset(block->pc + (i << 2));
+				uintptr_t fn = (uintptr_t)lut_read(state, offset);
+
+				if (fn - (uintptr_t)block->function < block->code_size)
+					lut_write(state, offset, NULL);
+			}
 		}
 	}
 
