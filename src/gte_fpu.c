@@ -37,7 +37,26 @@
 #include <libpcsxcore/gte_divider.h>
 #include <libpcsxcore/psxinterpreter.h>
 
+#include "bloom-config.h"
 #include "gte_fpu.h"
+#if WITH_GTE_PROFILE
+#include "gteprof.h"
+#endif
+
+/*
+ * Every command is its own function.
+ *
+ * They used to be inlined into one dispatch frame, on the reasoning that a
+ * removed call boundary is a removed cost.  It is not when the bodies differ
+ * this much: the shared frame is sized by the largest of them - seven
+ * registers, `pr` and eighty bytes of stack - and the smallest commands pay
+ * all of it.  NCLIP is three multiplies and was measured at 237 cycles inside
+ * that frame against 82 for the same arithmetic in a function of its own.
+ *
+ * NCLIP stays inline because it is a third of all GTE calls and small enough
+ * to set the dispatch frame rather than pay someone else's.
+ */
+#define GTE_CMD static __attribute__((noinline))
 
 /* ------------------------------------------------------------------ */
 /* The COP2 file, by the names gte.c uses                              */
@@ -1002,7 +1021,7 @@ gte_rtp_end_i(psxCP2Regs *r, u32 quotient)
 	gte_end(r);
 }
 
-void gte_fpu_rtps(psxCP2Regs *r)
+__attribute__((noinline)) void gte_fpu_rtps(psxCP2Regs *r)
 {
 	u32 quotient;
 
@@ -1037,7 +1056,7 @@ void gte_fpu_rtps(psxCP2Regs *r)
  * SZ1, SZ2, SZ3 and SXY0, SXY1, SXY2.  MAC, IR and the quotient are left
  * holding the third vertex's values, which is what the depth cue then uses.
  */
-void gte_fpu_rtpt(psxCP2Regs *r)
+__attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
 {
 	u32 quotient = 0;
 	int v;
@@ -1183,7 +1202,7 @@ static void gte_mac_to_rgb(psxCP2Regs *r)
  * exactly.  Both go down the integer path, which is the reference's arithmetic
  * transcribed; it is exact, and neither case is one a game issues in a loop.
  */
-static void gte_mvmva(psxCP2Regs *r, u32 op)
+GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
 {
 	int sf = GTE_SF(op);
 	int mx = GTE_MX(op);
@@ -1229,7 +1248,7 @@ static void gte_mvmva(psxCP2Regs *r, u32 op)
 /* The lighting family                                                 */
 /* ------------------------------------------------------------------ */
 
-static void gte_ncs(psxCP2Regs *r)
+GTE_CMD void gte_ncs(psxCP2Regs *r)
 {
 	gte_flag = 0;
 
@@ -1241,7 +1260,7 @@ static void gte_ncs(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_nct(psxCP2Regs *r)
+GTE_CMD void gte_nct(psxCP2Regs *r)
 {
 	int v;
 
@@ -1260,7 +1279,7 @@ static void gte_nct(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_nccs(psxCP2Regs *r)
+GTE_CMD void gte_nccs(psxCP2Regs *r)
 {
 	gte_flag = 0;
 
@@ -1278,7 +1297,7 @@ static void gte_nccs(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_ncct(psxCP2Regs *r)
+GTE_CMD void gte_ncct(psxCP2Regs *r)
 {
 	int v;
 
@@ -1299,7 +1318,7 @@ static void gte_ncct(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_ncds(psxCP2Regs *r)
+GTE_CMD void gte_ncds(psxCP2Regs *r)
 {
 	gte_flag = 0;
 
@@ -1315,7 +1334,7 @@ static void gte_ncds(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_ncdt(psxCP2Regs *r)
+GTE_CMD void gte_ncdt(psxCP2Regs *r)
 {
 	int v;
 
@@ -1334,7 +1353,7 @@ static void gte_ncdt(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_cc(psxCP2Regs *r)
+GTE_CMD void gte_cc(psxCP2Regs *r)
 {
 	gte_flag = 0;
 
@@ -1349,7 +1368,7 @@ static void gte_cc(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static void gte_cdp(psxCP2Regs *r)
+GTE_CMD void gte_cdp(psxCP2Regs *r)
 {
 	gte_flag = 0;
 
@@ -1387,7 +1406,7 @@ gte_nclip(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_avsz3(psxCP2Regs *r)
 {
 	gte_flag = 0;
@@ -1398,7 +1417,7 @@ gte_avsz3(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_avsz4(psxCP2Regs *r)
 {
 	gte_flag = 0;
@@ -1427,7 +1446,7 @@ gte_avsz4(psxCP2Regs *r)
  * None of the three raises an overflow flag: the reference assigns MAC
  * directly, with no `A1`/`A2`/`A3`.
  */
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_sqr(psxCP2Regs *r, u32 op)
 {
 	float s = gte_sf_scale[GTE_SF(op)];
@@ -1448,7 +1467,7 @@ gte_sqr(psxCP2Regs *r, u32 op)
 }
 
 /* The cross product of IR with the rotation matrix's diagonal. */
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_op(psxCP2Regs *r, u32 op)
 {
 	float s = gte_sf_scale[GTE_SF(op)];
@@ -1471,7 +1490,7 @@ gte_op(psxCP2Regs *r, u32 op)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_dcpl(psxCP2Regs *r, u32 op)
 {
 	int lm = GTE_LM(op);
@@ -1492,7 +1511,7 @@ gte_dcpl(psxCP2Regs *r, u32 op)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_gpf(psxCP2Regs *r, u32 op)
 {
 	float s = gte_sf_scale[GTE_SF(op)];
@@ -1517,7 +1536,7 @@ gte_gpf(psxCP2Regs *r, u32 op)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_gpl(psxCP2Regs *r, u32 op)
 {
 	int shift = 12 * GTE_SF(op);
@@ -1537,7 +1556,7 @@ gte_gpl(psxCP2Regs *r, u32 op)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_dpcs(psxCP2Regs *r, u32 op)
 {
 	int shift = 12 * GTE_SF(op);
@@ -1560,7 +1579,7 @@ gte_dpcs(psxCP2Regs *r, u32 op)
 	gte_end(r);
 }
 
-static void gte_dpct(psxCP2Regs *r)
+GTE_CMD void gte_dpct(psxCP2Regs *r)
 {
 	int v;
 
@@ -1586,7 +1605,7 @@ static void gte_dpct(psxCP2Regs *r)
 	gte_end(r);
 }
 
-static inline __attribute__((always_inline)) void
+GTE_CMD void
 gte_intpl(psxCP2Regs *r, u32 op)
 {
 	int shift = 12 * GTE_SF(op);
@@ -1669,6 +1688,9 @@ static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 void gte_fpu_cmd(psxCP2Regs *r, u32 op)
 {
 	u32 fn = op & 0x3f;
+#if WITH_GTE_PROFILE
+	GTEPROF_ENTER;
+#endif
 
 	if (fn == 0x01)
 		gte_fpu_rtps(r);
@@ -1678,6 +1700,10 @@ void gte_fpu_cmd(psxCP2Regs *r, u32 op)
 		gte_fpu_rtpt(r);
 	else
 		gte_dispatch(r, op);
+
+#if WITH_GTE_PROFILE
+	GTEPROF_LEAVE(fn);
+#endif
 }
 
 /*

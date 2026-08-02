@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #if WITH_FPU_GTE
 /*
@@ -22,6 +23,13 @@
  * this library does not include the core's headers.
  */
 extern uint32_t psxCP2CtrlGen;
+
+/*
+ * One GTE command: the COP2 register file, then the instruction word.  Takes
+ * the register file as void * for the same reason - the type lives in a header
+ * this library does not see, and the two agree on the ABI.
+ */
+extern void gte_fpu_cmd(void *cp2, uint32_t op);
 #endif
 
 #define LIGHTNING_UNALIGNED_32BIT 4
@@ -3002,6 +3010,61 @@ static void rec_CP0(struct lightrec_cstate *state,
 		(*f)(state, block, offset);
 }
 
+#if WITH_FPU_GTE
+/*
+ * A GTE command, called straight from generated code.
+ *
+ * The generic path for a coprocessor opcode is the C wrapper block: it saves
+ * every temporary to the state struct, converts the cycle counter from a delta
+ * to an absolute and back, and reaches the command through two indirect calls
+ * (`lightrec_cp_cb`, then the frontend's `cop2_op`).  None of that is needed
+ * here - the command reads and writes the COP2 file in the state struct and
+ * touches neither the cycle counter nor the guest's general registers - so the
+ * only thing kept is marking the live registers around the call.
+ */
+static void rec_CP2_gte(struct lightrec_cstate *state,
+			const struct block *block, u16 offset)
+{
+	struct regcache *reg_cache = state->reg_cache;
+	union code c = block->opcode_list[offset].c;
+	jit_state_t *_jit = block->_jit;
+	static bool announced;
+	u8 tmp;
+
+	jit_name(__func__);
+	jit_note(__FILE__, __LINE__);
+
+	/* Once, at compile time, so a run says which path it emitted. */
+	if (!announced) {
+		announced = true;
+		printf("GTE: direct call from generated code\n");
+	}
+
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	jit_addi(tmp, LIGHTREC_REG_STATE, lightrec_offset(regs.cp2d));
+
+	/*
+	 * LIGHTREC_REG_STATE is callee-saved and survives the call on its own.
+	 * The temporaries and the cycle register do not, and nothing else is
+	 * going to spill them now that the wrapper block is out of the path.
+	 */
+	lightrec_save_temps(reg_cache, _jit);
+
+	jit_prepare();
+	jit_pushargr(tmp);
+	jit_pushargi(c.opcode);
+
+	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	jit_finishi(gte_fpu_cmd);
+
+	lightrec_free_reg(reg_cache, tmp);
+	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	lightrec_restore_temps(reg_cache, _jit);
+}
+#endif
+
 static void rec_CP2(struct lightrec_cstate *state,
 		    const struct block *block, u16 offset)
 {
@@ -3016,7 +3079,11 @@ static void rec_CP2(struct lightrec_cstate *state,
 		}
 	}
 
+#if WITH_FPU_GTE
+	rec_CP2_gte(state, block, offset);
+#else
 	rec_CP(state, block, offset);
+#endif
 }
 
 static void rec_META(struct lightrec_cstate *state,

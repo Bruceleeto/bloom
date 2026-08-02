@@ -31,6 +31,9 @@
 #if WITH_FPU_GTE
 #include "gte_fpu.h"
 #endif
+#if WITH_GTE_PROFILE && !WITH_FPU_GTE
+#include "gteprof.h"
+#endif
 
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
@@ -147,6 +150,15 @@ static char cache_buf[64 * 1024];
 static void cop2_op(struct lightrec_state *state, u32 func)
 {
 	struct lightrec_registers *regs = lightrec_get_registers(state);
+	static bool announced;
+#if WITH_GTE_PROFILE && !WITH_FPU_GTE
+	GTEPROF_ENTER;
+#endif
+
+	if (unlikely(!announced)) {
+		announced = true;
+		printf("GTE: %s\n", WITH_FPU_GTE ? "SH-4 FPU" : "core C");
+	}
 
 	psxRegs.code = func;
 
@@ -162,6 +174,10 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 		 * so it can be cast to a pcsxCP2Regs pointer. */
 		cp2_ops[func & 0x3f]((psxCP2Regs *) regs->cp2d);
 	}
+#endif
+
+#if WITH_GTE_PROFILE && !WITH_FPU_GTE
+	GTEPROF_LEAVE(func);
 #endif
 }
 

@@ -30,6 +30,9 @@
 #if WITH_FPU_GTE
 #include "gte_fpu.h"
 #endif
+#if WITH_GTE_PROFILE
+#include "gteprof.h"
+#endif
 #include "pvr.h"
 
 int fs_fat_init(void);
@@ -170,6 +173,10 @@ int main(int argc, char **argv)
 #if WITH_FPU_GTE
 	/* Whichever CPU core runs, the coprocessor is this one. */
 	gte_fpu_install();
+#endif
+
+#if WITH_GTE_PROFILE
+	gteprof_init();
 #endif
 
 	if (LoadPlugins() < 0) {
