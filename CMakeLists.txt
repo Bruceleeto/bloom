@@ -114,6 +114,17 @@ set(LIBLIGHTNING_INCLUDE_DIR $<TARGET_PROPERTY:lightning,INTERFACE_INCLUDE_DIREC
 # Include Lightrec's own CMake file
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
+# Run the GTE's coordinate transforms on the SH-4 FPU instead of the core's
+# fixed-point C.  XMTRX is the GTE's when this is on, so src/pvr.c applies its
+# screen transform with multiplies instead of an ftrv.
+option(WITH_FPU_GTE "Run the GTE on the SH-4 FPU" ON)
+
+# Generated code stores to the COP2 control file without calling CTC2, so the
+# recompiler announces the write for the GTE's matrix cache.
+target_compile_definitions(lightrec PRIVATE
+	WITH_FPU_GTE=$<IF:$<BOOL:${WITH_FPU_GTE}>,1,0>
+)
+
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
 math(EXPR CODEBUF_SIZE "0x100000 * ${CODE_BUFFER_SIZE_MB}")
 if (NOT CODEBUF_SIZE)
@@ -180,6 +191,7 @@ target_compile_definitions(libpcsxcore PUBLIC
 	HAVE_CDROM
 	GPUSTATUS_POLLING_THRESHOLD=${WITH_GPUSTATUS_POLLING_THRESHOLD}
 )
+target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)
 target_link_libraries(libpcsxcore PUBLIC lightrec zlib)
 
@@ -273,6 +285,10 @@ add_executable(bloom
 	src/platform.c
 	src/plugins.c
 )
+
+if (WITH_FPU_GTE)
+	target_sources(bloom PRIVATE src/gte_fpu.c)
+endif()
 target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#lightning lightrec libpcsxcore gpu spu
 	#${ZLIB_LIBRARIES} tsunami parallax

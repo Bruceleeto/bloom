@@ -1170,6 +1170,18 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	}
 
 	for (i = 0; i < nb; i++) {
+#if WITH_FPU_GTE
+		/*
+		 * The screen transform is diagonal - two scales and two
+		 * reciprocals - so it is four multiplies.  XMTRX holds the
+		 * GTE's rotation matrix in this build, which is a product
+		 * that actually needs all sixteen words.
+		 */
+		float fr0 = (float)coords[i].x * screen_fw;
+		float fr1 = (float)coords[i].y * screen_fh;
+		float fr2 = (float)coords[i].u * (1.0f / 256.0f);
+		float fr3 = (float)(coords[i].v + voffset) * (1.0f / 1024.0f);
+#else
 		register float fr0 asm("fr0") = (float)coords[i].x;
 		register float fr1 asm("fr1") = (float)coords[i].y;
 		register float fr2 asm("fr2") = (float)coords[i].u;
@@ -1177,6 +1189,7 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 
 		asm inline("ftrv xmtrx, fv0\n"
 			   : "+f"(fr0), "+f"(fr1), "+f"(fr2), "+f"(fr3));
+#endif
 
 		vert = pvr_dr_target();
 

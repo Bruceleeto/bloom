@@ -27,6 +27,11 @@
 #include "mem.h"
 #include "plugin.h"
 
+#include "bloom-config.h"
+#if WITH_FPU_GTE
+#include "gte_fpu.h"
+#endif
+
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
 #endif
@@ -110,6 +115,7 @@ enum my_cp2_opcodes {
 	OP_CP2_NCCT		= 0x3f,
 };
 
+#if !WITH_FPU_GTE
 static void (*cp2_ops[])(struct psxCP2Regs *) = {
 	[OP_CP2_RTPS] = gteRTPS,
 	[OP_CP2_NCLIP] = gteNCLIP,
@@ -134,6 +140,7 @@ static void (*cp2_ops[])(struct psxCP2Regs *) = {
 	[OP_CP2_GPL] = gteGPL,
 	[OP_CP2_NCCT] = gteNCCT,
 };
+#endif
 
 static char cache_buf[64 * 1024];
 
@@ -143,6 +150,11 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 
 	psxRegs.code = func;
 
+#if WITH_FPU_GTE
+	/* This works because regs->cp2c comes right after regs->cp2d,
+	 * so it can be cast to a pcsxCP2Regs pointer. */
+	gte_fpu_cmd((psxCP2Regs *) regs->cp2d, func);
+#else
 	if (unlikely(!cp2_ops[func & 0x3f])) {
 		fprintf(stderr, "Invalid CP2 function %u\n", func);
 	} else {
@@ -150,6 +162,7 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 		 * so it can be cast to a pcsxCP2Regs pointer. */
 		cp2_ops[func & 0x3f]((psxCP2Regs *) regs->cp2d);
 	}
+#endif
 }
 
 static bool has_interrupt(void)
@@ -777,6 +790,11 @@ static void lightrec_plugin_reset(void)
 
 	/* Reset registers */
 	memset(regs, 0, sizeof(*regs));
+
+#if WITH_FPU_GTE
+	/* The control file was just zeroed without a CTC2 to announce it. */
+	gte_fpu_reset();
+#endif
 
 	regs->cp0[12] = 0x10900000; // COP0 enabled | BEV = 1 | TS = 1
 	regs->cp0[15] = 0x00000002; // PRevID = Revision ID, same as R3000A

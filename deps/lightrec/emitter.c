@@ -15,6 +15,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#if WITH_FPU_GTE
+/*
+ * Bumped on every write to a COP2 control register, wherever the write comes
+ * from.  Defined by the core's GTE (libpcsxcore/gte.c); declared here because
+ * this library does not include the core's headers.
+ */
+extern uint32_t psxCP2CtrlGen;
+#endif
+
 #define LIGHTNING_UNALIGNED_32BIT 4
 
 typedef void (*lightrec_rec_func_t)(struct lightrec_cstate *, const struct block *, u16);
@@ -2571,6 +2580,21 @@ static void rec_cp2_basic_CTC2(struct lightrec_cstate *state,
 	}
 
 	lightrec_free_reg(reg_cache, rt);
+
+#if WITH_FPU_GTE
+	/*
+	 * Announce the write.  A GTE that caches anything derived from the
+	 * control file tells whether it went stale by comparing this counter,
+	 * and generated code stores here without going through CTC2.
+	 */
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_ldi_i(tmp, &psxCP2CtrlGen);
+	jit_addi(tmp, tmp, 1);
+	jit_sti_i(&psxCP2CtrlGen, tmp);
+
+	lightrec_free_reg(reg_cache, tmp);
+#endif
 }
 
 static void rec_cp0_RFE(struct lightrec_cstate *state,
