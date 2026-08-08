@@ -46,6 +46,41 @@ lightrec_jump_to_eob(struct lightrec_cstate *state, jit_state_t *_jit)
 	lightrec_jump_to_fn(_jit, state->state->eob_wrapper_func);
 }
 
+/* Direct block linking: when a block ends with a compile-time-known target,
+ * jump straight to the target's code instead of walking the dispatcher. The
+ * target's code LUT slot is a constant address, so the tail reads it with one
+ * absolute load. A NULL slot (target not compiled) or an exhausted cycle
+ * counter falls back to the dispatcher, which handles both exactly as before.
+ * The LUT is already the threaded recompiler's publication point and is
+ * zeroed on invalidation, so the linked edge needs no extra synchronization
+ * and unlinks itself when the target is invalidated. */
+static void
+lightrec_jump_to_eob_linked(struct lightrec_cstate *state, jit_state_t *_jit,
+			    u32 target_pc)
+{
+	void *lut_slot = lut_address(state->state,
+				     lut_offset(kunseg(target_pc)));
+	jit_node_t *to_dispatch, *to_dispatch2;
+
+	/* JIT_V0 holds the target PC here (same contract the dispatcher's
+	 * eob entry point relies on), and JIT_V1 is dead. */
+	to_dispatch = jit_blei(LIGHTREC_REG_CYCLE, 0);
+
+	jit_ldi_i(JIT_V1, lut_slot);
+	to_dispatch2 = jit_beqi(JIT_V1, 0);
+
+	/* Provide what the dispatcher provides on block entry: curr_pc
+	 * synced, and the address mask blocks are compiled to expect. */
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	if (!arch_has_fast_mask())
+		jit_movi(JIT_R1, 0x1fffffff);
+	jit_jmpr(JIT_V1);
+
+	jit_patch(to_dispatch);
+	jit_patch(to_dispatch2);
+	lightrec_jump_to_eob(state, _jit);
+}
+
 static void
 lightrec_jump_to_ds_check(struct lightrec_cstate *state, jit_state_t *_jit)
 {
@@ -117,6 +152,8 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 		jit_movi(JIT_V1, ds->c.i.rt);
 
 		lightrec_jump_to_ds_check(state, _jit);
+	} else if (OPT_LINK_STATIC_EDGES && reg_new_pc < 0) {
+		lightrec_jump_to_eob_linked(state, _jit, imm);
 	} else {
 		lightrec_jump_to_eob(state, _jit);
 	}
@@ -162,7 +199,11 @@ static void lightrec_emit_eob(struct lightrec_cstate *state,
 
 	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 
-	lightrec_jump_to_eob(state, _jit);
+	if (OPT_LINK_STATIC_EDGES)
+		lightrec_jump_to_eob_linked(state, _jit,
+					    block->pc + (offset << 2));
+	else
+		lightrec_jump_to_eob(state, _jit);
 }
 
 static void rec_special_JR(struct lightrec_cstate *state, const struct block *block, u16 offset)
