@@ -33,6 +33,12 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
 
+#ifdef _arch_dreamcast
+#include <arch/timer.h>
+/* Wall time spent inside generated code / dispatcher, for the bench HUD */
+u64 bench_exec_us;
+#endif
+
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #	define LE32TOH(x)	__builtin_bswap32(x)
 #	define HTOLE32(x)	__builtin_bswap32(x)
@@ -643,6 +649,9 @@ static void lightrec_plugin_execute_internal(bool block_only)
 		psxInt.ExecuteBlock(&psxRegs, 0);
 	} else {
 		u32 cycles_lightrec = cycles_pcsx * 1024;
+#ifdef _arch_dreamcast
+		u64 bench_t0 = timer_us_gettime64();
+#endif
 		if (unlikely(use_lightrec_interpreter)) {
 			psxRegs.pc = lightrec_run_interpreter(lightrec_state,
 							      psxRegs.pc,
@@ -651,6 +660,9 @@ static void lightrec_plugin_execute_internal(bool block_only)
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
 		}
+#ifdef _arch_dreamcast
+		bench_exec_us += timer_us_gettime64() - bench_t0;
+#endif
 
 		lightrec_tansition_to_pcsx(lightrec_state);
 

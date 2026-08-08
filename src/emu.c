@@ -122,6 +122,78 @@ bool emu_check_cd(const char *path)
 	return true;
 }
 
+#define BENCH_EXE_WINDOW_MS 5000
+#define BENCH_CD_WINDOW_MS 60000
+#define PSX_CLOCK_HZ 33868800
+
+/* Wall time spent inside generated code, counted in the lightrec plugin */
+extern uint64_t bench_exec_us;
+
+static unsigned int bench_window_ms;
+
+static void *bench_stop_thd(void *arg)
+{
+	uint64_t t0, t, t_prev, exec, exec_prev, exec0, insns;
+	uint32_t cycle, cycle0, cycle_prev, cycles, ms, pc;
+
+	/* Don't count the BIOS boot: arm once the PC reaches the game EXE
+	 * (RAM above the kernel's 64K, below the shell at 0x30000). */
+	do {
+		thd_sleep(100);
+		pc = psxRegs.pc & 0x1fffffff;
+	} while (!psxRegs.stop && (pc < 0x10000 || pc >= 0x30000));
+
+	if (psxRegs.stop)
+		return NULL;
+
+	printf("BENCH: armed at pc %08lx\n", (unsigned long)psxRegs.pc);
+
+	t0 = t_prev = timer_ms_gettime64();
+	cycle0 = cycle_prev = psxRegs.cycle;
+	exec0 = exec_prev = bench_exec_us;
+
+	while (!psxRegs.stop) {
+		thd_sleep(1000);
+
+		t = timer_ms_gettime64();
+		cycle = psxRegs.cycle;
+		exec = bench_exec_us;
+
+		ms = t - t_prev;
+		cycles = cycle - cycle_prev;
+		insns = (uint64_t)cycles * 100 / Config.cycle_multiplier;
+
+		printf("BENCH: %llu k/s, %u%% realtime, %u%% in guest code\n",
+		       (unsigned long long)(insns / ms),
+		       (unsigned int)((uint64_t)cycles * 100
+				      / ((uint64_t)ms * (PSX_CLOCK_HZ / 1000))),
+		       (unsigned int)((exec - exec_prev) / (ms * 10)));
+
+		t_prev = t;
+		cycle_prev = cycle;
+		exec_prev = exec;
+
+		if (t - t0 >= bench_window_ms)
+			break;
+	}
+
+	ms = timer_ms_gettime64() - t0;
+	if (!ms)
+		ms = 1;
+	insns = (uint64_t)(psxRegs.cycle - cycle0) * 100 / Config.cycle_multiplier;
+
+	printf("BENCH: total %llu guest instructions in %lu ms"
+	       " -> %llu k/s, %u%% in guest code\n",
+	       (unsigned long long)insns, (unsigned long)ms,
+	       (unsigned long long)(insns / ms),
+	       (unsigned int)((bench_exec_us - exec0) / (ms * 10)));
+	fflush(stdout);
+
+	psxRegs.stop = 1;
+
+	return NULL;
+}
+
 /* Copy of the default params, but with FSAA enabled */
 static pvr_init_params_t pvr_init_params_fsaa = {
 	.opb_sizes = {
@@ -139,7 +211,10 @@ static pvr_init_params_t pvr_init_params_fsaa = {
 int main(int argc, char **argv)
 {
 	enum vid_display_mode_generic video_mode;
+	const char *bench_path = NULL;
 	bool should_exit;
+	bool bench;
+	file_t fd;
 
 	if (WITH_GDB)
 		gdb_init();
@@ -177,8 +252,32 @@ int main(int argc, char **argv)
 	do {
 		started = false;
 
-		if (WITH_GAME_PATH[0]) {
-			emu_check_cd(WITH_GAME_PATH);
+		bench = false;
+
+		if (WITH_BENCH) {
+			static const char * const bench_paths[] = {
+				"/ide/bloom/game.bin",
+				"/rd/prog.exe",
+			};
+			unsigned int i;
+
+			for (i = 0; !bench && i < 2; i++) {
+				fd = fs_open(bench_paths[i], O_RDONLY);
+				if (fd != -1) {
+					fs_close(fd);
+					bench_path = bench_paths[i];
+					bench = true;
+				}
+			}
+
+			if (bench)
+				bench_window_ms = strstr(bench_path, ".exe")
+					? BENCH_EXE_WINDOW_MS
+					: BENCH_CD_WINDOW_MS;
+		}
+
+		if (bench || WITH_GAME_PATH[0]) {
+			emu_check_cd(bench ? bench_path : WITH_GAME_PATH);
 			ClosePlugins();
 		} else {
 			vid_set_mode(DM_640x480, PM_RGB888P);
@@ -229,6 +328,9 @@ int main(int argc, char **argv)
 
 		psxRegs.stop = 0;
 
+		if (bench)
+			thd_create(1, bench_stop_thd, NULL);
+
 		while (!psxRegs.stop)
 			psxCpu->Execute(&psxRegs);
 
@@ -239,7 +341,7 @@ int main(int argc, char **argv)
 
 		pvr_shutdown();
 		mcd_fs_shutdown();
-	} while (!WITH_GAME_PATH[0]);
+	} while (!bench && !WITH_GAME_PATH[0]);
 
 	printf("Exit...\n");
 	EmuShutdown();

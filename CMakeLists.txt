@@ -31,6 +31,7 @@ endif()
 file(GENERATE OUTPUT revision.h CONTENT "#define REV \"${BLOOM_VERSION}\"\n")
 
 option(WITH_GDB "Enable support for GDB" OFF)
+option(WITH_BENCH "Auto-run /ide/bloom/game.bin (or /rd/prog.exe) and print CPU benchmark stats" ON)
 
 find_library(PARALLAX_LIBRARIES parallax REQUIRED)
 add_library(parallax STATIC IMPORTED)
