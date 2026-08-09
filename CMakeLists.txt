@@ -33,6 +33,16 @@ file(GENERATE OUTPUT revision.h CONTENT "#define REV \"${BLOOM_VERSION}\"\n")
 option(WITH_GDB "Enable support for GDB" OFF)
 option(WITH_BENCH "Auto-run /ide/bloom/game.bin (or /rd/prog.exe) and print CPU benchmark stats" ON)
 
+# PC-sampling profiler over the emitted code buffer, armed and reported with
+# the bench window.  Uses TMU2, which is free.  Splits runtime into emitted
+# code / C called from generated code / frontend, and names the hot host
+# functions.  See src/jitprof.c.
+option(JITPROF "Sample the PC inside emitted code during the bench window" OFF)
+if (JITPROF)
+	add_compile_definitions(JITPROF=1)
+	message(STATUS "JIT profiler: ON (TMU2, reports with the bench window)")
+endif()
+
 find_library(PARALLAX_LIBRARIES parallax REQUIRED)
 add_library(parallax STATIC IMPORTED)
 set_target_properties(parallax PROPERTIES
@@ -269,6 +279,7 @@ add_executable(bloom
 	src/emu.c
 	src/genmenu.cpp
 	src/input.c
+	src/jitprof.c
 	src/mcd.c
 	src/mmap.c
 	src/platform.c

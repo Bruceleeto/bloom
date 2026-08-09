@@ -27,6 +27,7 @@
 
 #include "bloom-config.h"
 #include "emu.h"
+#include "jitprof.h"
 #include "pvr.h"
 
 int fs_fat_init(void);
@@ -148,6 +149,9 @@ static void *bench_stop_thd(void *arg)
 
 	printf("BENCH: armed at pc %08lx\n", (unsigned long)psxRegs.pc);
 
+	/* Sample over exactly the window the k/s number is taken from. */
+	jitprof_start();
+
 	t0 = t_prev = timer_ms_gettime64();
 	cycle0 = cycle_prev = psxRegs.cycle;
 	exec0 = exec_prev = bench_exec_us;
@@ -188,6 +192,8 @@ static void *bench_stop_thd(void *arg)
 	       (unsigned long long)(insns / ms),
 	       (unsigned int)((bench_exec_us - exec0) / (ms * 10)));
 	fflush(stdout);
+
+	jitprof_report();
 
 	psxRegs.stop = 1;
 

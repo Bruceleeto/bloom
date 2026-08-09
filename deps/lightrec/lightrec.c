@@ -21,6 +21,13 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#ifdef JITPROF
+#include <stdio.h>
+/* Owned by src/jitprof.c: 1 while the guest is running inside the dispatcher
+ * call, so PC samples that land in host C can be attributed to generated
+ * code rather than to the frontend, the plugins or the CD. */
+extern volatile int jitprof_in_jit;
+#endif
 #include <limits.h>
 #if ENABLE_THREADED_COMPILER
 #include <stdatomic.h>
@@ -1815,6 +1822,9 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 	state->target_cycle = target_cycle;
 	state->curr_pc = pc;
 
+#ifdef JITPROF
+	jitprof_in_jit = 1;
+#endif
 	block_trace = get_next_block_func(state, pc);
 	if (block_trace) {
 		cycles_delta = state->target_cycle - state->current_cycle;
@@ -1824,6 +1834,9 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 
 		state->current_cycle = state->target_cycle - cycles_delta;
 	}
+#ifdef JITPROF
+	jitprof_in_jit = 0;
+#endif
 
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_reaper_reap(state->reaper);
@@ -1989,6 +2002,19 @@ struct lightrec_state * lightrec_init(char *argv0,
 	state->c_wrapper_block = generate_wrapper(state);
 	if (!state->c_wrapper_block)
 		goto err_free_dispatcher;
+
+#ifdef JITPROF
+	/* The dispatcher and the RW wrapper are emitted before any block, so
+	 * they sit at the bottom of the code buffer at fixed addresses.
+	 * Printing them lets a PC-sampling profile name its hot buckets
+	 * without disassembling anything. */
+	printf("JITPROF: dispatcher %p  rw-wrapper %p\n"
+	       "JITPROF: eob %p  next-block %p  interp %p  ds-check %p  memset %p\n",
+	       state->dispatcher->function, state->c_wrapper_block->function,
+	       state->eob_wrapper_func, state->get_next_block,
+	       state->interpreter_func, state->ds_check_func,
+	       state->memset_func);
+#endif
 
 	state->c_wrappers[C_WRAPPER_RW] = lightrec_rw_cb;
 	state->c_wrappers[C_WRAPPER_RW_GENERIC] = lightrec_rw_generic_cb;
