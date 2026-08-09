@@ -34,6 +34,9 @@ struct native_register {
 struct regcache {
 	struct lightrec_state *state;
 	struct native_register lightrec_regs[NUM_REGS + NUM_TEMPS];
+	/* Sink for host registers lightrec does not manage — see
+	 * lightning_reg_to_lightrec(). */
+	struct native_register unmanaged;
 };
 
 static const char * mips_regs[] = {
@@ -97,6 +100,39 @@ static inline u8 lightrec_reg_to_lightning(const struct regcache *cache,
 static inline struct native_register * lightning_reg_to_lightrec(
 		struct regcache *cache, u8 reg)
 {
+#if defined(__sh__) && JIT_SH_FORK
+	/* The fork's V pool is not contiguous — V0..V4 = r8..r12,
+	 * V5..V8 = r4..r7, V9 = r13 — so the arithmetic below, which assumes
+	 * jit_v(i) is JIT_V0 +/- i, does not hold.  Invert the map by hand.
+	 * See jit_v() in lightning/jit_sh.h for why it is ordered that way. */
+	{
+		unsigned int idx;
+
+		if (reg >= _R8 && reg <= _R12)
+			idx = reg - _R8;		/* V0..V4 */
+		else if (reg >= _R4 && reg <= _R7)
+			idx = reg - _R4 + 5;		/* V5..V8 */
+		else if (reg == _R13)
+			idx = 9;			/* V9, the state pointer */
+		else if (reg >= JIT_R(FIRST_TEMP)
+			 && reg < JIT_R(FIRST_TEMP) + NUM_TEMPS)
+			return &cache->lightrec_regs[NUM_REGS + reg
+						     - JIT_R(FIRST_TEMP)];
+		else
+			return &cache->unmanaged;
+
+		/* A V register at or past NUM_REGS is one we do not manage:
+		 * the state pointer, or an argument register this NUM_REGS
+		 * has not claimed.  Give those a sink rather than indexing
+		 * past the array — the contiguous version aliased them onto
+		 * the temp slots, which is silent corruption waiting for
+		 * someone to actually ask. */
+		if (idx >= NUM_REGS)
+			return &cache->unmanaged;
+
+		return &cache->lightrec_regs[idx];
+	}
+#else
 	if ((JIT_V0 > JIT_R0 && reg >= JIT_V0) ||
 			(JIT_V0 < JIT_R0 && reg < JIT_R0)) {
 		if (JIT_V1 > JIT_V0)
@@ -109,6 +145,7 @@ static inline struct native_register * lightning_reg_to_lightrec(
 		else
 			return &cache->lightrec_regs[NUM_REGS + JIT_R(FIRST_TEMP) - reg];
 	}
+#endif
 }
 
 u8 lightrec_get_reg_in_flags(struct regcache *cache, u8 jit_reg)

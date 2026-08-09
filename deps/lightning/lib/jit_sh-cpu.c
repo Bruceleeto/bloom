@@ -267,7 +267,20 @@ static void _cd(jit_state_t*,jit_uint16_t,jit_uint16_t);
 
 #    define ii(i)			*_jit->pc.us++ = i
 
-#    define stack_framesize		((JIT_V_NUM + 2) * 4)
+/* Words 0..3 of every frame (FP+0..FP+12) are the C-call shim's spill slots
+ * for r4-r7: written at jit_code_prepare, reloaded after calli/callr, and
+ * read by pushargr when an argument's source register is r4-r7.  Register
+ * saves sit above them.  Max save index is SHIM_SLOTS + JIT_V_NUM + 1 = 15,
+ * the ceiling of the 4-bit @(disp,Rn) encoding. */
+#    define SHIM_SLOTS			4
+#    define stack_framesize		((SHIM_SLOTS + JIT_V_NUM + 2) * 4)
+/* 0 disables the spill/reload emissions at the prepare and call nodes; the
+ * frame still reserves the slots either way.  Must match JIT_SH_WIDE_POOL
+ * (jit_sh.h) — the wide pool without the shim hands out registers the next
+ * C call destroys. */
+#    ifndef JIT_SH_SHIM
+#    define JIT_SH_SHIM			JIT_SH_FORK
+#    endif
 
 #    define PR_FLAG			(1 << 19)
 #    define SZ_FLAG			(1 << 20)
@@ -878,12 +891,27 @@ _movi(jit_state_t *_jit, jit_uint16_t r0, jit_word_t i0)
 	}
 }
 
-static void
+/* BUG FIX - the patch address was recorded before allocation, so a spill
+ * emitted by jit_get_reg() moved the real target away from it.
+ * Independent of JIT_SH_FORK; wrong in the stock backend too.
+ *
+ * Returns the address of the instruction a later patch_at() must rewrite,
+ * which is NOT always the w passed in: on the far/patchable path below,
+ * jit_get_reg() may spill a register first, emitting instructions ahead of
+ * the movi_p this function is about to place.  Every caller captures w
+ * before calling and used to return it verbatim, so the recorded patch
+ * address landed on the spill's `mov #imm,r0` instead of the LDPL — and a
+ * `mov #imm` has top nibble 0xe, which patch_at dispatches into
+ * patch_abs(), corrupting four instructions at stride 4.
+ *
+ * w is still taken as an argument because the short-branch displacement is
+ * measured from it. */
+static jit_word_t
 emit_branch_opcode(jit_state_t *_jit, jit_word_t i0, jit_word_t w,
 		   int t_set, int force_patchable)
 {
 	jit_int32_t disp = (i0 - w >> 1) - 2;
-	jit_uint16_t reg;
+	jit_word_t patch_w = w;
 
 	if (!force_patchable && i0 == 0) {
 		/* Positive displacement - we don't know the target yet. */
@@ -905,21 +933,34 @@ emit_branch_opcode(jit_state_t *_jit, jit_word_t i0, jit_word_t w,
 		else
 			BF(disp);
 	} else {
-		reg = jit_get_reg(jit_class_gpr);
+		/* BUG FIX - jit_get_reg() can hand back a register the client
+		 * is keeping live across the branch, which then gets
+		 * overwritten with the jump address.  Independent of
+		 * JIT_SH_FORK; wrong in the stock backend too.
+		 *
+		 * _R0, not jit_get_reg(): the target register is still live
+		 * when the branch is taken, so it must not be one the code
+		 * on the far side depends on, and jit_get_reg() has no way
+		 * to know which those are.  A client keeping a value live
+		 * across a branch would get it overwritten with the jump
+		 * address.  r0 is the backend's scratch, dead across a jump,
+		 * and never allocatable — the same reason _jmpi and _calli
+		 * use it. */
+		patch_w = _jit->pc.w;
 
 		if (force_patchable)
-			movi_p(rn(reg), i0);
+			movi_p(_R0, i0);
 		else
-			movi(rn(reg), i0);
+			movi(_R0, i0);
 		if (t_set)
 			BF(0);
 		else
 			BT(0);
-		JMP(rn(reg));
+		JMP(_R0);
 		NOP();
-
-		jit_unget_reg(reg);
 	}
+
+	return (patch_w);
 }
 
 static void _maybe_emit_frchg(jit_state_t *_jit)
@@ -2504,7 +2545,7 @@ _bger(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 
 	CMPGE(r0, r1);
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, t, p);
+	w = emit_branch_opcode(_jit, i0, w, t, p);
 
 	return (w);
 }
@@ -2519,7 +2560,7 @@ _bger_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 
 	CMPHS(r0, r1);
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, t, p);
+	w = emit_branch_opcode(_jit, i0, w, t, p);
 
 	return (w);
 }
@@ -2540,7 +2581,7 @@ _beqr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	} else {
 		CMPEQ(r0, r1);
 		w = _jit->pc.w;
-		emit_branch_opcode(_jit, i0, w, 1, p);
+		w = emit_branch_opcode(_jit, i0, w, 1, p);
 	}
 
 	return (w);
@@ -2556,7 +2597,7 @@ _bner(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 
 	CMPEQ(r0, r1);
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, 0, p);
+	w = emit_branch_opcode(_jit, i0, w, 0, p);
 
 	return (w);
 }
@@ -2576,7 +2617,7 @@ _bmsr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		maybe_emit_tst(_jit, r0, &set);
 
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2596,7 +2637,7 @@ _bmcr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		maybe_emit_tst(_jit, r0, &set);
 
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2618,7 +2659,7 @@ _bgti(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPGT(r0, _R0);
 	}
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2640,7 +2681,7 @@ _bgei(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPGE(r0, _R0);
 	}
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2662,7 +2703,7 @@ _bgti_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPHI(r0, _R0);
 	}
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2680,7 +2721,7 @@ _bgei_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	movi(_R0, i1);
 	CMPHS(r0, _R0);
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2704,7 +2745,7 @@ static jit_word_t _beqi(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPEQ(_R0, r0);
 	}
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2721,7 +2762,7 @@ static jit_word_t _bmsi(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	movi(_R0, i1);
 	TST(_R0, r0);
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2736,7 +2777,7 @@ static jit_word_t _boaddr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	ADDV(r0, r1);
 
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2752,7 +2793,7 @@ static jit_word_t _boaddr_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	ADDC(r0, r1);
 
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2800,7 +2841,7 @@ static jit_word_t _bosubr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	ADDV(r0, _R0);
 
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2816,7 +2857,7 @@ static jit_word_t _bosubr_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	SUBC(r0, r1);
 
 	w = _jit->pc.w;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -2880,12 +2921,20 @@ _jmpi(jit_state_t *_jit, jit_word_t i0, jit_bool_t force)
 
 		jit_unget_reg(reg);
 	} else {
-		reg = jit_get_reg(jit_class_gpr);
-
-		movi(rn(reg), i0);
-		jmpr(rn(reg));
-
-		jit_unget_reg(reg);
+		/* BUG FIX - jit_get_reg() can hand back a register the client
+		 * is keeping live across the jump, which then gets
+		 * overwritten with the target address.  Independent of
+		 * JIT_SH_FORK; wrong in the stock backend too.
+		 *
+		 * _R0, not jit_get_reg(): r0 is this backend's scratch
+		 * (class 0 in _rvs[], never allocatable), which is what
+		 * _calli below already relies on.  Allocating here can hand
+		 * back a register the caller is keeping live across the
+		 * jump, and jit_get_reg only reasons about liveness within
+		 * one emission — it has no concept of "live across a jump"
+		 * and cannot be asked to respect one. */
+		movi(_R0, i0);
+		jmpr(_R0);
 	}
 
 	return (w);
@@ -2943,6 +2992,9 @@ _jmpi_p(jit_state_t *_jit, jit_word_t i0)
 
     set_fmode(_jit, SH_DEFAULT_FPU_MODE);
 
+    /* NOT _R0, unlike _jmpi: this variant also emits the jump to the
+     * epilog for jit_ret and jit_retr (jit_code_jmpi with a
+     * jit_code_epilog target), and by then r0 holds the return value. */
     reg = jit_get_reg(jit_class_gpr);
     w = movi_p(rn(reg), i0);
     jmpr(rn(reg));
@@ -3054,6 +3106,21 @@ _patch_abs(jit_state_t *_jit, jit_word_t instr, jit_word_t label)
 {
 	jit_instr_t *ptr = (jit_instr_t *)instr;
 
+	/* BUG FIX - this silently corrupted four instructions whenever
+	 * patch_at() was handed an address it had never been given.
+	 * Independent of JIT_SH_FORK.
+	 *
+	 * Stamps one byte of the label into the immediate of four MOVIs at
+	 * stride 4.  Nothing in this backend emits that pattern any more —
+	 * the patchable forms all go through _movi_p, which is a single LDPL
+	 * (top nibble 0xd) — so this is only reachable if patch_at is given
+	 * an address it was never handed, which merely happens to start with
+	 * a 0xe nibble.  Assert rather than write: it wrecks four
+	 * instructions per call and preserves each opcode's high byte, so
+	 * the damage is close to invisible afterwards. */
+	assert(ptr[0].ni.c == 0xe && ptr[2].ni.c == 0xe &&
+	       ptr[4].ni.c == 0xe && ptr[6].ni.c == 0xe);
+
 	ptr[0].ni.i = (label >> 24) & 0xff;
 	ptr[2].ni.i = (label >> 16) & 0xff;
 	ptr[4].ni.i = (label >> 8) & 0xff;
@@ -3114,7 +3181,11 @@ _patch_at(jit_state_t *_jit, jit_word_t instr, jit_word_t label)
 		}
 		break;
 	default:
-		assert("unhandled branch opcode");
+		/* BUG FIX - the bang was missing, and assert("literal") is
+		 * always true, so every patch aimed at an opcode this
+		 * function cannot patch was swallowed silently, with or
+		 * without NDEBUG.  Independent of JIT_SH_FORK. */
+		assert(!"unhandled branch opcode");
 	}
 }
 
@@ -3138,14 +3209,14 @@ _prolog(jit_state_t *_jit, jit_node_t *node)
 				   _jitc->function->self.aoff) + 7) & -8;
 
 	ADDI(JIT_SP, -stack_framesize);
-	STDL(JIT_SP, JIT_FP, JIT_V_NUM + 1);
+	STDL(JIT_SP, JIT_FP, SHIM_SLOTS + JIT_V_NUM + 1);
 
 	STSPR(_R0);
-	STDL(JIT_SP, _R0, JIT_V_NUM);
+	STDL(JIT_SP, _R0, SHIM_SLOTS + JIT_V_NUM);
 
 	for (regno = 0; regno < JIT_V_NUM; regno++)
 		if (jit_regset_tstbit(&_jitc->function->regset, JIT_V(regno)))
-			STDL(JIT_SP, JIT_V(regno), regno);
+			STDL(JIT_SP, JIT_V(regno), SHIM_SLOTS + regno);
 
 	movr(JIT_FP, JIT_SP);
 
@@ -3197,12 +3268,12 @@ _epilog(jit_state_t *_jit, jit_node_t *node)
 
 	for (i = JIT_V_NUM; i > 0; i--)
 		if (jit_regset_tstbit(&_jitc->function->regset, JIT_V(i - 1)))
-			LDDL(JIT_V(i - 1), JIT_SP, i - 1);
+			LDDL(JIT_V(i - 1), JIT_SP, SHIM_SLOTS + i - 1);
 
-	LDDL(JIT_FP, JIT_SP, JIT_V_NUM);
+	LDDL(JIT_FP, JIT_SP, SHIM_SLOTS + JIT_V_NUM);
 	LDSPR(JIT_FP);
 
-	LDDL(JIT_FP, JIT_SP, JIT_V_NUM + 1);
+	LDDL(JIT_FP, JIT_SP, SHIM_SLOTS + JIT_V_NUM + 1);
 	RTS();
 	ADDI(JIT_SP, stack_framesize);
 }

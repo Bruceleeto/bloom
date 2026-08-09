@@ -63,9 +63,32 @@ static void _patch(jit_state_t*,jit_word_t,jit_node_t*);
 
 jit_register_t _rvs[] = {
     { 0x0,				"r0" },
+#if JIT_SH_FORK
+    /* r1 carries no class, like r0: lightrec pins its cycle counter here
+     * (LIGHTREC_REG_CYCLE = JIT_R0 = _R1) and only names it directly, never
+     * allocating it.  jit_get_reg's second pass ignores reglive and spills
+     * whatever it finds first, so under the wide pool's register pressure
+     * it was handing out r1 — and a spill whose reload sits after a jump
+     * is never executed.  jit_r_num() stays 3: lightrec's own temps are
+     * JIT_R1/JIT_R2 (FIRST_TEMP 1), so nothing allocates JIT_R0. */
+    { 0x1,				"r1" },
+#else
     { rc(gpr) | 0x1,			"r1" },
+#endif
     { rc(gpr) | 0x2,			"r2" },
     { rc(gpr) | 0x3,			"r3" },
+    /* r4-r7 keep rc(arg) only, never rc(sav), even though the C-call shim
+     * does preserve them across calli/callr.  Marking them callee-saved
+     * would be a lie the backend cannot make good on: jit_get_reg records
+     * every rc(sav) register it hands out into function->regset and sets
+     * _jitc->again, on the contract that the prolog will save it — and
+     * lightrec compiles each block as jit_prolog + jit_tramp, where _prolog
+     * returns immediately on assume_frame and emits no saves at all.  The
+     * register would then be used as scratch and never restored.
+     *
+     * Nothing is lost by leaving them rc(arg): lightrec allocates its V
+     * registers by name and marks them live, so the allocator's first pass
+     * skips them anyway. */
     { rc(arg) | rc(gpr) | 0x4,		"r4" },
     { rc(arg) | rc(gpr) | 0x5,		"r5" },
     { rc(arg) | rc(gpr) | 0x6,		"r6" },
@@ -573,6 +596,7 @@ _emit_code(jit_state_t *_jit)
 	jit_int32_t	 info_offset;
 #endif
 	jit_int32_t	 const_offset;
+	jit_int32_t	 const_length;
 	jit_int32_t	 patch_offset;
     } undo;
 #if DEVEL_DISASSEMBLER
@@ -595,7 +619,7 @@ _emit_code(jit_state_t *_jit)
 #if DISASSEMBLER
     undo.info_offset =
 #endif
-    undo.const_offset = undo.patch_offset = 0;
+    undo.const_offset = undo.const_length = undo.patch_offset = 0;
 #define case_rr(name, type)						\
 	    case jit_code_##name##r##type:				\
 		name##r##type(rn(node->u.w), rn(node->v.w));		\
@@ -1221,7 +1245,28 @@ _emit_code(jit_state_t *_jit)
 		flush_consts(0);
 		break;
 	    case jit_code_callr:
+		/* The shim parked r4-r7 in the frame slots at the prepare
+		 * node, and argument marshalling may have overwritten them
+		 * since.  An indirect call whose target register is one of
+		 * them must therefore be called through its prepare-time
+		 * value: reload that into r0, which the call clobbers
+		 * anyway, and call through it.  Writing a V register that
+		 * maps to r4-r7 between prepare and the call is forbidden by
+		 * the shim contract, so the slot holds the right target.
+		 *
+		 * Register substitution can place a call target in r4-r7 even
+		 * when the caller took care not to. */
+#if JIT_SH_SHIM
+		if (rn(node->u.w) >= 4 && rn(node->u.w) <= 7) {
+		    LDDL(_R0, JIT_FP, rn(node->u.w) - 4);
+		    callr(_R0);
+		} else
+#endif
 		callr(rn(node->u.w));
+#if JIT_SH_SHIM
+		for (word = 0; word < SHIM_SLOTS; word++)
+		    LDDL(_R4 + word, JIT_FP, word);
+#endif
 		break;
 	    case jit_code_calli:
 		if (node->flag & jit_flag_node) {
@@ -1237,6 +1282,10 @@ _emit_code(jit_state_t *_jit)
 		}
 		else
 		    calli(node->u.w);
+#if JIT_SH_SHIM
+		for (word = 0; word < SHIM_SLOTS; word++)
+		    LDDL(_R4 + word, JIT_FP, word);
+#endif
 		break;
 	    case jit_code_prolog:
 		_jitc->function = _jitc->functions.ptr + node->w.w;
@@ -1247,6 +1296,15 @@ _emit_code(jit_state_t *_jit)
 #endif
 		undo.data = _jitc->consts.data;
 		undo.const_offset = _jitc->consts.offset;
+		/* BUG FIX - the retry in jit_code_epilog restored only one of
+		 * two cursors that have to move together.  Independent of
+		 * JIT_SH_FORK.
+		 *
+		 * Saved alongside the offset: consts.patches[] is a pair
+		 * array whose odd entries index consts.values[] by
+		 * consts.length, so restoring one cursor without the other
+		 * desynchronises the two.  See the restart in jit_code_epilog. */
+		undo.const_length = _jitc->consts.length;
 		undo.patch_offset = _jitc->patches.offset;
 #if DISASSEMBLER
 		if (_jitc->data_info.ptr)
@@ -1274,6 +1332,32 @@ _emit_code(jit_state_t *_jit)
 		    invalidate_consts();
 		    _jitc->consts.data = undo.data;
 		    _jitc->consts.offset = undo.const_offset;
+		    /* BUG FIX - restoring consts.offset without consts.length
+		     * left the two cursors desynchronised, so flush_consts()
+		     * handed stale addresses to patch_at().  Independent of
+		     * JIT_SH_FORK.
+		     *
+		     * invalidate_consts() zeroed length as well as offset, and
+		     * the restore below it only ever put the offset back — so
+		     * a retry resumed with offset > 0 and length == 0.  The
+		     * pairs below undo.const_offset belong to an earlier
+		     * function whose code is NOT rewound (undo.word starts
+		     * this one), so they are still valid and must be kept;
+		     * what was lost was the values[] cursor they index.  The
+		     * next load_const then wrote at index 0, colliding with
+		     * them, and flush_consts() handed their addresses to
+		     * patch_at() — which by then pointed at freshly emitted
+		     * instructions.  A 0xe top nibble (any mov #imm,rn) sends
+		     * that into patch_abs(), stamping one byte of the label
+		     * into four instructions at stride 4 and preserving each
+		     * opcode's high byte, which is why it was near-invisible.
+		     *
+		     * Only reachable when a spill slot is allocated during
+		     * emission (jit_get_reg sets _jitc->again), which is why
+		     * it stayed hidden until the wide register pool made
+		     * lightning spill.  Restore sequence inherited from
+		     * jit_arm.c:2251-2254, which has the same asymmetry. */
+		    _jitc->consts.length = undo.const_length;
 		    _jitc->patches.offset = undo.patch_offset;
 #if DISASSEMBLER
 		    if (_jitc->data_info.ptr)
@@ -1359,8 +1443,19 @@ _emit_code(jit_state_t *_jit)
 	    case jit_code_retval_s:		case jit_code_retval_us:
 	    case jit_code_retval_i:
 	    case jit_code_retval_f:		case jit_code_retval_d:
-	    case jit_code_prepare:
 	    case jit_code_finishr:		case jit_code_finishi:
+		break;
+	    /* This case must NOT be reachable by fall-through: the long
+	     * no-op case group above ends at the break just before it. */
+	    case jit_code_prepare:
+		/* C-call shim, part 1: park r4-r7 in the frame's shim slots.
+		 * Argument marshalling is free to clobber them; pushargr
+		 * reads r4-r7-sourced arguments from these slots, and the
+		 * call cases reload all four after the C function returns. */
+#if JIT_SH_SHIM
+		for (word = 0; word < SHIM_SLOTS; word++)
+		    STDL(JIT_FP, _R4 + word, word);
+#endif
 		break;
 	    case jit_code_casr:
 		casr(rn(node->u.w), rn(node->v.w),
@@ -1819,12 +1914,29 @@ _jit_getarg_i(jit_state_t *_jit, jit_int32_t u, jit_node_t *v)
 void
 _jit_pushargr(jit_state_t *_jit, jit_int32_t u, jit_code_t code)
 {
+    jit_int32_t		regno;
+    jit_bool_t		shimmed;
     jit_code_inc_synth_w(code, u);
     jit_link_prepare();
     assert(_jitc->function);
+    /* An argument whose source lives in r4-r7 must be read from the shim
+     * slots (filled at the prepare node): marshalling an earlier argument
+     * may already have overwritten the source register. */
+    shimmed = u >= JIT_RA0 && u < JIT_RA0 + NUM_WORD_ARGS;
     if (jit_arg_reg_p(_jitc->function->call.argi)) {
-	jit_movr(JIT_RA0 + _jitc->function->call.argi, u);
+	if (shimmed)
+	    jit_ldxi_i(JIT_RA0 + _jitc->function->call.argi, JIT_FP,
+		       (u - JIT_RA0) * 4);
+	else
+	    jit_movr(JIT_RA0 + _jitc->function->call.argi, u);
 	++_jitc->function->call.argi;
+    }
+    else if (shimmed) {
+	regno = jit_get_reg(jit_class_gpr);
+	jit_ldxi_i(regno, JIT_FP, (u - JIT_RA0) * 4);
+	jit_stxi(_jitc->function->call.size, JIT_SP, regno);
+	_jitc->function->call.size += STACK_SLOT;
+	jit_unget_reg(regno);
     }
     else {
 	jit_stxi(_jitc->function->call.size, JIT_SP, u);
@@ -1859,6 +1971,10 @@ _jit_finishr(jit_state_t *_jit, jit_int32_t r0)
 {
     jit_node_t		*call;
     assert(_jitc->function);
+    /* A call target in r4-r7 would already be clobbered by argument
+     * marshalling when the call executes.  No caller in this tree does
+     * that; the raw jit_callr path is guarded on the lightrec side. */
+    assert(!(r0 >= JIT_RA0 && r0 < JIT_RA0 + NUM_WORD_ARGS));
     jit_inc_synth_w(finishr, r0);
     if (_jitc->function->self.alen < _jitc->function->call.size)
 	_jitc->function->self.alen = _jitc->function->call.size;

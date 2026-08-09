@@ -1219,6 +1219,14 @@ static void call_to_c_wrapper(struct lightrec_cstate *state,
 
 	tmp = lightrec_get_reg_with_value(reg_cache,
 					  (intptr_t) state->state->c_wrapper);
+#if defined(__sh__) && JIT_SH_FORK
+	/* Under the fork r4-r7 are V registers, so the cached copy of the
+	 * wrapper address can land in one — but they are also the C argument
+	 * registers, and marshalling would overwrite the call target before
+	 * the jit_callr below executes.  Force a reload into a temp. */
+	if (tmp >= _R4 && tmp <= _R7)
+		tmp = -1;
+#endif
 	if (tmp < 0) {
 		tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
 		jit_ldxi(tmp, LIGHTREC_REG_STATE, lightrec_offset(c_wrapper));

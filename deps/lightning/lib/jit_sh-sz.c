@@ -8,7 +8,7 @@
     0,	/* #name */
     0,	/* #note */
     0,	/* label */
-    40,	/* prolog */
+    64,	/* prolog */
     0,	/* ellipsis */
     0,	/* va_push */
     0,	/* allocai */
@@ -234,9 +234,9 @@
     20,	/* bxsubi_u */
     4,	/* jmpr */
     10,	/* jmpi */
-    4,	/* callr */
-    10,	/* calli */
-    0,	/* prepare */
+    14,	/* callr */
+    18,	/* calli */
+    8,	/* prepare */
     0,	/* pushargr_c */
     0,	/* pushargi_c */
     0,	/* pushargr_uc */
@@ -275,7 +275,7 @@
     0,	/* retval_i */
     0,	/* retval_ui */
     0,	/* retval_l */
-    22,	/* epilog */
+    48,	/* epilog */
     0,	/* arg_f */
     0,	/* getarg_f */
     0,	/* putargr_f */

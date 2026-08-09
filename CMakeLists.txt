@@ -73,6 +73,29 @@ if (WITH_FASTMEM)
 	link_libraries(fastmem)
 endif(WITH_FASTMEM)
 
+# SH-4 backend fork: the four C argument registers r4-r7 join lightning's V
+# pool, with a spill/reload shim around C calls keeping them alive across
+# the ABI boundary, taking a client from six V registers to ten.
+#
+# Measured neutral on hardware so far, so it is OFF by default; it exists as
+# groundwork for pinning hot guest registers, which is where the win is
+# expected.  Must be global rather than per-target: it changes JIT_V_NUM and
+# lightrec sizes its register pool off that, so lightning and lightrec
+# miscompile silently if they disagree.
+option(SH_FORK "Enable the forked SH-4 register model (wide V pool + C-call shim)" OFF)
+if (SH_FORK)
+	add_compile_definitions(JIT_SH_FORK=1)
+	message(STATUS "SH-4 backend fork: ON (wide V pool + C-call shim)")
+endif()
+
+# Keep lightning's asserts while the fork is in use.  They only run during
+# block compilation, never on the execution path, and they are the
+# difference between a named failure and silent corruption: jit_get_reg
+# returns JIT_NOREG when it runs out of registers, and rn(-1) then indexes
+# _rvs[-1] and ORs the garbage straight into the emitted instruction.
+# Several bugs in this backend hid behind NDEBUG.
+option(SH_LIGHTNING_ASSERTS "Keep GNU lightning's asserts in the build" ${SH_FORK})
+
 set(LIGHTNING_DIR deps/lightning CACHE STRING "GNU Lightning directory")
 file(REAL_PATH ${LIGHTNING_DIR} LIGHTNING_REAL_DIR EXPAND_TILDE)
 
@@ -103,6 +126,10 @@ target_include_directories(lightning PUBLIC
 )
 target_compile_definitions(lightning PRIVATE HAVE_MMAP=0 SH_HAS_FPU=0)
 target_compile_options(lightning PRIVATE -Wno-unused-function -Wno-unused-variable -Wno-parentheses -Wno-format)
+if (SH_LIGHTNING_ASSERTS)
+	target_compile_options(lightning PRIVATE -UNDEBUG)
+	message(STATUS "GNU lightning: asserts enabled")
+endif()
 
 # Force these two options to get Bloom to build and work properly
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)

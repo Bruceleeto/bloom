@@ -23,11 +23,60 @@
 #define JIT_HASH_CONSTS		0
 #define JIT_NUM_OPERANDS	2
 
+/* SH-4 register-model fork, off by default.
+ *
+ * Stock exposes six V registers, r8-r13.  With the fork the four C
+ * argument registers r4-r7 join the V pool as well, and a spill/reload
+ * shim around calli/callr keeps their contents alive across C calls, which
+ * the SH-4 ABI does not.  Together that gives a client ten V registers
+ * instead of six.
+ *
+ * Enable with -DJIT_SH_FORK=1 (cmake -DSH_FORK=ON).  It must be defined
+ * for every translation unit, not just lightning's: JIT_SH_WIDE_POOL
+ * changes JIT_V_NUM, and a client that sizes anything off JIT_V_NUM will
+ * miscompile silently if it sees a different value than the backend does.
+ * Hence a global definition and a default here, never a per-target one.
+ *
+ * JIT_SH_WIDE_POOL (this file) and JIT_SH_SHIM (jit_sh-cpu.c) both derive
+ * from it and are individually overridable, but only 0/0 and 1/1 are valid
+ * configurations — the wide pool without the shim hands out registers the
+ * next C call destroys. */
+#ifndef JIT_SH_FORK
+#define JIT_SH_FORK		0
+#endif
+
+#ifndef JIT_SH_WIDE_POOL
+#define JIT_SH_WIDE_POOL	JIT_SH_FORK
+#endif
+
 typedef enum {
 #define jit_r(i)		(JIT_R0 + (i))
 #define jit_r_num()		3
+#if JIT_SH_WIDE_POOL
+/* Deliberately NOT contiguous: V0..V4 are the callee-saved r8-r12, V5..V8
+ * are the C argument registers r4-r7, and V9 is r13.
+ *
+ * The argument registers come LAST for two reasons.  A client that uses
+ * fewer than five V registers then gets exactly stock's placement and never
+ * touches the shim at all; and the registers that cost a spill/reload at
+ * every C call are only handed out once the free ones are used up.
+ *
+ * The ordering is also load-bearing for correctness with lightrec, which
+ * uses JIT_V0 and JIT_V1 by name for the guest PC and the branch target
+ * while they are simultaneously its guest register slots 0 and 1.  Putting
+ * the argument registers first made those two aliases of the first two
+ * marshalling targets, and the shim then destroyed control-flow data.
+ *
+ * jit_hppa.h has a non-contiguous jit_v() too, so nothing inside lightning
+ * assumes otherwise — but a client that inverts the mapping by arithmetic
+ * will need fixing, as lightrec's regcache did. */
+#define jit_v(i)		((i) < 5 ? _R8 + (i) : \
+				 ((i) < 9 ? _R4 + (i) - 5 : _R13))
+#define jit_v_num()		10
+#else
 #define jit_v(i)		(JIT_V0 + (i))
 #define jit_v_num()		6
+#endif
 #define jit_f(i)		(JIT_F0 - (i) * 2)
 #ifdef __SH_FPU_ANY__
 #    define jit_f_num()		8
@@ -42,16 +91,33 @@ typedef enum {
 #define JIT_R2			_R3
 	_R1,	_R2,	_R3,
 
-	/* argument registers */
+	/* C argument registers, exposed as the TOP of the V pool (V5..V8):
+	 * preserved across C calls by the spill/reload shim around
+	 * calli/callr, not by the callee. */
+#if JIT_SH_WIDE_POOL
+#define JIT_V5			_R4
+#define JIT_V6			_R5
+#define JIT_V7			_R6
+#define JIT_V8			_R7
+#endif
 	_R4,	_R5,	_R6,	_R7,
 
 	/* callee-saved registers */
+#if JIT_SH_WIDE_POOL
+#define JIT_V0			_R8
+#define JIT_V1			_R9
+#define JIT_V2			_R10
+#define JIT_V3			_R11
+#define JIT_V4			_R12
+#define JIT_V9			_R13
+#else
 #define JIT_V0			_R8
 #define JIT_V1			_R9
 #define JIT_V2			_R10
 #define JIT_V3			_R11
 #define JIT_V4			_R12
 #define JIT_V5			_R13
+#endif
 	_R8,	_R9,	_R10,	_R11,	_R12,	_R13,
 
 #define JIT_FP			_R14
