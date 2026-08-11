@@ -303,7 +303,10 @@ void lightrec_free_cstate(struct lightrec_cstate *cstate);
 
 union code lightrec_read_opcode(struct lightrec_state *state, u32 pc);
 
-int lightrec_compile_block(struct lightrec_cstate *cstate, struct block *block);
+/* Translation, not execution: runs once per block and never again.  cold keeps
+ * it out of the cache lines used every frame; see bloom's linker script. */
+int lightrec_compile_block(struct lightrec_cstate *cstate, struct block *block)
+	__attribute__((cold));
 void lightrec_free_opcode_list(struct lightrec_state *state,
 			       struct opcode *list);
 

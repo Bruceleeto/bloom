@@ -36,6 +36,9 @@ static uint8_t bits_per_sample(flac_decoder *decoder) { return decoder->bits_per
  *-------------------------------------------------
  */
 
+/* FLAC decode only runs while loading a CHD, never per frame.  dr_flac is
+ * header-only and inlines into these three, so marking them moves all of it. */
+__attribute__((cold))
 int flac_decoder_init(flac_decoder *decoder)
 {
 	decoder->decoder = NULL;
@@ -88,6 +91,7 @@ static int flac_decoder_internal_reset(flac_decoder* decoder)
  *-------------------------------------------------
  */
 
+__attribute__((cold))
 int flac_decoder_reset(flac_decoder* decoder, uint32_t sample_rate, uint8_t num_channels, uint32_t block_size, const void *buffer, uint32_t length)
 {
 	/* modify the template header with our parameters */
@@ -128,6 +132,7 @@ int flac_decoder_reset(flac_decoder* decoder, uint32_t sample_rate, uint8_t num_
  *-------------------------------------------------
  */
 
+__attribute__((cold))
 int flac_decoder_decode_interleaved(flac_decoder* decoder, int16_t *samples, uint32_t num_samples, int swap_endian)
 {
 	/* configure the uncompressed buffer */

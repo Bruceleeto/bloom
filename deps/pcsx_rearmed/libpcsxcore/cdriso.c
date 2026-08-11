@@ -1382,6 +1382,9 @@ static void PrintTracks(void) {
 
 // This function is invoked by the front-end when opening an ISO
 // file for playback
+//
+// Cold: runs twice per session, and takes the format probes with it.
+__attribute__((cold))
 int ISOopen(const char *fname)
 {
 	boolean isMode1ISO = FALSE;

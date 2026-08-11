@@ -23,6 +23,8 @@ __cnst _Bool is_syscall(union code c);
 
 _Bool should_emulate(const struct opcode *op);
 
-int lightrec_optimize(struct lightrec_state *state, struct block *block);
+/* Runs once per block translation.  See lightrec_compile_block(). */
+int lightrec_optimize(struct lightrec_state *state, struct block *block)
+	__attribute__((cold));
 
 #endif /* __OPTIMIZER_H__ */

@@ -30,6 +30,32 @@ endif()
 
 file(GENERATE OUTPUT revision.h CONTENT "#define REV \"${BLOOM_VERSION}\"\n")
 
+# Link with our own linker script (see linker/bloom.xc).
+#
+# kos-cc expands ${KOS_LDFLAGS}, which already carries -T for KOS's script,
+# before "$@" -- and with multiple -T the first one wins, so a -T added here
+# would be ignored.  INSERT does not help either: it augments ld's default
+# script, which KOS's -T has already replaced.  Substituting the path inside
+# KOS_LDFLAGS is what is left.
+if (DEFINED ENV{KOS_LDFLAGS} AND DEFINED ENV{KOS_BASE})
+	set(_kos_script "$ENV{KOS_BASE}/utils/ldscripts/shlelf.xc")
+	set(_bloom_script "${CMAKE_CURRENT_SOURCE_DIR}/linker/bloom.xc")
+	string(REPLACE "${_kos_script}" "${_bloom_script}"
+		_bloom_ldflags "$ENV{KOS_LDFLAGS}")
+
+	if (_bloom_ldflags STREQUAL "$ENV{KOS_LDFLAGS}")
+		message(WARNING
+			"bloom: could not find KOS's linker script in KOS_LDFLAGS -- "
+			"expected '${_kos_script}'.  Linking with KOS's layout.")
+	else()
+		foreach (_lang C CXX)
+			set(CMAKE_${_lang}_LINK_EXECUTABLE
+				"env \"KOS_LDFLAGS=${_bloom_ldflags}\" <CMAKE_${_lang}_COMPILER> <FLAGS> <CMAKE_${_lang}_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+		endforeach()
+		message(STATUS "bloom: linking with linker/bloom.xc (cold code placed last)")
+	endif()
+endif()
+
 option(WITH_GDB "Enable support for GDB" OFF)
 option(WITH_BENCH "Auto-run /ide/bloom/game.bin (or /rd/prog.exe) and print CPU benchmark stats" ON)
 
@@ -217,6 +243,7 @@ elseif(GPU_PLUGIN STREQUAL PVR)
 		src/pvr.c
 	)
 	target_include_directories(gpu PRIVATE ${PCSX_REAL_DIR}/plugins)
+
 	set(HARDWARE_ACCELERATED ON)
 endif()
 

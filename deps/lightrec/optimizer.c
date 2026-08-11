@@ -898,6 +898,8 @@ static void maybe_remove_load_delay(struct opcode *op)
 		op->flags &= ~LIGHTREC_LOAD_DELAY;
 }
 
+/* Marked explicitly: cold does not propagate here from lightrec_optimize(). */
+__attribute__((cold))
 static int lightrec_transform_ops(struct lightrec_state *state, struct block *block)
 {
 	struct opcode *op, *list = block->opcode_list;
