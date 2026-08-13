@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2337,10 +2338,324 @@ static int lightrec_test_preload_pc(struct lightrec_state *state, struct block *
 	return 0;
 }
 
+/* Idle-loop elision.
+ *
+ * A guest waiting on an interrupt spins in a poll loop, and with counted
+ * cycles every lap costs real host time; a third of the emitted-code time in
+ * the wild is such loops.  When a backward conditional branch closes a loop
+ * that provably cannot change its own exit condition, the emitter makes the
+ * taken edge consume the whole remaining cycle budget, so the dispatcher
+ * delivers the next event after one lap instead of thousands.
+ *
+ * The loop body still executes, laps just get expensive in guest time —
+ * housekeeping side effects (the SDK's VSync decrements a timeout on the
+ * stack) keep happening, which is why the matcher can allow them.  What it
+ * must reject is real work: any instruction that can reach the backward
+ * branch again has to be ALU, a load from a statically-known RAM/scratchpad
+ * address or through $sp, a store through $sp, or an internal branch.  Calls
+ * and stores on paths that only *exit* the loop are fine, and the window may
+ * span block boundaries — it is read from the raw guest code, not the IR. */
+#define IDLE_LOOP_MAX_OPS	64
+
+/* Instruction kinds that matter for control flow inside the window. */
+enum idle_cf { IDLE_CF_NONE, IDLE_CF_COND, IDLE_CF_J, IDLE_CF_CALL };
+
+static enum idle_cf idle_loop_cf_kind(union code c)
+{
+	switch (c.i.op) {
+	case OP_SPECIAL:
+		if (c.r.op == OP_SPECIAL_JR || c.r.op == OP_SPECIAL_JALR)
+			return IDLE_CF_CALL;
+		return IDLE_CF_NONE;
+	case OP_REGIMM:
+		if (c.i.rt == OP_REGIMM_BLTZ || c.i.rt == OP_REGIMM_BGEZ)
+			return IDLE_CF_COND;
+		return IDLE_CF_NONE;
+	case OP_BEQ:
+	case OP_BNE:
+	case OP_BLEZ:
+	case OP_BGTZ:
+		return IDLE_CF_COND;
+	case OP_J:
+		return IDLE_CF_J;
+	case OP_JAL:
+		return IDLE_CF_CALL;
+	default:
+		return IDLE_CF_NONE;
+	}
+}
+
+static bool idle_loop_matches(const struct block *block, u16 offset)
+{
+	u32 branch_pc = block->pc + (offset << 2);
+	s32 imm = (s16)block->opcode_list[offset].c.i.imm;
+	u32 target = branch_pc + 4 + (imm << 2);
+	u64 succ[IDLE_LOOP_MAX_OPS];
+	u64 reach, bad = 0, loads = 0;
+	u32 known[32], known_mask = 0;
+	const u32 *code;
+	unsigned int i, n, bi;
+	enum idle_cf kind;
+	bool changed;
+	union code c;
+	u32 addr;
+	s32 t;
+
+	/* Window: [branch target .. branch delay slot], raw guest words. */
+	n = ((branch_pc + 8) - target) >> 2;
+	bi = n - 2;
+
+	if (n < 3 || n > IDLE_LOOP_MAX_OPS)
+		return false;
+
+	if (kunseg(target) >= RAM_SIZE || kunseg(branch_pc) + 8 > RAM_SIZE)
+		return false;
+
+	code = block->code + ((s32)(target - block->pc) >> 2);
+
+	/* First pass: which nodes are harmless on a loop path, which loads
+	 * feed the condition, and what constant addresses the lui chains
+	 * produce. */
+	for (i = 0; i < n; i++) {
+		bool node_bad = false;
+
+		c.opcode = code[i];
+
+		switch (c.i.op) {
+		case OP_SPECIAL:
+			switch (c.r.op) {
+			case OP_SPECIAL_JR:
+			case OP_SPECIAL_JALR:
+				/* Successors unknown — give up entirely. */
+				return false;
+			case OP_SPECIAL_SLL:
+			case OP_SPECIAL_SRL:
+			case OP_SPECIAL_SRA:
+			case OP_SPECIAL_SLLV:
+			case OP_SPECIAL_SRLV:
+			case OP_SPECIAL_SRAV:
+			case OP_SPECIAL_ADD:
+			case OP_SPECIAL_ADDU:
+			case OP_SPECIAL_SUB:
+			case OP_SPECIAL_SUBU:
+			case OP_SPECIAL_AND:
+			case OP_SPECIAL_OR:
+			case OP_SPECIAL_XOR:
+			case OP_SPECIAL_NOR:
+			case OP_SPECIAL_SLT:
+			case OP_SPECIAL_SLTU:
+				known_mask &= ~BIT(c.r.rd);
+				break;
+			default:
+				node_bad = true;
+				break;
+			}
+			break;
+
+		case OP_LUI:
+			known[c.i.rt] = (u32)c.i.imm << 16;
+			known_mask |= BIT(c.i.rt);
+			break;
+
+		case OP_ADDI:
+		case OP_ADDIU:
+		case OP_ORI:
+			if (known_mask & BIT(c.i.rs)) {
+				known[c.i.rt] = c.i.op == OP_ORI
+					? known[c.i.rs] | c.i.imm
+					: known[c.i.rs] + (s16)c.i.imm;
+				known_mask |= BIT(c.i.rt);
+			} else {
+				known_mask &= ~BIT(c.i.rt);
+			}
+			break;
+
+		case OP_SLTI:
+		case OP_SLTIU:
+		case OP_ANDI:
+		case OP_XORI:
+			known_mask &= ~BIT(c.i.rt);
+			break;
+
+		case OP_REGIMM:
+			if (c.i.rt != OP_REGIMM_BLTZ &&
+			    c.i.rt != OP_REGIMM_BGEZ)
+				node_bad = true;
+			break;
+
+		case OP_BEQ:
+		case OP_BNE:
+		case OP_BLEZ:
+		case OP_BGTZ:
+		case OP_J:
+			break;
+
+		case OP_JAL:
+			/* Fine on exit-only paths, never on the loop. */
+			node_bad = true;
+			break;
+
+		case OP_LB:
+		case OP_LH:
+		case OP_LWL:
+		case OP_LW:
+		case OP_LBU:
+		case OP_LHU:
+		case OP_LWR:
+			if (c.i.rs == 29) {
+				loads |= BIT(i);
+			} else if (known_mask & BIT(c.i.rs)) {
+				addr = kunseg(known[c.i.rs] + (s16)c.i.imm);
+				if (addr < RAM_SIZE
+				    || addr - 0x1f800000 < 0x400)
+					loads |= BIT(i);
+				else
+					node_bad = true;
+			} else {
+				node_bad = true;
+			}
+			known_mask &= ~BIT(c.i.rt);
+			break;
+
+		case OP_SB:
+		case OP_SH:
+		case OP_SWL:
+		case OP_SW:
+		case OP_SWR:
+			if (c.i.rs != 29)
+				node_bad = true;
+			break;
+
+		default:
+			node_bad = true;
+			break;
+		}
+
+		if (node_bad)
+			bad |= BIT(i);
+	}
+
+	/* Second pass: successor edges, with delay slots modelled properly —
+	 * a jump hands control to its delay slot, and the SLOT then goes to
+	 * the jump target.  Fall-through edges chaining past an exit jump
+	 * would otherwise wire exit paths back into the loop. */
+	for (i = 0; i < n; i++)
+		succ[i] = i + 1 < n ? BIT(i + 1) : 0;
+
+	for (i = 0; i < n; i++) {
+		c.opcode = code[i];
+		kind = idle_loop_cf_kind(c);
+
+		if (kind == IDLE_CF_NONE)
+			continue;
+
+		/* A branch whose delay slot falls outside the window, or is
+		 * itself a branch, cannot be modelled — reject. */
+		if (i + 1 >= n)
+			return false;
+		if (idle_loop_cf_kind((union code){ .opcode = code[i + 1] })
+		    != IDLE_CF_NONE)
+			return false;
+
+		switch (kind) {
+		case IDLE_CF_COND:
+			t = (s32)i + 1 + (s16)c.i.imm;
+			if (t >= 0 && t < (s32)n)
+				succ[i + 1] |= BIT(t);
+			break;
+
+		case IDLE_CF_J:
+			addr = ((target + (i << 2)) & 0xf0000000)
+				| (c.j.imm << 2);
+			t = (s32)((addr - target) >> 2);
+			if (t >= 0 && t < (s32)n)
+				succ[i + 1] = BIT(t);
+			else
+				succ[i + 1] = 0;
+			break;
+
+		default:
+			/* IDLE_CF_CALL (jal): delay slot runs, the call is a
+			 * bad node on the path, control resumes after it —
+			 * the default fall-through edges model that. */
+			break;
+		}
+	}
+
+	/* Which nodes can reach the backward branch? */
+	reach = BIT(bi);
+	do {
+		changed = false;
+		for (i = 0; i < n; i++) {
+			if (!(reach & BIT(i)) && (succ[i] & reach)) {
+				reach |= BIT(i);
+				changed = true;
+			}
+		}
+	} while (changed);
+
+	/* The loop entry must actually loop. */
+	if (!(reach & BIT(0)))
+		return false;
+
+	/* Everything on a path back to the branch, plus the branch's delay
+	 * slot, must be harmless. */
+	if (bad & (reach | BIT(n - 1)))
+		return false;
+
+	/* And the exit condition must come from memory. */
+	if (!(loads & reach))
+		return false;
+
+	return true;
+}
+
+static int lightrec_detect_idle_loops(struct lightrec_state *state,
+				      struct block *block)
+{
+	struct opcode *op;
+	unsigned int i;
+	union code c;
+
+	(void)state;
+
+	for (i = 0; i < block->nb_ops; i++) {
+		op = &block->opcode_list[i];
+		c = op->c;
+
+		switch (c.i.op) {
+		case OP_BEQ:
+		case OP_BNE:
+		case OP_BLEZ:
+		case OP_BGTZ:
+			break;
+		case OP_REGIMM:
+			if (c.i.rt == OP_REGIMM_BLTZ ||
+			    c.i.rt == OP_REGIMM_BGEZ)
+				break;
+			continue;
+		default:
+			continue;
+		}
+
+		if ((s16)c.i.imm >= 0)
+			continue;
+
+		if (idle_loop_matches(block, i)) {
+			op->flags |= LIGHTREC_IDLE_LOOP;
+			printf("lightrec: idle loop at PC 0x%08" PRIx32 "\n",
+			       block->pc + (i << 2));
+		}
+	}
+
+	return 0;
+}
+
 static int (*lightrec_optimizers[])(struct lightrec_state *state, struct block *) = {
 	IF_OPT(OPT_REMOVE_DIV_BY_ZERO_SEQ, &lightrec_remove_div_by_zero_check_sequence),
 	IF_OPT(OPT_REPLACE_MEMSET, &lightrec_replace_memset),
 	IF_OPT(OPT_DETECT_IMPOSSIBLE_BRANCHES, &lightrec_detect_impossible_branches),
+	&lightrec_detect_idle_loops,
 	IF_OPT(OPT_HANDLE_LOAD_DELAYS, &lightrec_handle_load_delays),
 	IF_OPT(OPT_HANDLE_LOAD_DELAYS, &lightrec_swap_load_delays),
 	IF_OPT(OPT_TRANSFORM_OPS, &lightrec_transform_branches),

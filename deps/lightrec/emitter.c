@@ -437,24 +437,36 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 		/* Clean remaining registers */
 		lightrec_clean_regs(reg_cache, _jit);
 
-		target_offset = offset + 1 + (s16)op->i.imm
-			- !!op_flag_no_ds(op->flags);
-		pr_debug("Adding local branch to offset 0x%"PRIx32"\n",
-			 target_offset << 2);
-		branch = &state->local_branches[
-			state->nb_local_branches++];
+		if (op_flag_idle_loop(op->flags)) {
+			/* Idle loop: no local back edge — the EOB below runs
+			 * with the budget consumed, so the dispatcher delivers
+			 * the next event after a single lap. */
+		} else {
+			target_offset = offset + 1 + (s16)op->i.imm
+				- !!op_flag_no_ds(op->flags);
+			pr_debug("Adding local branch to offset 0x%"PRIx32"\n",
+				 target_offset << 2);
+			branch = &state->local_branches[
+				state->nb_local_branches++];
 
-		branch->target = target_offset;
+			branch->target = target_offset;
 
-		if (no_indirection)
-			branch->branch = jit_new_node_pww(code2, NULL, rs, rt);
-		else if (is_forward)
-			branch->branch = jit_b();
-		else
-			branch->branch = jit_bgti(LIGHTREC_REG_CYCLE, 0);
+			if (no_indirection)
+				branch->branch = jit_new_node_pww(code2, NULL, rs, rt);
+			else if (is_forward)
+				branch->branch = jit_b();
+			else
+				branch->branch = jit_bgti(LIGHTREC_REG_CYCLE, 0);
+		}
 	}
 
 	if (!op_flag_local_branch(op->flags) || !is_forward) {
+		/* Idle loop taken edge: consume the remaining cycle budget so
+		 * the EOB's cycle gate exits to the dispatcher and the next
+		 * event fires now instead of thousands of laps from now. */
+		if (op_flag_idle_loop(op->flags))
+			jit_movi(LIGHTREC_REG_CYCLE, 0);
+
 		next_pc = get_branch_pc(block, offset, 1 + (s16)op->i.imm);
 		state->no_load_delay = op_flag_local_branch(op->flags);
 		lightrec_emit_end_of_block(state, block, offset, -1, next_pc,
