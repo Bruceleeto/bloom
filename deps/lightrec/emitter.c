@@ -14,6 +14,29 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+
+#if WITH_FPU_GTE
+/*
+ * Bumped on every write to a COP2 control register, wherever the write comes
+ * from.  Defined by the core's GTE (libpcsxcore/gte.c); declared here because
+ * this library does not include the core's headers.
+ */
+extern uint32_t psxCP2CtrlGen;
+
+/*
+ * Compile-time dispatch: the body to call for a command word, or NULL for a
+ * command the hardware ignores.  Returned as void * for the same reason the
+ * register file is passed as one - the types live in headers this library
+ * does not see, and the two sides agree on the ABI (every body takes the
+ * COP2 file, and the ones that need the op word take it second).
+ */
+extern void *gte_fpu_resolve(uint32_t op);
+
+/* Whether NCLIP may be emitted inline rather than counted through the
+ * instrumented entry point. */
+extern int gte_fpu_nclip_inline(void);
+#endif
 
 #define LIGHTNING_UNALIGNED_32BIT 4
 
@@ -2685,6 +2708,21 @@ static void rec_cp2_basic_CTC2(struct lightrec_cstate *state,
 	}
 
 	lightrec_free_reg(reg_cache, rt);
+
+#if WITH_FPU_GTE
+	/*
+	 * Announce the write.  A GTE that caches anything derived from the
+	 * control file tells whether it went stale by comparing this counter,
+	 * and generated code stores here without going through CTC2.
+	 */
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_ldi_i(tmp, &psxCP2CtrlGen);
+	jit_addi(tmp, tmp, 1);
+	jit_sti_i(&psxCP2CtrlGen, tmp);
+
+	lightrec_free_reg(reg_cache, tmp);
+#endif
 }
 
 static void rec_cp0_RFE(struct lightrec_cstate *state,
@@ -3092,6 +3130,147 @@ static void rec_CP0(struct lightrec_cstate *state,
 		(*f)(state, block, offset);
 }
 
+#if WITH_FPU_GTE
+/*
+ * NCLIP, emitted straight into the block.  It is a third of all GTE
+ * commands and it is three multiplies; a call frame costs more than the
+ * command.  MAC0 takes the low 32 bits of the cross product, exactly as
+ * the reference's truncating store does, and FLAG is cleared: the 32-bit
+ * overflow bits are not raised - hardware captures of NCLIP come back with
+ * FLAG zero, so nothing that runs can tell.
+ *
+ * Only emitted when gte_fpu_nclip_inline() allows it: instrumented builds
+ * route every command through the counted entry point instead, so the GTE
+ * bucket and the census histogram stay complete.
+ */
+static void rec_CP2_nclip(struct lightrec_cstate *state,
+			  const struct block *block, u16 offset)
+{
+	struct regcache *reg_cache = state->reg_cache;
+	jit_state_t *_jit = block->_jit;
+	u32 d = lightrec_offset(regs.cp2d);
+	u8 acc, t1;
+
+	jit_name(__func__);
+	jit_note(__FILE__, __LINE__);
+
+	/*
+	 * TWO temporaries, not three: SH-4 lightrec has exactly two (JIT_R0 is
+	 * the cycle counter), and a third request falls through to the
+	 * callee-saved pool - which, mid vertex loop, means writing back a
+	 * live guest register and reloading it after.  Measured: the spill
+	 * churn cost more than the call frame this routine removes.  MAC0's
+	 * slot accumulates instead - it is written at the end anyway and its
+	 * line is hot.
+	 */
+	acc = lightrec_alloc_reg_temp(reg_cache, _jit);
+	t1 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	/* SX0 * (SY1 - SY2) */
+	jit_ldxi_s(acc, LIGHTREC_REG_STATE, d + 13 * 4 + 2);
+	jit_ldxi_s(t1, LIGHTREC_REG_STATE, d + 14 * 4 + 2);
+	jit_subr(acc, acc, t1);
+	jit_ldxi_s(t1, LIGHTREC_REG_STATE, d + 12 * 4);
+	jit_mulr(acc, acc, t1);
+	jit_stxi_i(d + 24 * 4, LIGHTREC_REG_STATE, acc);
+
+	/* + SX1 * (SY2 - SY0) */
+	jit_ldxi_s(acc, LIGHTREC_REG_STATE, d + 14 * 4 + 2);
+	jit_ldxi_s(t1, LIGHTREC_REG_STATE, d + 12 * 4 + 2);
+	jit_subr(acc, acc, t1);
+	jit_ldxi_s(t1, LIGHTREC_REG_STATE, d + 13 * 4);
+	jit_mulr(acc, acc, t1);
+	jit_ldxi_i(t1, LIGHTREC_REG_STATE, d + 24 * 4);
+	jit_addr(acc, acc, t1);
+	jit_stxi_i(d + 24 * 4, LIGHTREC_REG_STATE, acc);
+
+	/* + SX2 * (SY0 - SY1) */
+	jit_ldxi_s(acc, LIGHTREC_REG_STATE, d + 12 * 4 + 2);
+	jit_ldxi_s(t1, LIGHTREC_REG_STATE, d + 13 * 4 + 2);
+	jit_subr(acc, acc, t1);
+	jit_ldxi_s(t1, LIGHTREC_REG_STATE, d + 14 * 4);
+	jit_mulr(acc, acc, t1);
+	jit_ldxi_i(t1, LIGHTREC_REG_STATE, d + 24 * 4);
+	jit_addr(acc, acc, t1);
+	jit_stxi_i(d + 24 * 4, LIGHTREC_REG_STATE, acc);	/* MAC0 */
+
+	jit_movi(t1, 0);
+	jit_stxi_i(lightrec_offset(regs.cp2c) + 31 * 4,
+		   LIGHTREC_REG_STATE, t1);			/* FLAG */
+
+	lightrec_free_reg(reg_cache, acc);
+	lightrec_free_reg(reg_cache, t1);
+}
+
+/*
+ * A GTE command, called straight from generated code.
+ *
+ * The generic path for a coprocessor opcode is the C wrapper block: it saves
+ * every temporary to the state struct, converts the cycle counter from a delta
+ * to an absolute and back, and reaches the command through two indirect calls
+ * (`lightrec_cp_cb`, then the frontend's `cop2_op`).  None of that is needed
+ * here - the command reads and writes the COP2 file in the state struct and
+ * touches neither the cycle counter nor the guest's general registers - so the
+ * only thing kept is marking the live registers around the call.
+ *
+ * The command word is known now, so the body is resolved now -
+ * gte_fpu_resolve() - instead of compared against at every execution.  NULL
+ * is a command the hardware ignores, and nothing at all is emitted for it.
+ */
+static void rec_CP2_gte(struct lightrec_cstate *state,
+			const struct block *block, u16 offset)
+{
+	struct regcache *reg_cache = state->reg_cache;
+	union code c = block->opcode_list[offset].c;
+	jit_state_t *_jit = block->_jit;
+	static bool announced;
+	void *fn;
+	u8 tmp;
+
+	/* Once, at compile time, so a run says which path it emitted. */
+	if (!announced) {
+		announced = true;
+		printf("GTE: direct call from generated code%s\n",
+		       gte_fpu_nclip_inline() ? ", NCLIP inline" : "");
+	}
+
+	if (gte_fpu_nclip_inline() && (c.opcode & 0x3f) == 0x06) {
+		rec_CP2_nclip(state, block, offset);
+		return;
+	}
+
+	fn = gte_fpu_resolve(c.opcode);
+	if (!fn)
+		return;
+
+	jit_name(__func__);
+	jit_note(__FILE__, __LINE__);
+
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	jit_addi(tmp, LIGHTREC_REG_STATE, lightrec_offset(regs.cp2d));
+
+	/*
+	 * LIGHTREC_REG_STATE is callee-saved and survives the call on its own.
+	 * The temporaries and the cycle register do not, and nothing else is
+	 * going to spill them now that the wrapper block is out of the path.
+	 */
+	lightrec_save_temps(reg_cache, _jit);
+
+	jit_prepare();
+	jit_pushargr(tmp);
+	jit_pushargi(c.opcode);
+
+	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	jit_finishi(fn);
+
+	lightrec_free_reg(reg_cache, tmp);
+	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	lightrec_restore_temps(reg_cache, _jit);
+}
+#endif
+
 static void rec_CP2(struct lightrec_cstate *state,
 		    const struct block *block, u16 offset)
 {
@@ -3106,7 +3285,11 @@ static void rec_CP2(struct lightrec_cstate *state,
 		}
 	}
 
+#if WITH_FPU_GTE
+	rec_CP2_gte(state, block, offset);
+#else
 	rec_CP(state, block, offset);
+#endif
 }
 
 static void rec_META(struct lightrec_cstate *state,

@@ -106,7 +106,13 @@ static void dc_vout_set_mode(int w, int h, int raw_w, int raw_h, int bpp)
 	screen_fw = (float)SCREEN_WIDTH / (float)raw_w;
 	screen_fh = (float)SCREEN_HEIGHT / (float)raw_h;
 
-	if (HARDWARE_ACCELERATED) {
+	/*
+	 * With WITH_FPU_GTE the GTE owns XMTRX and draw_prim applies this
+	 * transform as four multiplies, so loading it here would overwrite a
+	 * matrix the GTE believes is still resident - and a mode change can
+	 * happen between any two GTE commands.
+	 */
+	if (HARDWARE_ACCELERATED && !WITH_FPU_GTE) {
 		matrix_t matrix = {
 			{ screen_fw, 0.0f, 0.0f, 0.0f },
 			{ 0.0f, screen_fh, 0.0f, 0.0f },

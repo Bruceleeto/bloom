@@ -182,6 +182,22 @@ set(LIBLIGHTNING_INCLUDE_DIR $<TARGET_PROPERTY:lightning,INTERFACE_INCLUDE_DIREC
 # Include Lightrec's own CMake file
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
+# Run the GTE's coordinate transforms on the SH-4 FPU instead of the core's
+# fixed-point C.  XMTRX is the GTE's when this is on, so src/pvr.c applies its
+# screen transform with multiplies instead of an ftrv.
+option(WITH_FPU_GTE "Run the GTE on the SH-4 FPU" ON)
+
+# Time every GTE command on the SH-4 performance counter and print a breakdown
+# every few seconds.  Independent of WITH_FPU_GTE: it brackets the core's call,
+# so both settings report the same measurement.
+option(WITH_GTE_PROFILE "Time the GTE" OFF)
+
+# Generated code stores to the COP2 control file without calling CTC2, so the
+# recompiler announces the write for the GTE's matrix cache.
+target_compile_definitions(lightrec PRIVATE
+	WITH_FPU_GTE=$<IF:$<BOOL:${WITH_FPU_GTE}>,1,0>
+)
+
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
 math(EXPR CODEBUF_SIZE "0x100000 * ${CODE_BUFFER_SIZE_MB}")
 if (NOT CODEBUF_SIZE)
@@ -248,6 +264,7 @@ target_compile_definitions(libpcsxcore PUBLIC
 	HAVE_CDROM
 	GPUSTATUS_POLLING_THRESHOLD=${WITH_GPUSTATUS_POLLING_THRESHOLD}
 )
+target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)
 target_link_libraries(libpcsxcore PUBLIC lightrec zlib bloom_instr)
 
@@ -308,7 +325,7 @@ option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF
 option(WITH_CLIPPING "Enable pixel clipping" ON)
 
 if (WITH_HYBRID_RENDERING)
-	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
+	set(WITH_POLYBUF_SIZE_KB 256 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
 	math(EXPR POLY_BUFFER_SIZE "0x400 * ${WITH_POLYBUF_SIZE_KB}")
 	if (NOT POLY_BUFFER_SIZE)
 		message(SEND_ERROR "Invalid poly buffer size.")
@@ -352,6 +369,14 @@ add_executable(bloom
 	src/plugins.c
 	src/prof.c
 )
+
+if (WITH_FPU_GTE)
+	target_sources(bloom PRIVATE src/gte_fpu.c)
+endif()
+
+if (WITH_GTE_PROFILE)
+	target_sources(bloom PRIVATE src/gteprof.c)
+endif()
 target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami bloom_instr
 	#lightning lightrec libpcsxcore gpu spu
 	#${ZLIB_LIBRARIES} tsunami parallax
