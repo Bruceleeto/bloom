@@ -27,6 +27,29 @@ u16 lightrec_get_lut_entry(const struct block *block)
 	return (kunseg(block->pc) >> 2) & (LUT_SIZE - 1);
 }
 
+/* bloom: the block whose guest range CONTAINS pc, not the one that starts at
+ * it.  The hot addresses worth dumping come from a PC sampler and land in the
+ * middle of a block as often as not; lightrec_find_block() below is an exact
+ * start-address lookup and would simply miss them. */
+struct block * lightrec_find_block_containing(struct blockcache *cache, u32 pc)
+{
+	struct block *block;
+	unsigned int i;
+
+	pc = kunseg(pc);
+
+	for (i = 0; i < LUT_SIZE; i++) {
+		for (block = cache->lut[i]; block; block = block->next) {
+			u32 start = kunseg(block->pc);
+
+			if (pc >= start && pc < start + block->nb_ops * 4)
+				return block;
+		}
+	}
+
+	return NULL;
+}
+
 struct block * lightrec_find_block(struct blockcache *cache, u32 pc)
 {
 	struct block *block;

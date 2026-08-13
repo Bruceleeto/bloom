@@ -20,7 +20,9 @@
 #include <kos/string.h>
 
 #include "bloom-config.h"
+#include "census.h"
 #include "emu.h"
+#include "prof.h"
 #include "pvr.h"
 
 #if ENABLE_THREADED_RENDERER
@@ -1163,7 +1165,14 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	pvr_vertex_part2_t *vert2;
 	unsigned int i;
 
+	/* bloom: bloop's three renderer denominators, counted where it counts
+	 * them.  A "bind" is a poly header actually sent — the fast path above
+	 * reuses the previous one and passes hdr == NULL. */
+	census_bump(CENSUS_RECORDS);
+	census_add(CENSUS_VERTICES, nb);
+
 	if (unlikely(hdr)) {
+		census_bump(CENSUS_BINDS);
 		sq_hdr = pvr_dr_target();
 		copy32(sq_hdr, hdr);
 		pvr_dr_commit(sq_hdr);
@@ -1940,7 +1949,10 @@ static void pvr_set_list(pvr_list_t list)
 __noinline
 static void pvr_start_scene(pvr_list_t list)
 {
+	prof_enter(PROF_FLIP);
 	pvr_wait_ready();
+	prof_leave();
+
 	pvr_reap_textures();
 
 	pvr_scene_begin();
@@ -2480,6 +2492,11 @@ static void process_gpu_commands(void)
 	uint16_t draw_x, draw_y;
 	bool draw_updated;
 
+	/* bloom: PROF_RENDER is src/pvr.c's own work — everything from the
+	 * queued GP0 commands down to the PVR submit.  It nests inside
+	 * PROF_GPUFRONT (gpulib's list walk), so the two do not double-count. */
+	prof_enter(PROF_RENDER);
+
 	for (cmd_offt = 0; cmd_offt < pvr.cmdbuf_offt; cmd_offt += 1 + len) {
 		pbuffer = (const union PacketBuffer *)&cmdbuf[cmd_offt];
 
@@ -2823,6 +2840,8 @@ static void process_gpu_commands(void)
 	}
 
 	pvr.cmdbuf_offt = 0;
+
+	prof_leave();
 }
 
 int do_cmd_list(uint32_t *list, int list_len,
@@ -2835,6 +2854,8 @@ int do_cmd_list(uint32_t *list, int list_len,
 	uint32_t *list_end = list + list_len;
 	const union PacketBuffer *pbuffer;
 	unsigned int i, len_polyline;
+
+	prof_enter(PROF_RENDER);
 
 	for (; list < list_end; list += 1 + len)
 	{
@@ -2961,6 +2982,8 @@ out:
 	*cycles_sum_out += cpu_cycles_sum;
 	*cycles_last = cpu_cycles;
 	*last_cmd = cmd;
+	prof_leave();
+
 	return list - list_start;
 }
 
@@ -3200,7 +3223,9 @@ void hw_render_stop(void)
 	if (WITH_CLIPPING && pvr.nb_clips)
 		pvr_render_modifier_volumes();
 
+	prof_enter(PROF_FLIP);
 	pvr_scene_finish();
+	prof_leave();
 
 	/* Discard any textures covered by the draw area */
 	pvr_update_caches(pvr.start_x, pvr.start_y,

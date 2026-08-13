@@ -11,6 +11,12 @@
 #include "reaper.h"
 #include "slist.h"
 
+/* bloom: compiles to nothing without -DPROF=ON / -DCENSUS=ON.
+ * This runs on the worker thread, so prof.c charges it to the off-thread
+ * accumulator rather than the emulator's bucket stack. */
+#include "census.h"
+#include "prof.h"
+
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -139,7 +145,10 @@ static void lightrec_compile_list(struct recompiler *rec,
 		pthread_mutex_unlock(&rec->mutex);
 
 		if (likely(!block_has_flag(block, BLOCK_IS_DEAD))) {
+			prof_enter(PROF_COMPILE);
+			census_bump(CENSUS_COMPILES);
 			ret = lightrec_compile_block(thd->cstate, block);
+			prof_leave();
 			if (ret == -ENOMEM) {
 				/* Code buffer is full. Request the reaper to
 				 * flush it. */

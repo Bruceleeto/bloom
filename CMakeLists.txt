@@ -43,6 +43,63 @@ if (JITPROF)
 	message(STATUS "JIT profiler: ON (TMU2, reports with the bench window)")
 endif()
 
+# Exclusive wall-time buckets (src/prof.c) and the counters that give them
+# denominators (src/census.c).  Both off by default: the bucket profiler reads
+# an on-chip counter on every C crossing and bloom takes a lot of those, so the
+# build that produces a throughput figure must not carry it.  Take the window
+# both ways and the difference prices the instrument.
+#
+# Carried on an INTERFACE target rather than add_compile_definitions() so the
+# header lands only on the targets that ask for it — src/ on the global include
+# path would shadow vendored headers of the same name.
+add_library(bloom_instr INTERFACE)
+target_include_directories(bloom_instr INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+option(PROF "Split wall time into exclusive buckets (PRFC1)" OFF)
+if (PROF)
+	target_compile_definitions(bloom_instr INTERFACE BLOOM_PROF=1)
+	message(STATUS "Bucket profiler: ON (PRFC1, reports with the bench window)")
+endif()
+
+# SH-4 event counter, gated to generated code.  Needs PROF (it rides on the
+# same bracket stack to know when we are inside generated code) and takes
+# PRFC0, which KOS uses for perf_cntr_timer_ns() — so a STALL build must not
+# call that.  See the note in src/prof.h.
+set(STALL 0 CACHE STRING
+	"SH-4 PRFC0 event: 0 off, 1 icache freeze, 2 dcache freeze, 3 issued, 4 dual-issued"
+)
+if (NOT STALL EQUAL 0)
+	if (NOT PROF)
+		message(FATAL_ERROR "STALL needs PROF=ON: the counters are gated on the bracket stack")
+	endif()
+	target_compile_definitions(bloom_instr INTERFACE BLOOM_STALL=${STALL})
+	message(STATUS "SH-4 event counter: mode ${STALL} (PRFC0), gated to generated code")
+endif()
+
+# Dump the emitted SH-4 for a few hot guest blocks as hex, at the end of the
+# bench window.  The same addresses can be dumped from bloop, so the two
+# translations of identical MIPS can be disassembled side by side — see the
+# note above lightrec_dump_block() in deps/lightrec/lightrec.c.
+option(WITH_BLOCKDUMP "Dump hot blocks' emitted code as hex" OFF)
+if (WITH_BLOCKDUMP)
+	message(STATUS "Block dump: ON (hex on stdout, after the bench report)")
+endif()
+
+option(CENSUS "Count frames, binds, GTE commands and C crossings" OFF)
+if (CENSUS)
+	target_compile_definitions(bloom_instr INTERFACE BLOOM_CENSUS=1)
+	message(STATUS "Census counters: ON")
+endif()
+
+# Number of guest frames the benchmark runs for.  A frame budget, not a wall
+# budget: at 49% realtime a 60-second window covers half as much of the game as
+# a realtime emulator's does, so per-run counts taken that way are over
+# different content and do not subtract.  Frames are the one unit that means
+# the same thing on both sides.
+set(WITH_BENCH_FRAMES 1500 CACHE STRING
+	"Guest frames the benchmark window runs for (0 = fall back to a wall-clock window)"
+)
+
 find_library(PARALLAX_LIBRARIES parallax REQUIRED)
 add_library(parallax STATIC IMPORTED)
 set_target_properties(parallax PROPERTIES
@@ -192,7 +249,11 @@ target_compile_definitions(libpcsxcore PUBLIC
 	GPUSTATUS_POLLING_THRESHOLD=${WITH_GPUSTATUS_POLLING_THRESHOLD}
 )
 target_compile_options(libpcsxcore PRIVATE -Wno-format)
-target_link_libraries(libpcsxcore PUBLIC lightrec zlib)
+target_link_libraries(libpcsxcore PUBLIC lightrec zlib bloom_instr)
+
+# The instrument's brackets live inside lightrec too (the compile path and the
+# memory-access wrappers), so it needs the header as well.
+target_link_libraries(lightrec PRIVATE bloom_instr)
 
 if (NOT GPU_PLUGIN)
 	set(GPU_PLUGIN PVR CACHE STRING "GPU plugin" FORCE)
@@ -219,6 +280,8 @@ elseif(GPU_PLUGIN STREQUAL PVR)
 	target_include_directories(gpu PRIVATE ${PCSX_REAL_DIR}/plugins)
 	set(HARDWARE_ACCELERATED ON)
 endif()
+
+target_link_libraries(gpu PRIVATE bloom_instr)
 
 option(ENABLE_THREADED_RENDERER "Threaded renderer" OFF)
 if (ENABLE_THREADED_RENDERER)
@@ -271,8 +334,11 @@ elseif(SPU_PLUGIN STREQUAL AICA)
 	add_library(spu STATIC src/aica.c)
 endif()
 
+target_link_libraries(spu PRIVATE bloom_instr)
+
 add_executable(bloom
 	src/background.cpp
+	src/census.c
 	src/cdr.c
 	src/copy32.s
 	src/dynload.c
@@ -284,8 +350,9 @@ add_executable(bloom
 	src/mmap.c
 	src/platform.c
 	src/plugins.c
+	src/prof.c
 )
-target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
+target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami bloom_instr
 	#lightning lightrec libpcsxcore gpu spu
 	#${ZLIB_LIBRARIES} tsunami parallax
 )

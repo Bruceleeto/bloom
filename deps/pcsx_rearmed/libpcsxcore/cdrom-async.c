@@ -19,6 +19,10 @@
 #include "cdrom.h"
 #include "cdrom-async.h"
 
+/* bloom: compiles to nothing without -DPROF=ON / -DCENSUS=ON */
+#include "census.h"
+#include "prof.h"
+
 #if 0
 #define acdrom_dbg printf
 #else
@@ -412,11 +416,21 @@ static int cdra_do_read(const unsigned char *time, int cdda,
 // time: msf in non-bcd format
 int cdra_readTrack(const unsigned char *time)
 {
+   int ret;
+
+   prof_enter(PROF_CD);
+   census_bump(CENSUS_CD_SECTORS);
+
    if (!acdrom.thread && !g_cd_handle) {
       // just forward to ISOreadTrack to avoid extra copying
-      return ISOreadTrack(time, NULL);
+      ret = ISOreadTrack(time, NULL);
+   } else {
+      ret = cdra_do_read(time, 0, acdrom.buf_local, NULL);
    }
-   return cdra_do_read(time, 0, acdrom.buf_local, NULL);
+
+   prof_leave();
+
+   return ret;
 }
 
 int cdra_readCDDA(const unsigned char *time, void *buffer)
@@ -546,7 +560,14 @@ int cdra_prefetch(unsigned char m, unsigned char s, unsigned char f)
 // time: msf in non-bcd format
 int cdra_readTrack(const unsigned char *time)
 {
-   return ISOreadTrack(time, NULL);
+   int ret;
+
+   prof_enter(PROF_CD);
+   census_bump(CENSUS_CD_SECTORS);
+   ret = ISOreadTrack(time, NULL);
+   prof_leave();
+
+   return ret;
 }
 
 int cdra_readCDDA(const unsigned char *time, void *buffer)

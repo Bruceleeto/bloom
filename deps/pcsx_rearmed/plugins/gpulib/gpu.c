@@ -19,6 +19,10 @@
 #include "../../frontend/plugin_lib.h"
 #include "../../include/compiler_features.h"
 
+/* bloom: compiles to nothing without -DPROF=ON / -DCENSUS=ON */
+#include "census.h"
+#include "prof.h"
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
@@ -668,6 +672,11 @@ static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count
   uint32_t old_e3 = gpu->ex_regs[3];
   int vram_dirty = 0;
 
+  /* bloom: PROF_GPUFRONT is the GP0 decode and display-list walk.  The
+   * renderer's do_cmd_list() is bracketed PROF_RENDER inside it (src/pvr.c),
+   * so this bucket's exclusive time is the front end alone. */
+  prof_enter(PROF_GPUFRONT);
+
   // process buffer
   for (pos = 0; pos < count; )
   {
@@ -728,6 +737,7 @@ static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count
       pos += do_cmd_list_skip(gpu, data + pos, count - pos, &cmd);
     }
     else {
+      census_gp0((LE32TOH(data[pos]) >> 24) & 0xff);
       pos += do_cmd_list(data + pos, count - pos, cycles_sum, cycles_last, &cmd);
       vram_dirty = 1;
     }
@@ -745,6 +755,8 @@ static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count
 
   if (old_e3 != gpu->ex_regs[3])
     decide_frameskip_allow(gpu);
+
+  prof_leave();
 
   return count - pos;
 }

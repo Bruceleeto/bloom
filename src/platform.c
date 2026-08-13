@@ -21,7 +21,9 @@
 #include <sys/time.h>
 
 #include "bloom-config.h"
+#include "census.h"
 #include "emu.h"
+#include "prof.h"
 #include "pvr.h"
 
 #define MAX_LAG_FRAMES 3
@@ -35,6 +37,12 @@
 
 static unsigned int frames;
 static uint64_t timer_ms;
+
+/* Guest display flips since boot, free-running.  `frames` above is zeroed
+ * every second for the VMU readout; the benchmark needs a count that is not,
+ * because its window is a number of frames rather than a number of seconds
+ * (see the WITH_BENCH_FRAMES comment in CMakeLists.txt). */
+unsigned int bloom_frame_count;
 
 static pvr_ptr_t pvram;
 static uint32_t *pvram_sq;
@@ -235,7 +243,10 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		xmin = (float)x * (float)screen_fw;
 		xmax = (float)(x + w) * (float)screen_fw;
 
+		prof_enter(PROF_FLIP);
 		pvr_wait_ready();
+		prof_leave();
+
 		pvr_scene_begin();
 		pvr_list_begin(PVR_LIST_OP_POLY);
 
@@ -280,7 +291,10 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		pvr_prim(&vert, sizeof(vert));
 
 		pvr_list_finish();
+
+		prof_enter(PROF_FLIP);
 		pvr_scene_finish();
+		prof_leave();
 	}
 
 	frame_was_24bpp = bgr24;
@@ -288,6 +302,8 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	new_timer = timer_ms_gettime64();
 
 	frames++;
+	bloom_frame_count++;
+	census_bump(CENSUS_FRAMES);
 
 	if (timer_ms == 0) {
 		timer_ms = new_timer;

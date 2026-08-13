@@ -19,6 +19,16 @@
 #include "optimizer.h"
 #include "tlsf/tlsf.h"
 
+/* bloom: compiles to nothing without -DPROF=ON / -DCENSUS=ON.
+ *
+ * Only the inline compile path is bracketed.  With ENABLE_THREADED_COMPILER
+ * the work happens on a worker thread, where a bracket would interleave with
+ * the emulator's stack — prof.c ignores calls from other threads on purpose,
+ * and the report prints emu-thread against total CPU so the worker's share is
+ * visible there instead. */
+#include "census.h"
+#include "prof.h"
+
 #include <errno.h>
 #include <inttypes.h>
 #ifdef JITPROF
@@ -768,7 +778,10 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 			if (ENABLE_THREADED_COMPILER) {
 				lightrec_recompiler_add(state->rec, block);
 			} else {
+				prof_enter(PROF_COMPILE);
+				census_bump(CENSUS_COMPILES);
 				err = lightrec_compile_block(state->cstate, block);
+				prof_leave();
 				if (err) {
 					state->exit_flags = LIGHTREC_EXIT_NOMEM;
 					return NULL;
@@ -795,7 +808,10 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 				pc = lightrec_emulate_block(state, block, pc);
 
 			/* Then compile it using the profiled data */
+			prof_enter(PROF_COMPILE);
+			census_bump(CENSUS_COMPILES);
 			err = lightrec_compile_block(state->cstate, block);
+			prof_leave();
 			if (err) {
 				state->exit_flags = LIGHTREC_EXIT_NOMEM;
 				return NULL;
@@ -1551,6 +1567,72 @@ static void lightrec_reap_function(struct lightrec_state *state, void *data)
 static void lightrec_reap_opcode_list(struct lightrec_state *state, void *data)
 {
 	lightrec_free_opcode_list(state, data);
+}
+
+/* THE EMITTED CODE FOR ONE HOT GUEST BLOCK, AS HEX ON THE CONSOLE.
+ *
+ * The issue counter says bloom runs 8.76 SH-4 instructions per guest
+ * instruction against bloop's 4.76, and the static density says bloom's
+ * emitted code is the *denser* of the two.  Both cannot be explained by the
+ * block bodies, so the difference has to be at the edges — the prologue, the
+ * epilogue and the dispatcher tail — and that is an inference from two ratios
+ * taken on different builds, which is exactly the kind of cost model this
+ * project keeps getting wrong.  This turns it into a line-by-line count.
+ *
+ * Writes /pc/bloom_<guest>.bin over dc-load, and falls back to hex on the
+ * console if that cannot be opened — dc-tool needs -c <dir> for /pc to exist,
+ * and a run that forgets it should still produce something usable.
+ *
+ * Pair it with the same guest address on the other emulator — the format is
+ * identical on both — and disassemble each with
+ *     sh-elf-objdump -b binary -m sh4 -D block.bin
+ */
+void lightrec_dump_block(struct lightrec_state *state, u32 pc)
+{
+	const unsigned char *code;
+	struct block *block;
+	unsigned int i;
+	char path[64];
+	FILE *f;
+
+	block = lightrec_find_block_containing(state->block_cache, pc);
+	if (!block || !block->function) {
+		printf("DUMP: bloom guest=%08lx NOT FOUND\n",
+		       (unsigned long)pc);
+		return;
+	}
+
+	code = (const unsigned char *)block->function;
+
+	printf("DUMP: bloom guest=%08lx host=%08lx guest_ops=%u bytes=%u\n",
+	       (unsigned long)block->pc, (unsigned long)(uintptr_t)code,
+	       (unsigned int)block->nb_ops, (unsigned int)block->code_size);
+
+	snprintf(path, sizeof(path), "/pc/bloom_%08lx.bin",
+		 (unsigned long)block->pc);
+
+	f = fopen(path, "wb");
+	if (f) {
+		fwrite(code, 1, block->code_size, f);
+		fclose(f);
+		printf("DUMP: wrote %s\n", path);
+		return;
+	}
+
+	printf("DUMP: %s not writable (dc-tool needs -c <dir>), hex follows\n",
+	       path);
+
+	for (i = 0; i < block->code_size; i++) {
+		if (!(i & 31))
+			printf("DUMP: ");
+		printf("%02x", code[i]);
+		if ((i & 31) == 31)
+			printf("\n");
+	}
+	if (block->code_size & 31)
+		printf("\n");
+
+	printf("DUMP: end\n");
 }
 
 int lightrec_compile_block(struct lightrec_cstate *cstate,

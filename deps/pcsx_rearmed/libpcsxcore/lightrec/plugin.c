@@ -39,6 +39,11 @@
 u64 bench_exec_us;
 #endif
 
+/* bloom's instruments.  Both compile to nothing unless -DPROF=ON / -DCENSUS=ON
+ * (see src/prof.h, src/census.h). */
+#include "census.h"
+#include "prof.h"
+
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #	define LE32TOH(x)	__builtin_bswap32(x)
 #	define HTOLE32(x)	__builtin_bswap32(x)
@@ -149,6 +154,9 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 
 	psxRegs.code = func;
 
+	prof_enter(PROF_GTE);
+	census_gte(func);
+
 	if (unlikely(!cp2_ops[func & 0x3f])) {
 		fprintf(stderr, "Invalid CP2 function %u\n", func);
 	} else {
@@ -156,6 +164,8 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 		 * so it can be cast to a pcsxCP2Regs pointer. */
 		cp2_ops[func & 0x3f]((psxCP2Regs *) regs->cp2d);
 	}
+
+	prof_leave();
 }
 
 static bool has_interrupt(void)
@@ -184,45 +194,70 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 	}
 }
 
+/* The wrappers below are bracketed MEMCLASS and the psxHw* bodies they call
+ * are bracketed IO (psxhw.c), so MEMCLASS's exclusive time is the cost of the
+ * crossing itself — the two cycle-count transitions and the call — with the
+ * device work subtracted out.  That split is the point: bloop has no MEMCLASS
+ * at all, because it leaves the I/O window unmapped and lets the MMU classify. */
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	prof_enter(PROF_MEMCLASS);
+	census_bump(CENSUS_HW_WRITE);
+
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite8(mem, val);
 
 	lightrec_tansition_from_pcsx(state);
+
+	prof_leave();
 }
 
 static void hw_write_half(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	prof_enter(PROF_MEMCLASS);
+	census_bump(CENSUS_HW_WRITE);
+
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite16(mem, val);
 
 	lightrec_tansition_from_pcsx(state);
+
+	prof_leave();
 }
 
 static void hw_write_word(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	prof_enter(PROF_MEMCLASS);
+	census_bump(CENSUS_HW_WRITE);
+
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite32(mem, val);
 
 	lightrec_tansition_from_pcsx(state);
+
+	prof_leave();
 }
 
 static u8 hw_read_byte(struct lightrec_state *state, u32 op, void *host, u32 mem)
 {
 	u8 val;
 
+	prof_enter(PROF_MEMCLASS);
+	census_bump(CENSUS_HW_READ);
+
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead8(mem);
 
 	lightrec_tansition_from_pcsx(state);
+
+	prof_leave();
 
 	return val;
 }
@@ -232,11 +267,16 @@ static u16 hw_read_half(struct lightrec_state *state,
 {
 	u16 val;
 
+	prof_enter(PROF_MEMCLASS);
+	census_bump(CENSUS_HW_READ);
+
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead16(mem);
 
 	lightrec_tansition_from_pcsx(state);
+
+	prof_leave();
 
 	return val;
 }
@@ -246,6 +286,9 @@ static u32 hw_read_word(struct lightrec_state *state,
 {
 	static u32 old_cycle, oldold_cycle, old_gpusr;
 	u32 val, diff;
+
+	prof_enter(PROF_MEMCLASS);
+	census_bump(CENSUS_HW_READ);
 
 	lightrec_tansition_to_pcsx(state);
 
@@ -259,6 +302,9 @@ static u32 hw_read_word(struct lightrec_state *state,
 		    && diff == old_cycle - oldold_cycle) {
 			while (psxRegs.next_interupt > psxRegs.cycle && val == old_gpusr) {
 				psxRegs.cycle += diff;
+				/* Cycles nobody executed — see
+				 * CENSUS_SKIPPED_CYCLES in src/census.h. */
+				census_add(CENSUS_SKIPPED_CYCLES, diff);
 				val = psxHwRead32(mem);
 			}
 		}
@@ -269,6 +315,8 @@ static u32 hw_read_word(struct lightrec_state *state,
 	}
 
 	lightrec_tansition_from_pcsx(state);
+
+	prof_leave();
 
 	return val;
 }
@@ -633,7 +681,11 @@ static void lightrec_plugin_execute_internal(bool block_only)
 	u32 old_pc = psxRegs.pc;
 
 	regs = lightrec_get_registers(lightrec_state);
+
+	prof_enter(PROF_EVENTS);
 	gen_interupt((psxCP0Regs *)regs->cp0);
+	prof_leave();
+
 	if (!block_only && psxRegs.stop)
 		return;
 
@@ -652,6 +704,12 @@ static void lightrec_plugin_execute_internal(bool block_only)
 #ifdef _arch_dreamcast
 		u64 bench_t0 = timer_us_gettime64();
 #endif
+		/* One dispatcher round trip.  Divided into PROF_GUEST's ms it
+		 * gives the cost of an exit, which is the number that says
+		 * whether to attack how often we leave generated code or what
+		 * leaving costs. */
+		census_bump(CENSUS_EXEC_ENTRIES);
+
 		if (unlikely(use_lightrec_interpreter)) {
 			psxRegs.pc = lightrec_run_interpreter(lightrec_state,
 							      psxRegs.pc,
@@ -716,14 +774,38 @@ static void lightrec_plugin_execute_block(psxRegisters *regs,
 	lightrec_plugin_execute_internal(true);
 }
 
+/* THE BLOCKS WORTH DISASSEMBLING, and they are bloop's hot list rather than
+ * ours on purpose: same game, same code, so dumping these addresses on both
+ * emulators gives two translations of the SAME MIPS to set side by side.  They
+ * come from bloop's `where:` sampler (~11/9/8/8% of its samples).  A PC sampler
+ * lands mid-block, so the lookup finds the block CONTAINING the address rather
+ * than one starting at it. */
+void lightrec_dump_hot(void)
+{
+	static const u32 dump_pcs[] = {
+		0x8005df44, 0x80063e58, 0x80061960, 0x8005dd80,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(dump_pcs); i++)
+		lightrec_dump_block(lightrec_state, dump_pcs[i]);
+
+	fflush(stdout);
+}
+
 static void lightrec_plugin_clear(u32 addr, u32 size)
 {
+	prof_enter(PROF_INVALIDATE);
+	census_bump(CENSUS_INVALIDATES);
+
 	if ((addr == 0 && size == UINT32_MAX)
 	    || (lightrec_hacks & LIGHTREC_OPT_INV_DMA_ONLY))
 		lightrec_invalidate_all(lightrec_state);
 	else
 		/* size * 4: PCSX uses DMA units */
 		lightrec_invalidate(lightrec_state, addr, size * 4);
+
+	prof_leave();
 }
 
 static void lightrec_plugin_notify(enum R3000Anote note, void *data)

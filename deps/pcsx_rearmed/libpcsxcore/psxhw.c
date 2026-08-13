@@ -28,6 +28,26 @@
 #include "gpu.h"
 #include "../include/compiler_features.h"
 
+/* bloom: compiles to nothing without -DPROF=ON (src/prof.h) */
+#include "prof.h"
+
+#ifdef BLOOM_PROF
+/* Bracket every hardware register access as PROF_IO.  The bodies below have
+ * returns scattered through their switches, so the bracket cannot wrap the
+ * body — the definitions are renamed here and the wrappers at the end of the
+ * file carry the public names.  psxhw.h is included above, so the prototypes
+ * keep the real names and only the definitions move.
+ *
+ * These nest inside PROF_MEMCLASS (the lightrec plugin's rw wrappers), which
+ * is what makes MEMCLASS's exclusive time the cost of the crossing alone. */
+#define psxHwRead8	psxHwRead8_body
+#define psxHwRead16	psxHwRead16_body
+#define psxHwRead32	psxHwRead32_body
+#define psxHwWrite8	psxHwWrite8_body
+#define psxHwWrite16	psxHwWrite16_body
+#define psxHwWrite32	psxHwWrite32_body
+#endif
+
 void psxHwReset() {
 	memset(psxH, 0, 0x10000);
 
@@ -462,3 +482,60 @@ void psxHwWrite32(u32 add, u32 value) {
 int psxHwFreeze(void *f, int Mode) {
 	return 0;
 }
+
+#ifdef BLOOM_PROF
+#undef psxHwRead8
+#undef psxHwRead16
+#undef psxHwRead32
+#undef psxHwWrite8
+#undef psxHwWrite16
+#undef psxHwWrite32
+
+u8 psxHwRead8(u32 add) {
+	u8 v;
+
+	prof_enter(PROF_IO);
+	v = psxHwRead8_body(add);
+	prof_leave();
+
+	return v;
+}
+
+u16 psxHwRead16(u32 add) {
+	u16 v;
+
+	prof_enter(PROF_IO);
+	v = psxHwRead16_body(add);
+	prof_leave();
+
+	return v;
+}
+
+u32 psxHwRead32(u32 add) {
+	u32 v;
+
+	prof_enter(PROF_IO);
+	v = psxHwRead32_body(add);
+	prof_leave();
+
+	return v;
+}
+
+void psxHwWrite8(u32 add, u32 value) {
+	prof_enter(PROF_IO);
+	psxHwWrite8_body(add, value);
+	prof_leave();
+}
+
+void psxHwWrite16(u32 add, u32 value) {
+	prof_enter(PROF_IO);
+	psxHwWrite16_body(add, value);
+	prof_leave();
+}
+
+void psxHwWrite32(u32 add, u32 value) {
+	prof_enter(PROF_IO);
+	psxHwWrite32_body(add, value);
+	prof_leave();
+}
+#endif /* BLOOM_PROF */

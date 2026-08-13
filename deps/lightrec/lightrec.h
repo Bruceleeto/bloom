@@ -152,6 +152,9 @@ __api void lightrec_set_target_cycle_count(struct lightrec_state *state,
 					   u32 cycles);
 __api void lightrec_set_cycles_per_opcode(struct lightrec_state *state, u32 cycles);
 
+/* bloom: print one hot block's emitted SH-4 as hex.  See lightrec.c. */
+__api void lightrec_dump_block(struct lightrec_state *state, u32 pc);
+
 #ifdef __cplusplus
 };
 #endif

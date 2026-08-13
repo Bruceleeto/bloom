@@ -9,6 +9,21 @@
 #include <dc/sound/sound.h>
 #include <dc/spu.h>
 
+/* bloom: compiles to nothing without -DPROF=ON (src/prof.h).
+ *
+ * These bodies return from several places, so the bracket goes on a wrapper:
+ * the definitions below are renamed and the public names are re-emitted at the
+ * end of the file.  The G2 bus writes in here are the expensive part and they
+ * arrive from psxHwWrite16, so PROF_SPU nests inside PROF_IO. */
+#include "prof.h"
+
+#ifdef BLOOM_PROF
+#define SPUwriteRegister	SPUwriteRegister_body
+#define SPUreadRegister		SPUreadRegister_body
+#define SPUwriteDMAMem		SPUwriteDMAMem_body
+#define SPUreadDMAMem		SPUreadDMAMem_body
+#endif
+
 #define H_SPUirqAddr     0x0da4
 #define H_SPUaddr        0x0da6
 #define H_SPUdata        0x0da8
@@ -251,3 +266,43 @@ void SPUregisterScheduleCb(void (*cb)(unsigned int))
 void SPUasync(unsigned int cycle, unsigned int flags)
 {
 }
+
+#ifdef BLOOM_PROF
+#undef SPUwriteRegister
+#undef SPUreadRegister
+#undef SPUwriteDMAMem
+#undef SPUreadDMAMem
+
+void SPUwriteRegister(unsigned long reg, unsigned short val,
+		      unsigned int cycles)
+{
+	prof_enter(PROF_SPU);
+	SPUwriteRegister_body(reg, val, cycles);
+	prof_leave();
+}
+
+unsigned short SPUreadRegister(unsigned long reg, unsigned int cycles)
+{
+	unsigned short v;
+
+	prof_enter(PROF_SPU);
+	v = SPUreadRegister_body(reg, cycles);
+	prof_leave();
+
+	return v;
+}
+
+void SPUwriteDMAMem(unsigned short *addr, int size, unsigned int cycles)
+{
+	prof_enter(PROF_SPU);
+	SPUwriteDMAMem_body(addr, size, cycles);
+	prof_leave();
+}
+
+void SPUreadDMAMem(unsigned short *addr, int size, unsigned int cycles)
+{
+	prof_enter(PROF_SPU);
+	SPUreadDMAMem_body(addr, size, cycles);
+	prof_leave();
+}
+#endif /* BLOOM_PROF */

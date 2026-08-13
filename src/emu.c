@@ -26,8 +26,10 @@
 #include <sys/stat.h>
 
 #include "bloom-config.h"
+#include "census.h"
 #include "emu.h"
 #include "jitprof.h"
+#include "prof.h"
 #include "pvr.h"
 
 int fs_fat_init(void);
@@ -127,15 +129,29 @@ bool emu_check_cd(const char *path)
 #define BENCH_CD_WINDOW_MS 60000
 #define PSX_CLOCK_HZ 33868800
 
+/* A frame budget stalls forever if the guest stops producing frames, so the
+ * wall-clock window stays on as a backstop.  Generous, because the whole point
+ * of the frame budget is that a slower emulator is allowed to take longer. */
+#define BENCH_FRAME_CAP_MS 300000
+
 /* Wall time spent inside generated code, counted in the lightrec plugin */
 extern uint64_t bench_exec_us;
 
+/* Guest display flips since boot, from the vout flip callback */
+extern unsigned int bloom_frame_count;
+
+/* Dump the hot blocks' emitted SH-4.  Lives in the lightrec plugin, which
+ * owns lightrec_state and the address list — see lightrec_dump_hot(). */
+void lightrec_dump_hot(void);
+
 static unsigned int bench_window_ms;
+static unsigned int bench_frames;
 
 static void *bench_stop_thd(void *arg)
 {
 	uint64_t t0, t, t_prev, exec, exec_prev, exec0, insns;
 	uint32_t cycle, cycle0, cycle_prev, cycles, ms, pc;
+	uint32_t frames, frames0, frames_prev, frames_done;
 
 	/* Don't count the BIOS boot: arm once the PC reaches the game EXE
 	 * (RAM above the kernel's 64K, below the shell at 0x30000). */
@@ -147,14 +163,20 @@ static void *bench_stop_thd(void *arg)
 	if (psxRegs.stop)
 		return NULL;
 
-	printf("BENCH: armed at pc %08lx\n", (unsigned long)psxRegs.pc);
+	printf("BENCH: armed at pc %08lx, budget %u frames%s\n",
+	       (unsigned long)psxRegs.pc, bench_frames,
+	       bench_frames ? "" : " (wall-clock window)");
 
-	/* Sample over exactly the window the k/s number is taken from. */
+	/* Sample over exactly the window the numbers are taken from. */
 	jitprof_start();
+	prof_start();
+	prof_calibrate();
+	census_reset();
 
 	t0 = t_prev = timer_ms_gettime64();
 	cycle0 = cycle_prev = psxRegs.cycle;
 	exec0 = exec_prev = bench_exec_us;
+	frames0 = frames_prev = bloom_frame_count;
 
 	while (!psxRegs.stop) {
 		thd_sleep(1000);
@@ -162,13 +184,17 @@ static void *bench_stop_thd(void *arg)
 		t = timer_ms_gettime64();
 		cycle = psxRegs.cycle;
 		exec = bench_exec_us;
+		frames = bloom_frame_count;
 
 		ms = t - t_prev;
 		cycles = cycle - cycle_prev;
 		insns = (uint64_t)cycles * 100 / Config.cycle_multiplier;
 
-		printf("BENCH: %llu k/s, %u%% realtime, %u%% in guest code\n",
+		printf("BENCH: %llu k/s, %lu.%lu fps, %u%% realtime,"
+		       " %u%% in guest code\n",
 		       (unsigned long long)(insns / ms),
+		       (unsigned long)((uint64_t)(frames - frames_prev) * 10000 / ms / 10),
+		       (unsigned long)((uint64_t)(frames - frames_prev) * 10000 / ms % 10),
 		       (unsigned int)((uint64_t)cycles * 100
 				      / ((uint64_t)ms * (PSX_CLOCK_HZ / 1000))),
 		       (unsigned int)((exec - exec_prev) / (ms * 10)));
@@ -176,24 +202,46 @@ static void *bench_stop_thd(void *arg)
 		t_prev = t;
 		cycle_prev = cycle;
 		exec_prev = exec;
+		frames_prev = frames;
 
-		if (t - t0 >= bench_window_ms)
+		if (bench_frames) {
+			if (frames - frames0 >= bench_frames
+			    || t - t0 >= BENCH_FRAME_CAP_MS)
+				break;
+		} else if (t - t0 >= bench_window_ms) {
 			break;
+		}
 	}
 
 	ms = timer_ms_gettime64() - t0;
 	if (!ms)
 		ms = 1;
 	insns = (uint64_t)(psxRegs.cycle - cycle0) * 100 / Config.cycle_multiplier;
+	frames_done = bloom_frame_count - frames0;
 
 	printf("BENCH: total %llu guest instructions in %lu ms"
-	       " -> %llu k/s, %u%% in guest code\n",
+	       " -> %llu k/s, %lu frames (%lu.%lu fps), %u%% in guest code\n",
 	       (unsigned long long)insns, (unsigned long)ms,
 	       (unsigned long long)(insns / ms),
+	       (unsigned long)frames_done,
+	       (unsigned long)((uint64_t)frames_done * 10000 / ms / 10),
+	       (unsigned long)((uint64_t)frames_done * 10000 / ms % 10),
 	       (unsigned int)((bench_exec_us - exec0) / (ms * 10)));
+
+	if (bench_frames && frames_done < bench_frames)
+		printf("BENCH: SHORT — %lu of %u frames before the %u ms cap;"
+		       " this run is not comparable\n",
+		       (unsigned long)frames_done, bench_frames,
+		       BENCH_FRAME_CAP_MS);
+
 	fflush(stdout);
 
+	prof_report(ms, frames_done, insns);
+	census_report(ms, frames_done);
 	jitprof_report();
+
+	if (WITH_BLOCKDUMP)
+		lightrec_dump_hot();
 
 	psxRegs.stop = 1;
 
@@ -276,10 +324,16 @@ int main(int argc, char **argv)
 				}
 			}
 
-			if (bench)
-				bench_window_ms = strstr(bench_path, ".exe")
-					? BENCH_EXE_WINDOW_MS
-					: BENCH_CD_WINDOW_MS;
+			if (bench) {
+				bool exe = !!strstr(bench_path, ".exe");
+
+				bench_window_ms = exe ? BENCH_EXE_WINDOW_MS
+						      : BENCH_CD_WINDOW_MS;
+
+				/* The .exe fixture never flips, so a frame
+				 * budget would never retire on it. */
+				bench_frames = exe ? 0 : WITH_BENCH_FRAMES;
+			}
 		}
 
 		if (bench || WITH_GAME_PATH[0]) {
@@ -334,8 +388,13 @@ int main(int argc, char **argv)
 
 		psxRegs.stop = 0;
 
-		if (bench)
+		if (bench) {
+			/* The profiler's brackets all run on this thread;
+			 * the watcher below only arms and reports. */
+			prof_claim();
+
 			thd_create(1, bench_stop_thd, NULL);
+		}
 
 		while (!psxRegs.stop)
 			psxCpu->Execute(&psxRegs);
