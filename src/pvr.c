@@ -2251,6 +2251,12 @@ static void process_poly(struct poly *poly, bool scissor)
 		}
 	}
 
+	/* If the current draw area covers the whole render area, tile clipping
+	 * is a no-op: skip the modifier machinery — headers stay plain and
+	 * draw_prim won't send the second vertex packet. */
+	if (WITH_CLIPPING && !pvr.clip_test)
+		poly->flags |= POLY_NOCLIP;
+
 	if (likely(!(poly->flags & POLY_IGN_MASK))) {
 		set_mask = pvr.set_mask;
 		check_mask = pvr.check_mask;
