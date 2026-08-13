@@ -50,6 +50,34 @@ struct block * lightrec_find_block_containing(struct blockcache *cache, u32 pc)
 	return NULL;
 }
 
+/* The block whose EMITTED code contains host_addr.  PC-sampler buckets name
+ * host addresses, not guest ones; this is the reverse map.  Full LUT walk,
+ * only meant for report time. */
+struct block * lightrec_find_block_by_host(struct blockcache *cache,
+					   uintptr_t host_addr)
+{
+	struct block *block;
+	unsigned int i;
+	uintptr_t start;
+
+	host_addr &= 0x1fffffff;
+
+	for (i = 0; i < LUT_SIZE; i++) {
+		for (block = cache->lut[i]; block; block = block->next) {
+			if (!block->function)
+				continue;
+
+			start = (uintptr_t)block->function & 0x1fffffff;
+
+			if (host_addr >= start
+			    && host_addr < start + block->code_size)
+				return block;
+		}
+	}
+
+	return NULL;
+}
+
 struct block * lightrec_find_block(struct blockcache *cache, u32 pc)
 {
 	struct block *block;

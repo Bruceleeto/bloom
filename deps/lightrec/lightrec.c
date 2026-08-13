@@ -37,6 +37,36 @@
  * call, so PC samples that land in host C can be attributed to generated
  * code rather than to the frontend, the plugins or the CD. */
 extern volatile int jitprof_in_jit;
+
+/* For src/jitprof.c's report: reverse-map a sampled host address to the guest
+ * block that owns it.  The state pointer is stashed at init. */
+static struct lightrec_state *jitprof_lightrec_state;
+
+u32 jitprof_block_from_host(uintptr_t host, const void **host_start,
+			    u32 *code_size, const u32 **guest_code,
+			    u32 *nb_ops);
+
+u32 jitprof_block_from_host(uintptr_t host, const void **host_start,
+			    u32 *code_size, const u32 **guest_code,
+			    u32 *nb_ops)
+{
+	struct lightrec_state *state = jitprof_lightrec_state;
+	struct block *block;
+
+	if (!state)
+		return 0;
+
+	block = lightrec_find_block_by_host(state->block_cache, host);
+	if (!block)
+		return 0;
+
+	*host_start = block->function;
+	*code_size = block->code_size;
+	*guest_code = block->code;
+	*nb_ops = block->nb_ops;
+
+	return block->pc;
+}
 #endif
 #include <limits.h>
 #if ENABLE_THREADED_COMPILER
@@ -2070,6 +2100,10 @@ struct lightrec_state * lightrec_init(char *argv0,
 	state->block_cache = lightrec_blockcache_init(state);
 	if (!state->block_cache)
 		goto err_free_state;
+
+#ifdef JITPROF
+	jitprof_lightrec_state = state;
+#endif
 
 	if (ENABLE_THREADED_COMPILER) {
 		state->rec = lightrec_recompiler_init(state);

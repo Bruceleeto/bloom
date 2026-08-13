@@ -135,10 +135,12 @@ static uint32_t pct(uint32_t n, uint32_t of)
 }
 
 /* Print the heaviest buckets of one histogram, plus a paste-ready addr2line
- * argument list for the same addresses. */
-static void jitprof_top(const char *title, const uint32_t *b,
-			unsigned int nb, uintptr_t base, uint32_t of,
-			int want_cmd)
+ * argument list for the same addresses.  If out_addr is non-NULL the bucket
+ * addresses are copied there (JITPROF_TOP entries max) and the count
+ * returned. */
+static unsigned int jitprof_top(const char *title, const uint32_t *b,
+				unsigned int nb, uintptr_t base, uint32_t of,
+				int want_cmd, uintptr_t *out_addr)
 {
 	static uint8_t taken[JITPROF_HOST_BUCKETS];
 	uintptr_t addr[JITPROF_TOP];
@@ -147,7 +149,7 @@ static void jitprof_top(const char *title, const uint32_t *b,
 	int best_i;
 
 	if (!of)
-		return;
+		return 0;
 
 	memset(taken, 0, nb);
 
@@ -190,10 +192,91 @@ static void jitprof_top(const char *title, const uint32_t *b,
 			printf(" %08lx", (unsigned long)addr[i]);
 		printf("\n");
 	}
+
+	if (out_addr)
+		memcpy(out_addr, addr, n * sizeof(*addr));
+
+	return n;
+}
+
+/* Reverse map from lightrec: sampled host address -> the guest block that
+ * owns it.  Returns the guest PC, or 0 if no live block covers the address
+ * (freed or invalidated since the sample was taken). */
+extern uint32_t jitprof_block_from_host(uintptr_t host,
+					const void **host_start,
+					uint32_t *code_size,
+					const uint32_t **guest_code,
+					uint32_t *nb_ops);
+
+#define JITPROF_DUMP_BLOCKS	3	/* full code dumps for the hottest N */
+#define JITPROF_DUMP_MAX	4096	/* bytes of emitted code per block */
+
+static void jitprof_hexdump(const char *tag, uint32_t base,
+			    const uint32_t *p, uint32_t nwords)
+{
+	uint32_t i, j;
+
+	for (i = 0; i < nwords; i += 4) {
+		printf("JITPROF: %s %08lx:", tag, (unsigned long)(base + i * 4));
+		for (j = i; j < nwords && j < i + 4; j++)
+			printf(" %08lx", (unsigned long)p[j]);
+		printf("\n");
+	}
+}
+
+/* Name the guest block behind each hot emitted bucket, and dump the hottest
+ * few in full — guest MIPS words (M lines) and emitted SH-4 words (S lines) —
+ * so both sides can be disassembled offline. */
+static void jitprof_blocks(const uintptr_t *addr, unsigned int n)
+{
+	uintptr_t seen[JITPROF_TOP];
+	unsigned int i, j, nseen = 0, dumped = 0;
+	const uint32_t *guest;
+	const void *host;
+	uint32_t pc, code_size, nb_ops, words;
+
+	printf("JITPROF: --- hot emitted buckets, resolved to blocks ---\n");
+
+	for (i = 0; i < n; i++) {
+		pc = jitprof_block_from_host(addr[i], &host, &code_size,
+					     &guest, &nb_ops);
+		if (!pc) {
+			printf("JITPROF:   0x%08lx: no live block\n",
+			       (unsigned long)addr[i]);
+			continue;
+		}
+
+		for (j = 0; j < nseen; j++)
+			if (seen[j] == (uintptr_t)host)
+				break;
+		if (j < nseen)
+			continue;
+		seen[nseen++] = (uintptr_t)host;
+
+		printf("JITPROF:   guest 0x%08lx  host 0x%08lx +%lu  %lu ops\n",
+		       (unsigned long)pc, (unsigned long)host,
+		       (unsigned long)code_size, (unsigned long)nb_ops);
+
+		if (dumped >= JITPROF_DUMP_BLOCKS)
+			continue;
+		dumped++;
+
+		if (guest)
+			jitprof_hexdump("M", pc, guest, nb_ops);
+
+		words = code_size / 4;
+		if (words > JITPROF_DUMP_MAX / 4)
+			words = JITPROF_DUMP_MAX / 4;
+		jitprof_hexdump("S", (uint32_t)(uintptr_t)host,
+			(const uint32_t *)host, words);
+	}
+
+	fflush(stdout);
 }
 
 void jitprof_report(void)
 {
+	uintptr_t jit_addr[JITPROF_TOP];
 	unsigned int i, live;
 
 	if (!jp_running)
@@ -235,13 +318,15 @@ void jitprof_report(void)
 
 	jitprof_top("C called from JIT (% of that class)",
 		    jp_hostjit_b, JITPROF_HOST_BUCKETS, jp_text_base,
-		    jp_hostjit, 1);
+		    jp_hostjit, 1, NULL);
 	jitprof_top("other host code (% of that class)",
 		    jp_hostother_b, JITPROF_HOST_BUCKETS, jp_text_base,
-		    jp_hostother, 1);
-	jitprof_top("emitted code (% of that class)",
-		    jp_jit_b, JITPROF_JIT_BUCKETS, jp_code_base,
-		    jp_jit, 0);
+		    jp_hostother, 1, NULL);
+	live = jitprof_top("emitted code (% of that class)",
+			   jp_jit_b, JITPROF_JIT_BUCKETS, jp_code_base,
+			   jp_jit, 0, jit_addr);
+
+	jitprof_blocks(jit_addr, live);
 
 	fflush(stdout);
 }
