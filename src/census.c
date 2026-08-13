@@ -52,7 +52,7 @@ void census_reset(void)
 
 /* The per-unit costs, which are the only figures that survive being compared
  * against an emulator drawing a different scene.  Printed as nanoseconds so
- * the small ones do not truncate to zero; bloop quotes microseconds. */
+ * the small ones do not truncate to zero. */
 static void census_cost(const char *what, prof_bucket b, census_id id)
 {
 	uint64_t ns = prof_ns(b);

@@ -1165,9 +1165,9 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	pvr_vertex_part2_t *vert2;
 	unsigned int i;
 
-	/* bloom: bloop's three renderer denominators, counted where it counts
-	 * them.  A "bind" is a poly header actually sent — the fast path above
-	 * reuses the previous one and passes hdr == NULL. */
+	/* The three renderer denominators, counted where the reference
+	 * emulator counts them.  A "bind" is a poly header actually sent — the
+	 * fast path above reuses the previous one and passes hdr == NULL. */
 	census_bump(CENSUS_RECORDS);
 	census_add(CENSUS_VERTICES, nb);
 

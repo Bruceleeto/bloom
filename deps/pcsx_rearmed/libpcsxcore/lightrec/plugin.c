@@ -252,8 +252,8 @@ static void lightrec_tansition_from_pcsx_read(struct lightrec_state *state)
 /* The wrappers below are bracketed MEMCLASS and the psxHw* bodies they call
  * are bracketed IO (psxhw.c), so MEMCLASS's exclusive time is the cost of the
  * crossing itself — the two cycle-count transitions and the call — with the
- * device work subtracted out.  That split is the point: bloop has no MEMCLASS
- * at all, because it leaves the I/O window unmapped and lets the MMU classify. */
+ * device work subtracted out.  That split is the point: an emulator that
+ * lets the MMU classify addresses has no MEMCLASS bucket at all. */
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
@@ -891,10 +891,10 @@ static void lightrec_plugin_execute_block(psxRegisters *regs,
 	lightrec_plugin_execute_internal(true);
 }
 
-/* THE BLOCKS WORTH DISASSEMBLING, and they are bloop's hot list rather than
- * ours on purpose: same game, same code, so dumping these addresses on both
- * emulators gives two translations of the SAME MIPS to set side by side.  They
- * come from bloop's `where:` sampler (~11/9/8/8% of its samples).  A PC sampler
+/* THE BLOCKS WORTH DISASSEMBLING — the reference emulator's hot list rather
+ * than ours on purpose: same game, same code, so dumping these addresses on
+ * both emulators gives two translations of the SAME MIPS to set side by side
+ * (~11/9/8/8% of its samples).  A PC sampler
  * lands mid-block, so the lookup finds the block CONTAINING the address rather
  * than one starting at it. */
 void lightrec_dump_hot(void)
@@ -915,8 +915,11 @@ static void lightrec_plugin_clear(u32 addr, u32 size)
 	prof_enter(PROF_INVALIDATE);
 	census_bump(CENSUS_INVALIDATES);
 
-	if ((addr == 0 && size == UINT32_MAX)
-	    || (lightrec_hacks & LIGHTREC_OPT_INV_DMA_ONLY))
+	/* Even in DMA-only invalidation mode, DMA clears must stay RANGED:
+	 * lightrec_invalidate_all() memsets the whole multi-MB code LUT, and
+	 * doing that on every DMA transfer costs more than the store diet
+	 * saves.  Only the explicit full-clear call gets the big hammer. */
+	if (addr == 0 && size == UINT32_MAX)
 		lightrec_invalidate_all(lightrec_state);
 	else
 		/* size * 4: PCSX uses DMA units */
@@ -959,6 +962,12 @@ static void lightrec_plugin_apply_config()
 	}
 	cycles_per_op_old = cycles_per_op;
 	lightrec_set_cycles_per_opcode(lightrec_state, cycles_per_op);
+
+	/* Store diet experiment: assume guest code only changes via DMA, so
+	 * emitted stores skip the inline code-LUT invalidation entirely.
+	 * Forced on for testing — revert here if a game self-modifies via
+	 * CPU stores.  See plan.md. */
+	lightrec_hacks |= LIGHTREC_OPT_INV_DMA_ONLY;
 
 	lightrec_set_unsafe_opt_flags(lightrec_state, lightrec_hacks);
 	intApplyConfig();

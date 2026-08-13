@@ -1621,7 +1621,7 @@ static void lightrec_reap_opcode_list(struct lightrec_state *state, void *data)
 /* THE EMITTED CODE FOR ONE HOT GUEST BLOCK, AS HEX ON THE CONSOLE.
  *
  * The issue counter says bloom runs 8.76 SH-4 instructions per guest
- * instruction against bloop's 4.76, and the static density says bloom's
+ * instruction against the reference's 4.76, and the static density says bloom's
  * emitted code is the *denser* of the two.  Both cannot be explained by the
  * block bodies, so the difference has to be at the edges — the prologue, the
  * epilogue and the dispatcher tail — and that is an inference from two ratios
@@ -2280,6 +2280,105 @@ void lightrec_destroy(struct lightrec_state *state)
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
 			    lut_elm_size(state) * CODE_LUT_SIZE);
 	free(state);
+}
+
+/* Bloom's device dispatch (kunseg'd address in, raw value out/in);
+ * implemented in the frontend next to the fault-path shims. */
+extern u32 bloom_iofault_read(u32 mem, unsigned int size);
+extern void bloom_iofault_write(u32 mem, u32 val, unsigned int size);
+
+/* An IO_HW tag records where the op's FIRST access landed (or that its
+ * base register was zero) — later executions may point anywhere, and the
+ * BIOS really does write the exception vectors through ops tagged HW.
+ * Only the I/O window takes the fast path; everything else goes through
+ * the full map dispatch in lightrec_rw. */
+#define HW_SHIM_IN_IO(kaddr)	((kaddr) - 0x1f801000u < 0x2000u)
+
+static u32 hw_shim_slow(struct lightrec_state *state, u32 op, u32 addr,
+			u32 data)
+{
+	return lightrec_rw(state, (union code){ .i.op = op }, addr, data,
+			   NULL, NULL, 0);
+}
+
+void lightrec_hw_lb(struct lightrec_state *state, u32 addr)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		state->temp_reg = (u32)(s32)(s8)bloom_iofault_read(kaddr, 1);
+	else
+		state->temp_reg = hw_shim_slow(state, OP_LB, addr, 0);
+}
+
+void lightrec_hw_lbu(struct lightrec_state *state, u32 addr)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		state->temp_reg = (u8)bloom_iofault_read(kaddr, 1);
+	else
+		state->temp_reg = hw_shim_slow(state, OP_LBU, addr, 0);
+}
+
+void lightrec_hw_lh(struct lightrec_state *state, u32 addr)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		state->temp_reg = (u32)(s32)(s16)bloom_iofault_read(kaddr, 2);
+	else
+		state->temp_reg = hw_shim_slow(state, OP_LH, addr, 0);
+}
+
+void lightrec_hw_lhu(struct lightrec_state *state, u32 addr)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		state->temp_reg = (u16)bloom_iofault_read(kaddr, 2);
+	else
+		state->temp_reg = hw_shim_slow(state, OP_LHU, addr, 0);
+}
+
+void lightrec_hw_lw(struct lightrec_state *state, u32 addr)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		state->temp_reg = bloom_iofault_read(kaddr, 4);
+	else
+		state->temp_reg = hw_shim_slow(state, OP_LW, addr, 0);
+}
+
+void lightrec_hw_sb(struct lightrec_state *state, u32 addr, u32 val)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		bloom_iofault_write(kaddr, val, 1);
+	else
+		hw_shim_slow(state, OP_SB, addr, val);
+}
+
+void lightrec_hw_sh(struct lightrec_state *state, u32 addr, u32 val)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		bloom_iofault_write(kaddr, val, 2);
+	else
+		hw_shim_slow(state, OP_SH, addr, val);
+}
+
+void lightrec_hw_sw(struct lightrec_state *state, u32 addr, u32 val)
+{
+	u32 kaddr = kunseg(addr);
+
+	if (likely(HW_SHIM_IN_IO(kaddr)))
+		bloom_iofault_write(kaddr, val, 4);
+	else
+		hw_shim_slow(state, OP_SW, addr, val);
 }
 
 void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)

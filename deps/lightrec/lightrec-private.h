@@ -226,6 +226,19 @@ struct lightrec_state {
 u32 lightrec_rw(struct lightrec_state *state, union code op, u32 addr,
 		u32 data, u32 *flags, struct block *block, u16 offset);
 
+/* Direct-call device access for HW-tagged plain loads/stores (Dreamcast).
+ * Emitted as a bare C call from generated code with inline cycle sync —
+ * no wrapper block, no lightrec_rw.  Loads park their (pre-extended)
+ * result in state->temp_reg; the call itself performs the access. */
+void lightrec_hw_lb(struct lightrec_state *state, u32 addr);
+void lightrec_hw_lbu(struct lightrec_state *state, u32 addr);
+void lightrec_hw_lh(struct lightrec_state *state, u32 addr);
+void lightrec_hw_lhu(struct lightrec_state *state, u32 addr);
+void lightrec_hw_lw(struct lightrec_state *state, u32 addr);
+void lightrec_hw_sb(struct lightrec_state *state, u32 addr, u32 val);
+void lightrec_hw_sh(struct lightrec_state *state, u32 addr, u32 val);
+void lightrec_hw_sw(struct lightrec_state *state, u32 addr, u32 val);
+
 void lightrec_free_block(struct lightrec_state *state, struct block *block);
 
 void remove_from_code_lut(struct blockcache *cache, struct block *block);
