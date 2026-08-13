@@ -2187,6 +2187,10 @@ static void process_poly(struct poly *poly, bool scissor)
 	bool check_mask, set_mask;
 	pvr_list_t list;
 
+	/* If the clip area matches the screen area, we don't need to clip */
+	if (WITH_CLIPPING && !pvr.clip_test)
+		poly->flags |= POLY_NOCLIP;
+
 	if (poly->flags & POLY_TEXTURED) {
 		if (scissor && unlikely(poly->bpp != TEXTURE_4BPP)) {
 			umin = poly_get_umin(poly);
