@@ -1772,6 +1772,27 @@ static void rec_store_direct(struct lightrec_cstate *cstate, const struct block 
 	lightrec_free_reg(reg_cache, tmp2);
 }
 
+/* Record the host position of an unknown-mode access about to be emitted
+ * bare, so an MMU fault on it can be traced back to this opcode and the
+ * opcode re-tagged (lightrec_backpatch_io).  Returns false when the
+ * per-compilation table is full — the caller must emit the C-wrapper
+ * access instead, as a fault there couldn't be resolved. */
+static bool rec_note_fault_site(struct lightrec_cstate *cstate,
+				const struct block *block, u16 offset)
+{
+	jit_state_t *_jit = block->_jit;
+	struct lightrec_fault_site *site;
+
+	if (cstate->nb_fault_sites >= ARRAY_SIZE(cstate->fault_sites))
+		return false;
+
+	site = &cstate->fault_sites[cstate->nb_fault_sites++];
+	site->label = jit_indirect();
+	site->offset = offset;
+
+	return true;
+}
+
 static void rec_store(struct lightrec_cstate *state,
 		      const struct block *block, u16 offset,
 		      jit_code_t code, jit_code_t swap_code)
@@ -1815,7 +1836,21 @@ static void rec_store(struct lightrec_cstate *state,
 	case LIGHTREC_IO_DIRECT_HW:
 		rec_store_io(state, block, offset, code, swap_code);
 		break;
+	case LIGHTREC_IO_HW:
+		rec_io(state, block, offset, true, false);
+		return;
 	default:
+		if (!is_swc2 && rec_note_fault_site(state, block, offset)) {
+			if (no_invalidate) {
+				rec_store_direct_no_invalidate(state, block,
+							       offset, code,
+							       swap_code);
+			} else {
+				rec_store_direct(state, block, offset, code,
+						 swap_code);
+			}
+			break;
+		}
 		rec_io(state, block, offset, true, false);
 		return;
 	}
@@ -2139,7 +2174,15 @@ static void rec_load(struct lightrec_cstate *state, const struct block *block,
 	case LIGHTREC_IO_DIRECT:
 		rec_load_direct(state, block, offset, code, swap_code, is_unsigned);
 		break;
+	case LIGHTREC_IO_HW:
+		rec_io(state, block, offset, false, true);
+		return;
 	default:
+		if (rec_note_fault_site(state, block, offset)) {
+			rec_load_direct(state, block, offset, code, swap_code,
+					is_unsigned);
+			break;
+		}
 		rec_io(state, block, offset, false, true);
 		return;
 	}

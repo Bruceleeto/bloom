@@ -38,12 +38,16 @@ const char *census_name(census_id id)
 uint32_t census_ctr[CENSUS_N];
 uint32_t census_gte_func[64];
 uint32_t census_gp0_op[256];
+uint32_t census_irq_fired[32];
+uint32_t census_hw_reg[1024];
 
 void census_reset(void)
 {
 	memset(census_ctr, 0, sizeof(census_ctr));
 	memset(census_gte_func, 0, sizeof(census_gte_func));
 	memset(census_gp0_op, 0, sizeof(census_gp0_op));
+	memset(census_irq_fired, 0, sizeof(census_irq_fired));
+	memset(census_hw_reg, 0, sizeof(census_hw_reg));
 }
 
 /* The per-unit costs, which are the only figures that survive being compared
@@ -120,6 +124,34 @@ void census_report(uint32_t wall_ms, uint32_t frames)
 		}
 
 		printf(" %02x=%lu", i, (unsigned long)census_gp0_op[i]);
+	}
+	if (!first)
+		printf("\n");
+
+	for (i = 0, first = 1; i < 32; i++) {
+		if (!census_irq_fired[i])
+			continue;
+
+		if (first) {
+			printf("CENSUS: IRQs fired (PSXINT_*=count):");
+			first = 0;
+		}
+
+		printf(" %u=%lu", i, (unsigned long)census_irq_fired[i]);
+	}
+	if (!first)
+		printf("\n");
+
+	for (i = 0, first = 1; i < 1024; i++) {
+		if (!census_hw_reg[i])
+			continue;
+
+		if (first) {
+			printf("CENSUS: hw regs (0x1f801xxx=count):");
+			first = 0;
+		}
+
+		printf(" %03x=%lu", i << 2, (unsigned long)census_hw_reg[i]);
 	}
 	if (!first)
 		printf("\n");

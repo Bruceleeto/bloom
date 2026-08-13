@@ -113,16 +113,26 @@ struct u16x2 {
 #endif
 };
 
+/* Maps the host address of an emitted unknown-mode access back to the
+ * opcode it came from, so an MMU fault on it can tag the opcode (see
+ * lightrec_backpatch_io).  Sorted by host address (emission order). */
+struct block_fault_site {
+	u32 host;
+	u16 offset;
+};
+
 struct block {
 	jit_state_t *_jit;
 	struct opcode *opcode_list;
 	void (*function)(void);
 	const u32 *code;
 	struct block *next;
+	struct block_fault_site *fault_sites;
 	u32 pc;
 	u32 hash;
 	u32 precompile_date;
 	unsigned int code_size;
+	u16 nb_fault_sites;
 	u16 nb_ops;
 #if ENABLE_THREADED_COMPILER
 	_Atomic u8 flags;
@@ -150,14 +160,21 @@ enum c_wrappers {
 	C_WRAPPERS_COUNT,
 };
 
+struct lightrec_fault_site {
+	struct jit_node *label;
+	u16 offset;
+};
+
 struct lightrec_cstate {
 	struct lightrec_state *state;
 
 	struct lightrec_branch local_branches[512];
 	struct lightrec_branch_target targets[512];
+	struct lightrec_fault_site fault_sites[512];
 	u16 movi_temp[32];
 	unsigned int nb_local_branches;
 	unsigned int nb_targets;
+	unsigned int nb_fault_sites;
 	unsigned int cycles;
 
 	struct regcache *reg_cache;

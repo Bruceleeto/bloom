@@ -14,6 +14,8 @@
 #include <libpcsxcore/psxmem.h>
 #include <libpcsxcore/lightrec/mem.h>
 
+#include "iofault.h"
+
 #define OFFSET 0x0
 
 extern u32 _arch_mem_top;
@@ -69,13 +71,17 @@ int lightrec_init_mmap(void)
 
 	printf("RAM mapped\n");
 
-	/* Map Scratchpad + I/O using one 64 KiB page */
+	/* Map the scratchpad alone, one 4 KiB page.  The I/O registers at
+	 * 0x1f801000+ are deliberately LEFT UNMAPPED: a direct access there
+	 * from generated code takes a DTLB miss, and src/iofault.c services
+	 * it — the MMU classifies RAM-vs-I/O so emitted code doesn't have to.
+	 * C never touches this window; it uses the psxH backing pointer. */
 	err = mmu_page_map_static(OFFSET + 0x1f800000, (uintptr_t)psxH,
-				  PAGE_SIZE_64K, MMU_KERNEL_RDWR, true);
+				  PAGE_SIZE_4K, MMU_KERNEL_RDWR, true);
 	if (err)
 		goto handle_err;
 
-	printf("Scratchpad / IO mapped\n");
+	printf("Scratchpad mapped, I/O window left unmapped\n");
 
 	/* Map parallel port using one 64 KiB page */
 	err = mmu_page_map_static(OFFSET + 0x1f000000, (uintptr_t)psxP,
@@ -98,7 +104,9 @@ int lightrec_init_mmap(void)
 
 	psxM = (void *)OFFSET;
 	psxP = (void *)(OFFSET + 0x1f000000);
-	psxH = (void *)(OFFSET + 0x1f800000);
+	/* psxH stays at the P1 backing address: the I/O half of its 64 KiB
+	 * window has no virtual mapping, and the psxHu macros must never
+	 * fault.  Only generated code sees the 0x1f80xxxx window. */
 	psxR = (void *)(OFFSET + 0x1fc00000);
 
 	/* Clear pages */
@@ -110,6 +118,8 @@ int lightrec_init_mmap(void)
 	       "RAM: 0x%x BIOS: 0x%x SCRATCH: 0x%x CODE: 0x%x\n",
 	       (unsigned int)psxM, (unsigned int)psxR, (unsigned int)psxH,
 	       (unsigned int)code_buffer);
+
+	iofault_init();
 
 	return 0;
 

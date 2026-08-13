@@ -28,6 +28,7 @@
 #include "bloom-config.h"
 #include "census.h"
 #include "emu.h"
+#include "iofault.h"
 #include "jitprof.h"
 #include "prof.h"
 #if WITH_FPU_GTE
@@ -245,6 +246,7 @@ static void *bench_stop_thd(void *arg)
 	prof_report(ms, frames_done, insns);
 	census_report(ms, frames_done);
 	jitprof_report();
+	iofault_report();
 
 	if (WITH_BLOCKDUMP)
 		lightrec_dump_hot();

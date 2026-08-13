@@ -1069,6 +1069,8 @@ static struct block * generate_wrapper(struct lightrec_state *state)
 	block->opcode_list = NULL;
 	block->flags = BLOCK_NO_OPCODE_LIST;
 	block->nb_ops = 0;
+	block->fault_sites = NULL;
+	block->nb_fault_sites = 0;
 
 	block->function = lightrec_emit_code(state, block, _jit,
 					     &block->code_size);
@@ -1362,6 +1364,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	block->opcode_list = NULL;
 	block->flags = BLOCK_NO_OPCODE_LIST;
 	block->nb_ops = 0;
+	block->fault_sites = NULL;
+	block->nb_fault_sites = 0;
 
 	block->function = lightrec_emit_code(state, block, _jit,
 					     &block->code_size);
@@ -1503,6 +1507,8 @@ static struct block * lightrec_precompile_block(struct lightrec_state *state,
 	block->code_size = 0;
 	block->precompile_date = state->current_cycle;
 	block->nb_ops = length / sizeof(u32);
+	block->fault_sites = NULL;
+	block->nb_fault_sites = 0;
 
 	lightrec_optimize(state, block);
 
@@ -1721,6 +1727,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	cstate->cycles = 0;
 	cstate->nb_local_branches = 0;
 	cstate->nb_targets = 0;
+	cstate->nb_fault_sites = 0;
 	cstate->no_load_delay = false;
 
 	jit_prolog();
@@ -1803,6 +1810,43 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
+
+	/* Publish the fault-site table for this compilation.  Ordering keeps
+	 * a concurrent lightrec_backpatch_io safe: a fault in the OLD code no
+	 * longer matches block->function/code_size (both updated above) and
+	 * is skipped, and backpatch bounds-checks the offset it reads. */
+	{
+		struct block_fault_site *sites = NULL, *old_sites;
+		u16 nb, old_nb;
+
+		if (cstate->nb_fault_sites) {
+			sites = lightrec_malloc(state, MEM_FOR_LIGHTREC,
+						cstate->nb_fault_sites
+						* sizeof(*sites));
+		}
+
+		old_sites = block->fault_sites;
+		old_nb = block->nb_fault_sites;
+
+		if (sites) {
+			for (nb = 0; nb < cstate->nb_fault_sites; nb++) {
+				sites[nb].host = (u32)(uintptr_t)jit_address(
+					cstate->fault_sites[nb].label);
+				sites[nb].offset =
+					cstate->fault_sites[nb].offset;
+			}
+			block->nb_fault_sites = nb;
+			block->fault_sites = sites;
+		} else {
+			block->fault_sites = NULL;
+			block->nb_fault_sites = 0;
+		}
+
+		if (old_sites) {
+			lightrec_free(state, MEM_FOR_LIGHTREC,
+				      old_nb * sizeof(*old_sites), old_sites);
+		}
+	}
 
 	/* Detect old blocks that have been covered by the new one */
 	for (i = 0; ENABLE_THREADED_COMPILER && i < cstate->nb_targets; i++) {
@@ -2011,6 +2055,12 @@ void lightrec_free_block(struct lightrec_state *state, struct block *block)
 	if (block->function) {
 		lightrec_free_function(state, block->function);
 		lightrec_unregister(MEM_FOR_CODE, block->code_size);
+	}
+	if (block->fault_sites) {
+		lightrec_free(state, MEM_FOR_LIGHTREC,
+			      block->nb_fault_sites
+			      * sizeof(*block->fault_sites),
+			      block->fault_sites);
 	}
 	lightrec_free(state, MEM_FOR_IR, sizeof(*block), block);
 }
@@ -2283,6 +2333,68 @@ u32 lightrec_exit_flags(struct lightrec_state *state)
 u32 lightrec_current_cycle_count(const struct lightrec_state *state)
 {
 	return state->current_cycle;
+}
+
+u32 lightrec_target_cycle_count(const struct lightrec_state *state)
+{
+	return state->target_cycle;
+}
+
+/* Called (from thread context) after an MMU fault serviced an emitted
+ * unknown-mode access that turned out to hit I/O: tag the opcode as a HW
+ * access and queue the block for recompilation, mirroring what
+ * lightrec_rw does when the C wrapper discovers an opcode's IO mode. */
+_Bool lightrec_backpatch_io(struct lightrec_state *state, u32 host_pc)
+{
+	const struct block_fault_site *sites;
+	struct block *block;
+	struct opcode *op;
+	unsigned int i;
+	u32 masked_pc = host_pc & 0x1fffffff;
+	u16 nb, offset;
+	bool found = false;
+	u8 old_flags;
+
+	block = lightrec_find_block_by_host(state->block_cache,
+					    (uintptr_t)host_pc);
+	if (!block || block_has_flag(block, BLOCK_NO_OPCODE_LIST))
+		return false;
+
+	sites = block->fault_sites;
+	nb = block->nb_fault_sites;
+	if (!sites)
+		return false;
+
+	/* Sites are in emission order; the faulting instruction belongs to
+	 * the last site at or before it. */
+	for (i = 0, offset = 0; i < nb; i++) {
+		if ((sites[i].host & 0x1fffffff) <= masked_pc) {
+			offset = sites[i].offset;
+			found = true;
+		}
+	}
+
+	if (!found || offset >= block->nb_ops)
+		return false;
+
+	op = &block->opcode_list[offset];
+	if (LIGHTREC_FLAGS_GET_IO_MODE(op->flags))
+		return false;	/* already tagged, recompile in flight */
+
+	op->flags |= LIGHTREC_IO_MODE(LIGHTREC_IO_HW);
+
+	if (block_has_flag(block, BLOCK_NEVER_COMPILE))
+		return true;
+
+	old_flags = block_set_flags(block, BLOCK_SHOULD_RECOMPILE);
+	if (!(old_flags & BLOCK_SHOULD_RECOMPILE)) {
+		if (ENABLE_THREADED_COMPILER)
+			lightrec_recompiler_add(state->rec, block);
+		else
+			lut_write(state, lut_offset(block->pc), NULL);
+	}
+
+	return true;
 }
 
 void lightrec_reset_cycle_count(struct lightrec_state *state, u32 cycles)

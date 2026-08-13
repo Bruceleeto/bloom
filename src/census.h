@@ -64,6 +64,8 @@ const char *census_name(census_id id);
 extern uint32_t census_ctr[CENSUS_N];
 extern uint32_t census_gte_func[64];	/* GTE commands by function */
 extern uint32_t census_gp0_op[256];	/* GP0 commands by opcode */
+extern uint32_t census_irq_fired[32];	/* irq_test dispatches by PSXINT_* */
+extern uint32_t census_hw_reg[1024];	/* hw wrapper accesses by register */
 
 static inline void census_bump(census_id id)
 {
@@ -86,6 +88,18 @@ static inline void census_gp0(uint32_t op)
 	census_gp0_op[op & 0xff]++;
 }
 
+static inline void census_irq(unsigned int irq)
+{
+	census_irq_fired[irq & 0x1f]++;
+}
+
+/* One 4 KiB page of I/O registers, word-granular — enough to name which
+ * register the hw wrappers are being hammered with. */
+static inline void census_hw_access(uint32_t mem)
+{
+	census_hw_reg[(mem >> 2) & 0x3ff]++;
+}
+
 void census_reset(void);
 void census_report(uint32_t wall_ms, uint32_t frames);
 
@@ -95,6 +109,8 @@ void census_report(uint32_t wall_ms, uint32_t frames);
 #define census_add(id, n)		((void)0)
 #define census_gte(func)		((void)0)
 #define census_gp0(op)			((void)0)
+#define census_irq(irq)			((void)0)
+#define census_hw_access(mem)		((void)0)
 #define census_reset()			((void)0)
 #define census_report(ms, f)		((void)0)
 

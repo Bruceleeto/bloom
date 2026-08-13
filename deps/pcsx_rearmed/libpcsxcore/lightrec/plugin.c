@@ -233,6 +233,22 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 	}
 }
 
+/* The way back for the READ wrappers.  A read never asserts an interrupt on
+ * the spot — devices raise IRQs from scheduled events, not from register
+ * reads — so I_STAT, I_MASK and CP0 are exactly as the last transition left
+ * them and has_interrupt() cannot have changed.  Only the deadline needs
+ * re-checking, because the transition in (and the GPUSTAT poll-skip) advanced
+ * the cycle count. */
+static void lightrec_tansition_from_pcsx_read(struct lightrec_state *state)
+{
+	s32 cycles_left = psxRegs.next_interupt - psxRegs.cycle;
+
+	if (block_stepping || cycles_left <= 0)
+		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
+	else
+		lightrec_set_target_cycle_count(state, cycles_left * CYCLE_SCALE);
+}
+
 /* The wrappers below are bracketed MEMCLASS and the psxHw* bodies they call
  * are bracketed IO (psxhw.c), so MEMCLASS's exclusive time is the cost of the
  * crossing itself — the two cycle-count transitions and the call — with the
@@ -243,6 +259,7 @@ static void hw_write_byte(struct lightrec_state *state,
 {
 	prof_enter(PROF_MEMCLASS);
 	census_bump(CENSUS_HW_WRITE);
+	census_hw_access(mem);
 
 	lightrec_tansition_to_pcsx(state);
 
@@ -258,6 +275,7 @@ static void hw_write_half(struct lightrec_state *state,
 {
 	prof_enter(PROF_MEMCLASS);
 	census_bump(CENSUS_HW_WRITE);
+	census_hw_access(mem);
 
 	lightrec_tansition_to_pcsx(state);
 
@@ -273,6 +291,7 @@ static void hw_write_word(struct lightrec_state *state,
 {
 	prof_enter(PROF_MEMCLASS);
 	census_bump(CENSUS_HW_WRITE);
+	census_hw_access(mem);
 
 	lightrec_tansition_to_pcsx(state);
 
@@ -289,12 +308,13 @@ static u8 hw_read_byte(struct lightrec_state *state, u32 op, void *host, u32 mem
 
 	prof_enter(PROF_MEMCLASS);
 	census_bump(CENSUS_HW_READ);
+	census_hw_access(mem);
 
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead8(mem);
 
-	lightrec_tansition_from_pcsx(state);
+	lightrec_tansition_from_pcsx_read(state);
 
 	prof_leave();
 
@@ -308,12 +328,13 @@ static u16 hw_read_half(struct lightrec_state *state,
 
 	prof_enter(PROF_MEMCLASS);
 	census_bump(CENSUS_HW_READ);
+	census_hw_access(mem);
 
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead16(mem);
 
-	lightrec_tansition_from_pcsx(state);
+	lightrec_tansition_from_pcsx_read(state);
 
 	prof_leave();
 
@@ -328,6 +349,7 @@ static u32 hw_read_word(struct lightrec_state *state,
 
 	prof_enter(PROF_MEMCLASS);
 	census_bump(CENSUS_HW_READ);
+	census_hw_access(mem);
 
 	lightrec_tansition_to_pcsx(state);
 
@@ -353,12 +375,50 @@ static u32 hw_read_word(struct lightrec_state *state,
 		old_gpusr = val;
 	}
 
-	lightrec_tansition_from_pcsx(state);
+	lightrec_tansition_from_pcsx_read(state);
 
 	prof_leave();
 
 	return val;
 }
+
+#ifdef _arch_dreamcast
+/* Entry points for src/iofault.c: a DTLB miss on the unmapped I/O window
+ * lands there, and these route it through the same wrappers (and the same
+ * cycle transitions) a compiled wrapper call would have used.  The caller
+ * has already synced state->current_cycle per the wrapper contract. */
+struct lightrec_state *bloom_lightrec_state(void)
+{
+	return lightrec_state;
+}
+
+u32 bloom_iofault_read(u32 mem, unsigned int size)
+{
+	switch (size) {
+	case 1:
+		return hw_read_byte(lightrec_state, 0, NULL, mem);
+	case 2:
+		return hw_read_half(lightrec_state, 0, NULL, mem);
+	default:
+		return hw_read_word(lightrec_state, 0, NULL, mem);
+	}
+}
+
+void bloom_iofault_write(u32 mem, u32 val, unsigned int size)
+{
+	switch (size) {
+	case 1:
+		hw_write_byte(lightrec_state, 0, NULL, mem, val);
+		break;
+	case 2:
+		hw_write_half(lightrec_state, 0, NULL, mem, val);
+		break;
+	default:
+		hw_write_word(lightrec_state, 0, NULL, mem, val);
+		break;
+	}
+}
+#endif
 
 static struct lightrec_mem_map_ops hw_regs_ops = {
 	.sb = hw_write_byte,
@@ -462,6 +522,7 @@ static void lightrec_enable_ram(struct lightrec_state *state, bool enable)
 	ram_disabled = !enable;
 }
 
+__attribute__((unused))
 static bool lightrec_can_hw_direct(u32 kaddr, bool is_write, u8 size)
 {
 	if (is_write && size != 32) {
@@ -549,7 +610,14 @@ static bool lightrec_can_hw_direct(u32 kaddr, bool is_write, u8 size)
 static const struct lightrec_ops lightrec_ops = {
 	.cop2_op = cop2_op,
 	.enable_ram = lightrec_enable_ram,
+#ifdef _arch_dreamcast
+	/* Direct-HW shadow accesses would fault now that the I/O window is
+	 * unmapped — statically-known I/O goes through the wrappers instead
+	 * (IO_HW mode), which is what it did for the hot registers anyway. */
+	.hw_direct = NULL,
+#else
 	.hw_direct = lightrec_can_hw_direct,
+#endif
 	.code_inv = LIGHTREC_CODE_INV ? lightrec_code_inv : NULL,
 };
 
@@ -557,8 +625,18 @@ static int lightrec_plugin_init(void)
 {
 	lightrec_map[PSX_MAP_KERNEL_USER_RAM].address = psxM;
 	lightrec_map[PSX_MAP_BIOS].address = psxR;
+#ifdef _arch_dreamcast
+	/* The guest-visible scratchpad/IO window is the identity-mapped
+	 * virtual page, NOT psxH: psxH points at the P1 backing (mmap.c
+	 * leaves the I/O half of the window unmapped so direct accesses
+	 * fault into src/iofault.c).  Declaring the identities here keeps
+	 * offset_scratch == offset_io == 0 and the map "perfect". */
+	lightrec_map[PSX_MAP_SCRATCH_PAD].address = (void *)0x1f800000;
+	lightrec_map[PSX_MAP_HW_REGISTERS].address = (void *)0x1f801000;
+#else
 	lightrec_map[PSX_MAP_SCRATCH_PAD].address = psxH;
 	lightrec_map[PSX_MAP_HW_REGISTERS].address = psxH + 0x1000;
+#endif
 	lightrec_map[PSX_MAP_PARALLEL_PORT].address = psxP;
 
 	if (!LIGHTREC_CUSTOM_MAP) {
