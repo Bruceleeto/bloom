@@ -381,7 +381,7 @@ if (WITH_EMBEDDED_BIOS_PATH)
 endif()
 
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
-set(WITH_GAME_PATH "" CACHE PATH "If set, auto-boot the CD image at the given path")
+set(WITH_GAME_PATH "/rd/n00bdemo.exe" CACHE PATH "If set, auto-boot the CD image at the given path")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
 set(WITH_MCD2_PATH "/dev/mcd1" CACHE PATH "Runtime path to the second memory card image")
