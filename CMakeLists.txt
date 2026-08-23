@@ -395,6 +395,10 @@ endif()
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
 set(WITH_GAME_PATH "/rd/n00bdemo.exe" CACHE PATH "If set, auto-boot the CD image at the given path")
 
+# If set, load this savestate once the game is up, so every run benches the same
+# scene.  Put it in romdisk/ and hardware and Flycast measure the same thing.
+set(WITH_BENCH_STATE "" CACHE PATH "Savestate to load at boot, e.g. /rd/bench.sav.gz")
+
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
 set(WITH_MCD2_PATH "/dev/mcd1" CACHE PATH "Runtime path to the second memory card image")
 
