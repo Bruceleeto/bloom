@@ -33,10 +33,32 @@ static const u8 table[] =
 	0x00
 };
 
+#ifdef __sh__
+/*
+ * SH-4 has no clz instruction, so __builtin_clz() becomes a call to libgcc's
+ * __clzsi2 -- which drags in its own 256-byte table and forces a stack frame
+ * on a leaf function called once per RTPS and three times per RTPT.  The
+ * denominator is 1..65535 here (d == 0 takes the early-out above, since the
+ * unsigned compare against 0 is always false), so the exponent of its float
+ * conversion gives the same answer branchlessly.
+ */
+static inline int gte_div_shift(u16 d)
+{
+	union { float f; u32 u; } cv;
+
+	cv.f = (float)d;
+
+	/* 142 == exponent bias 127 + 15, i.e. the value for d == 0x8000. */
+	return 142 - (int)((cv.u >> 23) & 0xff);
+}
+#else
+#define gte_div_shift(d) (__builtin_clz(d) - 16)
+#endif
+
 u32 DIVIDE(u16 numerator, u16 denominator)
 {
 	if (numerator < (denominator * 2)) {
-		int shift = __builtin_clz(denominator) - 16;
+		int shift = gte_div_shift(denominator);
 
 		int r1 = (denominator << shift) & 0x7fff;
 		int r2 = table[(r1 + 0x40) >> 7] + 0x101;
