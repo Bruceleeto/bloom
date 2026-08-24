@@ -27,9 +27,6 @@
 #include "mem.h"
 #include "plugin.h"
 
-#include "bloom-config.h"
-#include "gte_fpu.h"
-
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
 #endif
@@ -113,27 +110,46 @@ enum my_cp2_opcodes {
 	OP_CP2_NCCT		= 0x3f,
 };
 
+static void (*cp2_ops[])(struct psxCP2Regs *) = {
+	[OP_CP2_RTPS] = gteRTPS,
+	[OP_CP2_NCLIP] = gteNCLIP,
+	[OP_CP2_OP] = gteOP,
+	[OP_CP2_DPCS] = gteDPCS,
+	[OP_CP2_INTPL] = gteINTPL,
+	[OP_CP2_MVMVA] = gteMVMVA,
+	[OP_CP2_NCDS] = gteNCDS,
+	[OP_CP2_CDP] = gteCDP,
+	[OP_CP2_NCDT] = gteNCDT,
+	[OP_CP2_NCCS] = gteNCCS,
+	[OP_CP2_CC] = gteCC,
+	[OP_CP2_NCS] = gteNCS,
+	[OP_CP2_NCT] = gteNCT,
+	[OP_CP2_SQR] = gteSQR,
+	[OP_CP2_DCPL] = gteDCPL,
+	[OP_CP2_DPCT] = gteDPCT,
+	[OP_CP2_AVSZ3] = gteAVSZ3,
+	[OP_CP2_AVSZ4] = gteAVSZ4,
+	[OP_CP2_RTPT] = gteRTPT,
+	[OP_CP2_GPF] = gteGPF,
+	[OP_CP2_GPL] = gteGPL,
+	[OP_CP2_NCCT] = gteNCCT,
+};
 
 static char cache_buf[64 * 1024];
 
 static void cop2_op(struct lightrec_state *state, u32 func)
 {
 	struct lightrec_registers *regs = lightrec_get_registers(state);
-	static bool announced;
-
-	if (unlikely(!announced)) {
-		announced = true;
-		printf("GTE: SH-4 FPU\n");
-	}
 
 	psxRegs.code = func;
 
-	/* The direct calls from generated code bypass this wrapper; it only
-	 * exists for the interpreter/first-pass path.
-	 * The cast works because regs->cp2c comes right after regs->cp2d,
-	 * so it can be cast to a pcsxCP2Regs pointer. */
-	gte_fpu_cmd((psxCP2Regs *) regs->cp2d, func);
-
+	if (unlikely(!cp2_ops[func & 0x3f])) {
+		fprintf(stderr, "Invalid CP2 function %u\n", func);
+	} else {
+		/* This works because regs->cp2c comes right after regs->cp2d,
+		 * so it can be cast to a pcsxCP2Regs pointer. */
+		cp2_ops[func & 0x3f]((psxCP2Regs *) regs->cp2d);
+	}
 }
 
 static bool has_interrupt(void)
@@ -761,9 +777,6 @@ static void lightrec_plugin_reset(void)
 
 	/* Reset registers */
 	memset(regs, 0, sizeof(*regs));
-
-	/* The control file was just zeroed without a CTC2 to announce it. */
-	gte_fpu_reset();
 
 	regs->cp0[12] = 0x10900000; // COP0 enabled | BEV = 1 | TS = 1
 	regs->cp0[15] = 0x00000002; // PRevID = Revision ID, same as R3000A

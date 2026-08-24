@@ -75,9 +75,6 @@ u32  MFC2(struct psxCP2Regs *regs, int reg);
 void MTC2(struct psxCP2Regs *regs, u32 value, int reg);
 void CTC2(struct psxCP2Regs *regs, u32 value, int reg);
 
-/* Incremented by every CTC2.  See gte.c. */
-extern u32 psxCP2CtrlGen;
-
 void gteRTPS(struct psxCP2Regs *regs);
 void gteOP(struct psxCP2Regs *regs);
 void gteNCLIP(struct psxCP2Regs *regs);

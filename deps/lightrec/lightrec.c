@@ -29,13 +29,6 @@
 #include <stddef.h>
 #include <string.h>
 
-/*
- * Bumped on every write to a COP2 control register, wherever the write comes
- * from.  Defined by the core's GTE (libpcsxcore/gte.c); declared here because
- * this library does not include the core's headers.
- */
-extern uint32_t psxCP2CtrlGen;
-
 static struct block * lightrec_precompile_block(struct lightrec_state *state,
 						u32 pc);
 static bool lightrec_block_is_fully_tagged(const struct block *block);
@@ -612,8 +605,6 @@ static void lightrec_mtc2(struct lightrec_state *state, u8 reg, u32 data)
 
 static void lightrec_ctc2(struct lightrec_state *state, u8 reg, u32 data)
 {
-	psxCP2CtrlGen++;
-
 	switch (reg) {
 	case 4:
 	case 12:

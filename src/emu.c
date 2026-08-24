@@ -27,7 +27,6 @@
 
 #include "bloom-config.h"
 #include "emu.h"
-#include "gte_fpu.h"
 #include "pvr.h"
 
 int fs_fat_init(void);
@@ -187,10 +186,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Could not initialize PCSX core\n");
 		return 1;
 	}
-
-	/* Whichever CPU core runs, the coprocessor is this one. */
-	gte_fpu_install();
-
 
 	if (LoadPlugins() < 0) {
 		fprintf(stderr, "Could not load plugins\n");
