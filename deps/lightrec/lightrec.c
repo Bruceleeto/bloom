@@ -1609,8 +1609,18 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	cstate->nb_targets = 0;
 	cstate->no_load_delay = false;
 
-	for (i = 0; i < 32; i++)
-		cstate->v[i] = (struct constprop_data){ 0, 0xffffffff, 0 };
+	/*
+	 * Only $zero is known at block entry; every other register holds
+	 * whatever the block that jumped here left in it.  This is what
+	 * LIGHTREC_CONSTPROP_INITIALIZER spells - it initialises the *array*,
+	 * so the braced element applies to v[0] alone and the rest are
+	 * implicitly zeroed, i.e. known == 0.  Applying that element to all
+	 * 32 instead declares every register known-zero, and the end-of-block
+	 * shortcut then computes a code-LUT entry for PC 0 on any branch
+	 * through a register this block never wrote.
+	 */
+	memset(cstate->v, 0, sizeof(cstate->v));
+	cstate->v[0].known = 0xffffffff;
 
 	jit_prolog();
 	jit_tramp(256);
