@@ -118,7 +118,10 @@ add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
 # Generated code stores to the COP2 control file without calling CTC2, so the
 # recompiler announces the write for the GTE's matrix cache.
+option(WITH_JITMAP "Print a LRBLK block map for flycast cachesweep --jitmap" OFF)
+
 target_compile_definitions(lightrec PRIVATE
+	BLOOM_JITMAP=$<BOOL:${WITH_JITMAP}>
 )
 
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
@@ -396,7 +399,9 @@ set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
 set(WITH_GAME_PATH "/rd/n00bdemo.exe" CACHE PATH "If set, auto-boot the CD image at the given path")
 
 # If set, load this savestate once the game is up, so every run benches the same
-# scene.  Put it in romdisk/ and hardware and Flycast measure the same thing.
+# scene, on hardware and under Flycast alike.  Savestates live in states/ and
+# only the selected one is copied into the romdisk: they are megabytes each and
+# the romdisk is linked into the ELF, so shipping them all runs the heap out.
 set(WITH_BENCH_STATE "" CACHE PATH "Savestate to load at boot, e.g. /rd/bench.sav.gz")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
@@ -435,6 +440,16 @@ endif()
 # would generate a bigger file. We also need this file to be present at
 # configuration time, hence the execute_process() calls.
 file(COPY romdisk DESTINATION ${CMAKE_BINARY_DIR})
+
+# Only the selected savestate goes in, and only when it is loaded from /rd.
+if (WITH_BENCH_STATE MATCHES "^/rd/")
+	string(REPLACE "/rd/" "" BENCH_STATE_NAME ${WITH_BENCH_STATE})
+	if (NOT EXISTS ${CMAKE_SOURCE_DIR}/states/${BENCH_STATE_NAME})
+		message(SEND_ERROR "No such savestate: states/${BENCH_STATE_NAME}")
+	endif()
+	file(COPY ${CMAKE_SOURCE_DIR}/states/${BENCH_STATE_NAME}
+	     DESTINATION ${CMAKE_BINARY_DIR}/romdisk)
+endif()
 file(WRITE ${CMAKE_BINARY_DIR}/dummy.c "")
 execute_process(
 	COMMAND $ENV{KOS_CC} ${CMAKE_BINARY_DIR}/dummy.c -c

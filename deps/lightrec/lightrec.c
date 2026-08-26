@@ -28,7 +28,15 @@
 #endif
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
+
+/* Dump a JIT block map for flycast's cachesweep --jitmap. Off unless the
+ * build system asks for it: the map goes out over the serial console, which
+ * costs real time and buries the bench output. */
+#ifndef BLOOM_JITMAP
+#define BLOOM_JITMAP 0
+#endif
 
 /*
  * Bumped on every write to a COP2 control register, wherever the write comes
@@ -938,6 +946,19 @@ static void * lightrec_emit_code(struct lightrec_state *state,
 
 	if (state->ops.code_inv)
 		state->ops.code_inv(code, new_code_size);
+
+	if (BLOOM_JITMAP) {
+		/*
+		 * Block map for flycast's cachesweep --jitmap: generated code
+		 * carries no symbols, and this is the only place that knows
+		 * which guest PC each host block came from.  Size MUST be
+		 * decimal (cachesweep scans it with %u); the fourth column is
+		 * ignored there and is ours, for guest instructions retired.
+		 */
+		printf("LRBLK %08x %08x %u %u\n", block->pc,
+		       (unsigned int)(uintptr_t)code,
+		       (unsigned int)new_code_size, block->nb_ops);
+	}
 
 	return code;
 }
