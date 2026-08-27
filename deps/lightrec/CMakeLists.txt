@@ -7,6 +7,7 @@ list(APPEND LIGHTREC_SOURCES
 	emitter.c
 	interpreter.c
 	lightrec.c
+	links.c
 	memmanager.c
 	optimizer.c
 	regcache.c
