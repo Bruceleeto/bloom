@@ -800,6 +800,16 @@ void lightrec_save_temps(struct regcache *cache, jit_state_t *_jit)
 				 LIGHTREC_REG_STATE, JIT_R(FIRST_TEMP + i));
 		}
 	}
+
+	/* The r4-r7 temporaries handed out by lightrec_alloc_reg_temp() live
+	 * outside lightrec_regs[]; they are argument registers, so a C call
+	 * destroys them. Spill the allocated ones. */
+	for (i = 0; i < 4; i++) {
+		if (cache->temps & BIT(i)) {
+			jit_stxi(lightrec_offset(wrapper_temps_r4[i]),
+				 LIGHTREC_REG_STATE, _R4 + i);
+		}
+	}
 }
 
 void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit)
@@ -816,6 +826,13 @@ void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit)
 		if (nreg->used || nreg->prio > REG_IS_TEMP) {
 			jit_ldxi(JIT_R(FIRST_TEMP + i), LIGHTREC_REG_STATE,
 				 lightrec_offset(wrapper_regs[i]));
+		}
+	}
+
+	for (i = 0; i < 4; i++) {
+		if (cache->temps & BIT(i)) {
+			jit_ldxi(_R4 + i, LIGHTREC_REG_STATE,
+				 lightrec_offset(wrapper_temps_r4[i]));
 		}
 	}
 }

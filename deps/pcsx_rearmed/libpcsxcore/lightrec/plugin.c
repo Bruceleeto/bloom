@@ -174,13 +174,44 @@ static bool has_interrupt(void)
 #define WALL_TCNT1		(*(volatile u32 *)0xffd80018)
 #define WALL_TICK_HZ		12500000u
 #define WALL_CYCLES_PER_TICK_FP	((u32)(((u64)PSXCLK << 16) / WALL_TICK_HZ))
-/* A host stall (savestate inflate, a PVR wait) passes at most this much
- * guest time - events coalesce, they do not burst. */
+/* Outer bound on one transition's advance; the per-transition cap in
+ * lightrec_tansition_to_pcsx() is the one that normally applies. */
 #define WALL_MAX_DELTA		(PSXCLK / 30)
 
 static u32 wall_last_tcnt, wall_frac;
+static u32 wall_charge_tcnt, wall_charge_ticks;
 static bool wall_started;
-unsigned int wall_clamps;
+unsigned int wall_clamps, wall_dropped_us;
+
+/* Per-transition bound on how much guest time may pass: twice the cycles
+ * the guest actually executed in the transition, plus a floor for the
+ * plugin's own per-transition work, plus whatever host work was explicitly
+ * charged (wallclock_charge_begin/end: the renderer's commit, which is
+ * real time the guest's 60 Hz must include). Anything over is a host stall
+ * - a preempting compiler thread, a disk read, the OS - and passing it
+ * would land a time jump inside the guest's IRQ handling: with the CD, the
+ * next sector fires between the guest's ack and its DMA and the buffer is
+ * overwritten (Rayman level change, 2026-08-27). The excess is dropped, as
+ * the cycle clock always dropped it. */
+#define WALL_FLOOR		(PSXCLK / 500)		/* 2 ms */
+#define WALL_CATCHUP		2
+
+/* Host work whose real time the guest must see (renderer commit). */
+void wallclock_charge_begin(void)
+{
+	wall_charge_tcnt = WALL_TCNT1;
+}
+
+void wallclock_charge_end(void)
+{
+	wall_charge_ticks += wall_charge_tcnt - WALL_TCNT1;	/* counts down */
+}
+
+static inline u32 wall_ticks_to_cycles(u32 ticks)
+{
+	return (u32)(((u64)ticks * WALL_CYCLES_PER_TICK_FP / WALLCLOCK_SLOWDOWN) >> 16);
+}
+
 
 static u32 wallclock_elapsed_cycles(void)
 {
@@ -216,7 +247,20 @@ static inline s32 wallclock_slice(s32 cycles)
 
 static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
-	psxRegs.cycle += wallclock_elapsed_cycles();
+	u32 counted = lightrec_current_cycle_count(state) / 1024;
+	u32 elapsed = wallclock_elapsed_cycles();
+	u32 cap = counted * WALL_CATCHUP + WALL_FLOOR
+		+ wall_ticks_to_cycles(wall_charge_ticks);
+
+	wall_charge_ticks = 0;
+
+	if (unlikely(elapsed > cap)) {
+		wall_dropped_us += (elapsed - cap) / (PSXCLK / 1000000);
+		wall_clamps++;
+		elapsed = cap;
+	}
+
+	psxRegs.cycle += elapsed;
 	lightrec_reset_cycle_count(state, 0);
 }
 

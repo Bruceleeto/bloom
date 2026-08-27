@@ -236,10 +236,19 @@ void lightrec_links_lut_cleared(struct lightrec_state *state,
 	unsigned int h;
 	u32 value, i;
 
-	if (!links || !links->nb_links)
+	if (!links)
 		return;
 
+	/* The "no links" test must be under the lock: the compiler thread
+	 * reads the LUT and inserts its link in one critical section, and a
+	 * DMA invalidation that slips between an unlocked check here and
+	 * that insertion would leave a live link into overwritten code. */
 	links_lock(links);
+
+	if (!links->nb_links) {
+		links_unlock(links);
+		return;
+	}
 
 	value = link_value(state, NULL);
 

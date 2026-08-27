@@ -185,6 +185,7 @@ struct lightrec_state {
 	u32 curr_pc;
 	u32 next_pc;
 	uintptr_t wrapper_regs[NUM_TEMPS];
+	uintptr_t wrapper_temps_r4[4];	/* r4-r7 temps, lightrec_save_temps() */
 	uintptr_t wrapper_cycle;
 	u8 in_delay_slot_n;
 	u32 current_cycle;
@@ -193,8 +194,9 @@ struct lightrec_state {
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
 	void *c_wrapper;
-	void *link_inv_wrapper;
-	struct block *dispatcher, *c_wrapper_block, *link_inv_wrapper_block;
+	void *link_inv_stub;
+	u32 link_inv_arg;
+	struct block *dispatcher, *c_wrapper_block, *link_inv_stub_block;
 	struct lightrec_links *links;
 	void *c_wrappers[C_WRAPPERS_COUNT];
 	struct blockcache *block_cache;
@@ -285,6 +287,7 @@ static inline void * lut_read(struct lightrec_state *state, u32 offset)
 
 void lightrec_links_lut_changed(struct lightrec_state *state,
 				u32 offset, void *ptr);
+void lightrec_link_inv_cb(u32 arg, struct lightrec_state *state);
 
 static inline void lut_write(struct lightrec_state *state, u32 offset, void *ptr)
 {

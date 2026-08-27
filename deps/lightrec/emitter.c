@@ -9,6 +9,7 @@
 #include "disassembler.h"
 #include "emitter.h"
 #include "links.h"
+
 #include "lightning-wrapper.h"
 #include "optimizer.h"
 #include "regcache.h"
@@ -1408,14 +1409,17 @@ static void rec_store_invalidate_lut(struct lightrec_cstate *cstate,
 
 	to_skip = jit_beqi(old, 0);
 
-	/* Rare path: the store landed on the first word of live code. Pass
-	 * the entry's address, bit 0 flagging the second word. The arg move
-	 * happens before the register is reused for the call target. */
+	/* Rare path: the store landed on the first word of live code. Hand
+	 * the entry's address (bit 0 flagging the second word) to the
+	 * out-of-line stub through state, never through a register: the
+	 * register cache keeps temporaries in r4-r7 and the stub saves all
+	 * of them itself. Kept to a store and a call so the cold code at
+	 * every store site stays small - it is the icache that pays for it. */
 	jit_addi(old, addr_reg, lut_offt + two_words);
-	jit_prepare();
-	jit_pushargr(old);
-	jit_movi(old, (uintptr_t)state->link_inv_wrapper);
+	jit_stxi_i(lightrec_offset(link_inv_arg), LIGHTREC_REG_STATE, old);
+	jit_movi(old, (uintptr_t)state->link_inv_stub);
 	lightrec_regcache_mark_live(reg_cache, _jit);
+	jit_prepare();
 	jit_callr(old);
 	lightrec_regcache_mark_live(reg_cache, _jit);
 

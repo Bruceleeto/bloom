@@ -6,6 +6,7 @@
  */
 
 #include <arch/cache.h>
+#include <arch/timer.h>
 #include <dc/pvr.h>
 #include <dc/video.h>
 #include <gpulib/gpu.h>
@@ -295,6 +296,38 @@ static struct pvr_renderer pvr;
 static struct poly polybuf[POLY_BUFFER_SIZE / sizeof(struct poly)];
 
 unsigned int pvr_commits, pvr_drops;
+
+uint64_t pvr_work_us_sum, pvr_work_us_max;
+unsigned int pvr_work_frames;
+static uint64_t work_start_us;
+static bool work_armed = true;
+
+/* Called on every emulated vblank (the vout flip). The first one after a
+ * commit is where the guest's next frame starts; later ones during a long
+ * frame are not. */
+void pvr_vblank_tick(void)
+{
+	if (work_armed) {
+		work_start_us = timer_us_gettime64();
+		work_armed = false;
+	}
+}
+
+/* Called on GP1(05), committed or dropped: the frame's work is done. */
+static void pvr_work_end(void)
+{
+	uint64_t now = timer_us_gettime64(), w;
+
+	if (work_start_us && !work_armed) {
+		w = now - work_start_us;
+		pvr_work_us_sum += w;
+		if (w > pvr_work_us_max)
+			pvr_work_us_max = w;
+		pvr_work_frames++;
+	}
+
+	work_armed = true;
+}
 
 /* In KOS since 2.3.0, not in its headers yet. */
 extern int pvr_check_ready(void);
@@ -3312,12 +3345,28 @@ static void pvr_render_modifier_volumes(void)
 	pvr_list_finish();
 }
 
+extern void wallclock_charge_begin(void);
+extern void wallclock_charge_end(void);
+
+static void hw_render_stop_body(void);
+
+/* The commit is real time the guest's 60 Hz must include: charge it to the
+ * wall clock explicitly (plugin.c, wallclock_charge_begin). */
 void hw_render_stop(void)
+{
+	wallclock_charge_begin();
+	hw_render_stop_body();
+	wallclock_charge_end();
+}
+
+static void hw_render_stop_body(void)
 {
 	bool overpaint = pvr.start_x == pvr.view_x
 		&& pvr.start_y == pvr.view_y;
 
 	process_gpu_commands();
+
+	pvr_work_end();
 
 	/* SUBMIT ONLY WHEN THE TILE ACCELERATOR IS FREE, AND NEVER WAIT. Busy
 	 * means this frame is dropped - the screen keeps the previous one -
