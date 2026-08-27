@@ -20,4 +20,7 @@ void hw_render_stop(void);
 
 void invalidate_all_textures(void);
 
+/* Presented-frame counters, reset by whoever prints them. */
+extern unsigned int pvr_commits, pvr_drops;
+
 #endif /* __BLOOM_PVR_H */

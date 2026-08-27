@@ -244,14 +244,11 @@ option(WITH_HYBRID_RENDERING "Enable hybrid rendering" ON)
 option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF)
 option(WITH_CLIPPING "Enable pixel clipping" ON)
 
-if (WITH_HYBRID_RENDERING)
-	set(WITH_POLYBUF_SIZE_KB 256 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
-	math(EXPR POLY_BUFFER_SIZE "0x400 * ${WITH_POLYBUF_SIZE_KB}")
-	if (NOT POLY_BUFFER_SIZE)
-		message(SEND_ERROR "Invalid poly buffer size.")
-	endif()
-else()
-	set(POLY_BUFFER_SIZE 0) # the buffer will be discarded anyway
+# The frame's retained primitive list (both PT and TR lists share it).
+set(WITH_POLYBUF_SIZE_KB 256 CACHE STRING "Poly buffer size, in KiB")
+math(EXPR POLY_BUFFER_SIZE "0x400 * ${WITH_POLYBUF_SIZE_KB}")
+if (NOT POLY_BUFFER_SIZE)
+	message(SEND_ERROR "Invalid poly buffer size.")
 endif()
 
 target_compile_definitions(gpu PRIVATE POLY_BUFFER_SIZE=${POLY_BUFFER_SIZE})

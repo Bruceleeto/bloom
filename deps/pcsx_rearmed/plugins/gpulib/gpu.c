@@ -345,7 +345,6 @@ void GPUwriteStatus(uint32_t data)
       if (src_x != gpu.screen.src_x || src_y != gpu.screen.src_y) {
         gpu.screen.src_x = src_x;
         gpu.screen.src_y = src_y;
-        renderer_notify_scanout_change(src_x, src_y);
         if (gpu.frameskip.set) {
           decide_frameskip_allow(&gpu);
           if (gpu.frameskip.last_flip_frame != *gpu.state.frame_count) {
@@ -354,6 +353,9 @@ void GPUwriteStatus(uint32_t data)
           }
         }
       }
+      /* Every display-start write, changed or not: it is the frame
+       * boundary for the PVR renderer. */
+      renderer_notify_scanout_change(src_x, src_y);
       break;
     case 0x06:
       gpu.screen.x1 = data & 0xfff;

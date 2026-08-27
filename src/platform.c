@@ -207,22 +207,19 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	if (!started || !vram)
 		return;
 
-	if (HARDWARE_ACCELERATED && !frame_was_24bpp) {
-		/* Render the old frame */
+	/* Frames are committed by the renderer itself on GP1(05); this is
+	 * only the 15/24bpp mode transition and the per-second stats. */
+	if (HARDWARE_ACCELERATED && !frame_was_24bpp && bgr24) {
 		hw_render_stop();
-
-		if (bgr24) {
-			invalidate_all_textures();
-			dc_alloc_pvram();
-		}
+		invalidate_all_textures();
+		dc_alloc_pvram();
 	}
 
 	if (HARDWARE_ACCELERATED && !bgr24) {
-		if (frame_was_24bpp)
+		if (frame_was_24bpp) {
 			pvr_mem_free(pvram);
-
-		/* Prepare the next frame */
-		hw_render_start();
+			hw_render_start();
+		}
 	} else {
 		vram = (void *)((uintptr_t)vram + offset);
 		assert(!((unsigned int)vram & 0x3));
@@ -316,15 +313,18 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
 
 
-		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%%\n",
+		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%% commits %u drops %u\n",
 		       (float)frames * 1000.0f / (float)(new_timer - timer_ms),
 		       (float)(new_timer - timer_ms) / (float)frames,
 		       (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
-		       100.0f - 100.0f * idle_diff / cpu_diff);
+		       100.0f - 100.0f * idle_diff / cpu_diff,
+		       pvr_commits, pvr_drops);
 		fflush(stdout);
 
 		timer_ms = new_timer;
 		frames = 0;
+		pvr_commits = 0;
+		pvr_drops = 0;
 
 		last_cputime = cputime;
 		last_idletime = idletime;

@@ -197,6 +197,7 @@ struct clip_area {
 #define POLY_FB			BIT(6)
 #define POLY_NOCLIP		BIT(7)
 #define POLY_TILECLIP		BIT(8)
+#define POLY_SCREEN		BIT(9)	/* coords already screen-relative */
 
 struct poly {
 	alignas(32)
@@ -235,6 +236,16 @@ struct pvr_renderer {
 	uint32_t new_frame :1;
 	uint32_t has_bg :1;
 
+	/* A frame is open between hw_render_start() and hw_render_stop();
+	 * commits are ignored outside of it (24bpp mode, vout closed). */
+	uint32_t frame_open :1;
+
+	/* GP1(05) bookkeeping for the vblank fallback, see
+	 * renderer_notify_update_lace(). */
+	uint32_t flipped_since_vblank :1;
+	uint32_t ever_flipped :1;
+	uint32_t vbl_since_flip :8;
+
 	uint32_t set_mask :1;
 	uint32_t check_mask :1;
 
@@ -257,7 +268,9 @@ struct pvr_renderer {
 	pvr_ptr_t reap_list[2][32 * 4];
 	unsigned int reap_bank, to_reap[2];
 
+	/* TR polys grow up from polybuf[0]; PT polys grow down from the end. */
 	unsigned int polybuf_cnt_start;
+	unsigned int polybuf_cnt_pt;
 
 	unsigned int nb_clips;
 	struct clip_area clips[64];
@@ -276,6 +289,17 @@ static void poly_enqueue(pvr_list_t list, const struct poly *poly);
 static struct pvr_renderer pvr;
 
 static struct poly polybuf[POLY_BUFFER_SIZE / sizeof(struct poly)];
+
+unsigned int pvr_commits, pvr_drops;
+
+/* In KOS since 2.3.0, not in its headers yet. */
+extern int pvr_check_ready(void);
+
+/* Vertical blanks without a GP1(05) after which the vblank becomes the frame
+ * boundary again, for titles that never write it (bloop's FLIP_STALE_VBL). */
+#define FLIP_STALE_VBL 60
+
+static void pvr_commit_frame(void);
 
 static uint32_t cmdbuf[32768];
 
@@ -909,8 +933,17 @@ static inline void poly_copy(struct poly *dst, const struct poly *src)
 
 static void pvr_reap_ptr(pvr_ptr_t tex)
 {
-	unsigned int idx = pvr.to_reap[pvr.reap_bank]++;
+	unsigned int idx = pvr.to_reap[pvr.reap_bank];
+
+	/* A dropped frame does not reap, so two frames of discards can land in
+	 * one bank. Leak rather than overrun. */
+	if (unlikely(idx == ARRAY_SIZE(pvr.reap_list[0]))) {
+		printf("Reap list overflow\n");
+		return;
+	}
+
 	pvr.reap_list[pvr.reap_bank][idx] = tex;
+	pvr.to_reap[pvr.reap_bank] = idx + 1;
 }
 
 static void discard_texture_page(struct texture_page *page)
@@ -934,14 +967,6 @@ static void invalidate_textures(unsigned int page_offset, uint64_t block_mask)
 	invalidate_texture(&pvr.textures4[page_offset].base, block_mask);
 }
 
-static bool overlap_draw_area(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
-{
-	return x0 < pvr.start_x + gpu.screen.hres
-		&& y0 < pvr.start_y + gpu.screen.vres
-		&& x1 > pvr.start_x
-		&& y1 > pvr.start_y;
-}
-
 static void invalidate_texture_area(unsigned int page_offset,
 				    uint16_t xmin, uint16_t xmax,
 				    uint16_t ymin, uint16_t ymax,
@@ -959,8 +984,12 @@ static void invalidate_texture_area(unsigned int page_offset,
 	block_mask = get_block_mask(umin << 2, umax << 2, vmin, vmax);
 	invalidate_textures(page_offset, block_mask);
 
-	if (invalidate_only || !overlap_draw_area(xmin, ymin, xmax, ymax))
+	if (invalidate_only)
 		return;
+
+	/* Recorded whatever the upload targets: which VRAM window is on
+	 * screen is only known at the commit, where pvr_load_bg() converts
+	 * the blocks inside it and poly_draw_now() skips the quads outside. */
 
 	pvr.textures16[page_offset].bgload_mask |= block_mask;
 	pvr.has_bg = 1;
@@ -969,11 +998,6 @@ static void invalidate_texture_area(unsigned int page_offset,
 	 * writes overwrite whatever was there before). Add a black square
 	 * behind the textured one to make sure the transparent pixels end up
 	 * black. */
-
-	xmin -= pvr.start_x;
-	xmax -= pvr.start_x;
-	ymin -= pvr.start_y;
-	ymax -= pvr.start_y;
 
 	poly_alloc_cache(&poly);
 
@@ -1058,14 +1082,39 @@ void renderer_notify_res_change(void)
 {
 }
 
+/* GP1(05), the display-start write. THE FRAME BOUNDARY: the list recorded
+ * since the previous one is committed now, whatever the vblank is doing.
+ * That is bleem's model, and it is what makes the picture independent of
+ * when the vblank lands. */
 void renderer_notify_scanout_change(int x, int y)
 {
 	pvr.view_x = x;
 	pvr.view_y = y;
+
+	pvr.flipped_since_vblank = 1;
+	pvr.ever_flipped = 1;
+	pvr.vbl_since_flip = 0;
+
+	pvr_commit_frame();
 }
 
+/* Called from GPUupdateLace() once per vblank, updated=0 before the flip.
+ * A title that never writes GP1(05) - or wrote it once at setup and never
+ * again - gets the vblank as its frame boundary, as before. */
 void renderer_notify_update_lace(int updated)
 {
+	if (updated)
+		return;
+
+	if (pvr.vbl_since_flip < FLIP_STALE_VBL)
+		pvr.vbl_since_flip++;
+
+	if (!pvr.flipped_since_vblank
+	    && (!pvr.ever_flipped || pvr.vbl_since_flip >= FLIP_STALE_VBL)
+	    && (!pvr.new_frame || pvr.has_bg))
+		pvr_commit_frame();
+
+	pvr.flipped_since_vblank = 0;
 }
 
 void renderer_set_config(const struct rearmed_cbs *cbs)
@@ -1100,6 +1149,38 @@ static inline float get_zvalue(uint16_t zoffset)
 }
 
 __noinline
+/* A clip rectangle recorded in VRAM coordinates, to the screen. Same
+ * origin subtraction as the vertices, at the same time: the commit. */
+static struct clip_area clip_to_screen(struct clip_area c)
+{
+	int32_t sx1, sy1, sx2, sy2;
+
+	sx1 = (int32_t)((float)(c.x1 - pvr.start_x) * screen_fw);
+	sy1 = (int32_t)((float)(c.y1 - pvr.start_y) * screen_fh);
+	sx2 = (int32_t)((float)(c.x2 - pvr.start_x) * screen_fw);
+	sy2 = (int32_t)((float)(c.y2 - pvr.start_y) * screen_fh);
+
+	if (sx2 < sx1)
+		sx2 = sx1;
+	if (sy2 < sy1)
+		sy2 = sy1;
+	if (sx1 < 0)
+		sx1 = 0;
+	if (sy1 < 0)
+		sy1 = 0;
+	if (sx2 > SCREEN_WIDTH)
+		sx2 = SCREEN_WIDTH;
+	if (sy2 > SCREEN_HEIGHT)
+		sy2 = SCREEN_HEIGHT;
+
+	c.x1 = (int16_t)sx1;
+	c.y1 = (int16_t)sy1;
+	c.x2 = (int16_t)sx2;
+	c.y2 = (int16_t)sy2;
+
+	return c;
+}
+
 static void pvr_add_clip(uint16_t zoffset)
 {
 	int16_t x1, x2, y1, y2;
@@ -1111,23 +1192,10 @@ static void pvr_add_clip(uint16_t zoffset)
 	if (unlikely(pvr.nb_clips == ARRAY_SIZE(pvr.clips))) {
 		printf("Too many clip areas\n");
 	} else {
-		x1 = pvr.draw_x1 * screen_fw;
-		y1 = pvr.draw_y1 * screen_fh;
-		x2 = pvr.draw_x2 * screen_fw;
-		y2 = pvr.draw_y2 * screen_fh;
-
-		if (x2 < x1)
-			x2 = x1;
-		if (y2 < y1)
-			y2 = y1;
-		if (x1 < 0)
-			x1 = 0;
-		if (y1 < 0)
-			y1 = 0;
-		if (x2 > SCREEN_WIDTH)
-			x2 = SCREEN_WIDTH;
-		if (y2 > SCREEN_HEIGHT)
-			y2 = SCREEN_HEIGHT;
+		x1 = pvr.draw_x1;
+		y1 = pvr.draw_y1;
+		x2 = pvr.draw_x2;
+		y2 = pvr.draw_y2;
 
 		pvr.clips[pvr.nb_clips++] = (struct clip_area){
 			.x1 = x1,
@@ -1169,6 +1237,11 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 		pvr_dr_commit(sq_hdr);
 	}
 
+	/* Vertices are recorded in VRAM coordinates; the display origin of
+	 * the list being committed comes off here. */
+	int16_t ox = (flags & POLY_SCREEN) ? 0 : pvr.start_x;
+	int16_t oy = (flags & POLY_SCREEN) ? 0 : pvr.start_y;
+
 	for (i = 0; i < nb; i++) {
 		/*
 		 * The screen transform is diagonal - two scales and two
@@ -1176,8 +1249,8 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 		 * GTE's rotation matrix in this build, which is a product
 		 * that actually needs all sixteen words.
 		 */
-		float fr0 = (float)coords[i].x * screen_fw;
-		float fr1 = (float)coords[i].y * screen_fh;
+		float fr0 = (float)(coords[i].x - ox) * screen_fw;
+		float fr1 = (float)(coords[i].y - oy) * screen_fh;
 		float fr2 = (float)coords[i].u * (1.0f / 256.0f);
 		float fr3 = (float)(coords[i].v + voffset) * (1.0f / 1024.0f);
 
@@ -1526,10 +1599,17 @@ static void pvr_tile_clip(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 __noinline
 static void poly_do_tile_clip(const struct poly *poly)
 {
+	struct clip_area c = {
+		.x1 = poly->coords[0].x,
+		.y1 = poly->coords[0].y,
+		.x2 = poly->coords[0].u,
+		.y2 = poly->coords[0].v,
+	};
+
 	pvr_avoid_tile_clip_glitch();
 
-	pvr_tile_clip(poly->coords[0].x, poly->coords[0].y,
-		      poly->coords[0].u, poly->coords[0].v);
+	c = clip_to_screen(c);
+	pvr_tile_clip(c.x1, c.y1, c.x2, c.y2);
 }
 
 __noinline
@@ -1631,6 +1711,14 @@ static void poly_draw_now(const struct poly *poly)
 	pvr_poly_hdr_t hdr, *poly_hdr;
 	pvr_ptr_t tex = NULL;
 	float z;
+
+	/* An upload outside the window being committed is not a background. */
+	if (unlikely(flags & POLY_FB)
+	    && (coords[0].x >= pvr.start_x + gpu.screen.hres
+		|| coords[3].x <= pvr.start_x
+		|| coords[0].y >= pvr.start_y + gpu.screen.vres
+		|| coords[3].y <= pvr.start_y))
+		return;
 
 	if (WITH_CLIPPING && unlikely(poly->flags & POLY_TILECLIP)) {
 		/* We'll send a new header, so the next poly can't reuse the
@@ -1914,6 +2002,10 @@ static void poly_draw_now(const struct poly *poly)
 static void pvr_load_bg(void)
 {
 	struct texture_page_16bpp *page16;
+	int32_t wx0 = pvr.start_x, wy0 = pvr.start_y;
+	int32_t wx1 = wx0 + gpu.screen.hres, wy1 = wy0 + gpu.screen.vres;
+	int32_t px, py, x0, x1, y0, y1;
+	uint64_t mask;
 	unsigned int i;
 
 	for (i = 0; i < 32; i++) {
@@ -1922,7 +2014,22 @@ static void pvr_load_bg(void)
 		if (!page16->bgload_mask)
 			continue;
 
-		maybe_update_texture(&page16->base, i, page16->bgload_mask);
+		/* The blocks of this page inside the display window. A 16bpp
+		 * page is 64x256 VRAM pixels, blocks are 16x16 (4x16 grid). */
+		px = (i % 16) * 64;
+		py = (i / 16) * 256;
+		x0 = max32(wx0, px) - px;
+		x1 = min32(wx1, px + 64) - px;
+		y0 = max32(wy0, py) - py;
+		y1 = min32(wy1, py + 256) - py;
+
+		if (x1 > x0 && y1 > y0) {
+			mask = get_block_mask(x0 << 2, x1 << 2, y0, y1);
+			mask &= page16->bgload_mask;
+			if (mask)
+				maybe_update_texture(&page16->base, i, mask);
+		}
+
 		page16->bgload_mask = 0;
 	}
 }
@@ -1943,32 +2050,42 @@ static void pvr_set_list(pvr_list_t list)
 __noinline
 static void pvr_start_scene(pvr_list_t list)
 {
-	pvr_wait_ready();
+	/* The caller has checked the TA is free; nothing waits here. */
 	pvr_reap_textures();
 
 	pvr_scene_begin();
 	pvr_set_list(list);
 
-	pvr.new_frame = 0;
-
 	if (WITH_CLIPPING) {
-		pvr_add_clip(3);
-
 		/* Reset tile clip */
 		pvr_tile_clip(0.0f, 0.0f, (float)SCREEN_WIDTH, (float)SCREEN_HEIGHT);
 	}
 }
 
+/* NOTHING IS STREAMED TO THE TA MID-FRAME. Every poly is recorded, and the
+ * whole list is submitted at the commit (GP1(05)). TR polys fill the buffer
+ * from the bottom, PT polys from the top; they meet in the middle. */
 __pvr
 static void poly_enqueue(pvr_list_t list, const struct poly *poly)
 {
-	if (!WITH_HYBRID_RENDERING || likely(list == PVR_LIST_PT_POLY)) {
-		if (unlikely(pvr.new_frame))
-			pvr_start_scene(list);
+	if (unlikely(pvr.new_frame)) {
+		pvr.new_frame = 0;
 
-		poly_draw_now(poly);
-	} else if (unlikely(pvr.polybuf_cnt_start == __array_size(polybuf))) {
+		/* The initial clip area, first in the TR list. */
+		if (WITH_CLIPPING)
+			pvr_add_clip(3);
+	}
+
+	if (unlikely(pvr.polybuf_cnt_start + pvr.polybuf_cnt_pt
+		     == __array_size(polybuf))) {
 		printf("Poly buffer overflow\n");
+		return;
+	}
+
+	if (!WITH_HYBRID_RENDERING || likely(list == PVR_LIST_PT_POLY)) {
+		poly_copy(&polybuf[__array_size(polybuf) - 1 - pvr.polybuf_cnt_pt],
+			  poly);
+		pvr.polybuf_cnt_pt++;
 	} else {
 		poly_copy(&polybuf[pvr.polybuf_cnt_start++], poly);
 	}
@@ -1988,6 +2105,23 @@ static void polybuf_render_from_start(void)
 	}
 
 	pvr.polybuf_cnt_start = 0;
+}
+
+static void polybuf_render_pt(void)
+{
+	struct poly *p = &polybuf[__array_size(polybuf) - 1];
+	unsigned int i;
+
+	poly_prefetch(p);
+
+	for (i = 0; i < pvr.polybuf_cnt_pt; i++, p--) {
+		poly_prefetch(p - 1);
+
+		poly_draw_now(p);
+		poly_discard(p);
+	}
+
+	pvr.polybuf_cnt_pt = 0;
 }
 
 static inline struct vertex_coords
@@ -2438,13 +2572,13 @@ static void cmd_clear_image(const union PacketBuffer *pbuffer)
 
 	pvr_update_caches(x0, y0, w0, h0, true);
 
-	if (screen_bpp != 24 && overlap_draw_area(x0, y0, x0 + w0, y0 + h0)) {
+	if (screen_bpp != 24) {
 		color32 = __builtin_bswap32(pbuffer->U4[0]) >> 8;
 
-		x13 = max32(x0, pvr.start_x) - pvr.start_x;
-		y01 = max32(y0, pvr.start_y) - pvr.start_y;
-		x02 = min32(x0 + w0, pvr.start_x + gpu.screen.hres) - pvr.start_x;
-		y23 = min32(y0 + h0, pvr.start_y + gpu.screen.vres) - pvr.start_y;
+		x13 = x0;
+		y01 = y0;
+		x02 = x0 + w0;
+		y23 = y0 + h0;
 
 		poly_alloc_cache(&poly);
 
@@ -2466,9 +2600,10 @@ static void cmd_clear_image(const union PacketBuffer *pbuffer)
 
 static inline bool pvr_clip_test(void)
 {
-	return pvr.draw_x1 || pvr.draw_y1
-		|| pvr.draw_x2 != gpu.screen.hres
-		|| pvr.draw_y2 != gpu.screen.vres;
+	/* A draw area the size of the display is a whole buffer, wherever it
+	 * sits in VRAM; anything smaller needs clipping. */
+	return pvr.draw_x2 - pvr.draw_x1 != gpu.screen.hres
+		|| pvr.draw_y2 - pvr.draw_y1 != gpu.screen.vres;
 }
 
 __pvr
@@ -2547,11 +2682,11 @@ static void process_gpu_commands(void)
 				/* Set top-left corner of drawing area */
 				draw_x = pbuffer->U4[0] & 0x3ff;
 				draw_y = (pbuffer->U4[0] >> 10) & 0x1ff;
-				draw_updated = draw_x - pvr.start_x != pvr.draw_x1
-					|| draw_y - pvr.start_y != pvr.draw_y1;
+				draw_updated = draw_x != pvr.draw_x1
+					|| draw_y != pvr.draw_y1;
 
-				pvr.draw_x1 = draw_x - pvr.start_x;
-				pvr.draw_y1 = draw_y - pvr.start_y;
+				pvr.draw_x1 = draw_x;
+				pvr.draw_y1 = draw_y;
 
 				if (WITH_CLIPPING) {
 					pvr.clip_test = pvr_clip_test();
@@ -2565,11 +2700,11 @@ static void process_gpu_commands(void)
 				/* Set bottom-right corner of drawing area */
 				draw_x = (pbuffer->U4[0] & 0x3ff) + 1;
 				draw_y = ((pbuffer->U4[0] >> 10) & 0x1ff) + 1;
-				draw_updated = draw_x - pvr.start_x != pvr.draw_x2
-					|| draw_y - pvr.start_y != pvr.draw_y2;
+				draw_updated = draw_x != pvr.draw_x2
+					|| draw_y != pvr.draw_y2;
 
-				pvr.draw_x2 = draw_x - pvr.start_x;
-				pvr.draw_y2 = draw_y - pvr.start_y;
+				pvr.draw_x2 = draw_x;
+				pvr.draw_y2 = draw_y;
 
 				if (WITH_CLIPPING) {
 					pvr.clip_test = pvr_clip_test();
@@ -2583,8 +2718,8 @@ static void process_gpu_commands(void)
 				/* Set drawing offsets */
 				pvr.draw_dx = ((int32_t)pbuffer->U4[0] << 21) >> 21;
 				pvr.draw_dy = ((int32_t)pbuffer->U4[0] << 10) >> 21;
-				pvr.draw_offt_x = pvr.draw_dx - pvr.start_x + gpu.screen.x;
-				pvr.draw_offt_y = pvr.draw_dy - pvr.start_y + gpu.screen.y;
+				pvr.draw_offt_x = pvr.draw_dx + gpu.screen.x;
+				pvr.draw_offt_y = pvr.draw_dy + gpu.screen.y;
 				if (0)
 					pvr_printf("Set drawing offsets to %dx%d\n",
 						   pvr.draw_dx, pvr.draw_dy);
@@ -2996,9 +3131,25 @@ void hw_render_start(void)
 	pvr.cmdbuf_offt = 0;
 	pvr.old_blending_is_none = false;
 	pvr.polybuf_cnt_start = 0;
+	pvr.polybuf_cnt_pt = 0;
 	pvr.nb_clips = 0;
+	pvr.frame_open = 1;
 
 	reset_texture_pages();
+}
+
+/* The bookkeeping every frame end does, rendered or dropped. */
+static void hw_render_end_frame(void)
+{
+	/* Discard any textures covered by the draw area */
+	pvr_update_caches(pvr.start_x, pvr.start_y,
+			  gpu.screen.hres, gpu.screen.vres, true);
+
+	pvr.start_x = pvr.view_x;
+	pvr.start_y = pvr.view_y;
+	pvr.draw_offt_x = pvr.draw_dx + gpu.screen.x;
+	pvr.draw_offt_y = pvr.draw_dy + gpu.screen.y;
+	pvr.frame_open = 0;
 }
 
 static void pvr_render_black_square(uint16_t x0, uint16_t x1,
@@ -3010,7 +3161,7 @@ static void pvr_render_black_square(uint16_t x0, uint16_t x1,
 	};
 	static const uint32_t colors[4] = { 0 };
 
-	draw_prim(NULL, coords, 0.0f, colors, 4, z, 0, POLY_NOCLIP);
+	draw_prim(NULL, coords, 0.0f, colors, 4, z, 0, POLY_NOCLIP | POLY_SCREEN);
 }
 
 static void pvr_render_outlines(void)
@@ -3106,6 +3257,7 @@ static void render_mod_cube(float x1, float y1, float z1,
 static void pvr_render_modifier_volumes(void)
 {
 	int16_t x1, y1, x2, y2, tilex1, tiley1, tilex2, tiley2;
+	struct clip_area c;
 	unsigned int i;
 	float z, newz;
 
@@ -3130,10 +3282,11 @@ static void pvr_render_modifier_volumes(void)
 		else
 			newz = get_zvalue(pvr.zoffset++);
 
-		x1 = pvr.clips[i].x1;
-		x2 = pvr.clips[i].x2;
-		y1 = pvr.clips[i].y1;
-		y2 = pvr.clips[i].y2;
+		c = clip_to_screen(pvr.clips[i]);
+		x1 = c.x1;
+		x2 = c.x2;
+		y1 = c.y1;
+		y2 = c.y2;
 		tilex1 = x1 & -32;
 		tiley1 = y1 & -32;
 		tilex2 = (x2 + 31) & -32;
@@ -3155,23 +3308,45 @@ static void pvr_render_modifier_volumes(void)
 
 void hw_render_stop(void)
 {
-	bool overpaint;
+	bool overpaint = pvr.start_x == pvr.view_x
+		&& pvr.start_y == pvr.view_y;
 
 	process_gpu_commands();
 
-	if (unlikely(pvr.new_frame)) {
-		pvr_start_scene(PVR_LIST_TR_POLY);
-	} else if (WITH_HYBRID_RENDERING) {
-		pvr_list_finish();
-		pvr_set_list(PVR_LIST_TR_POLY);
+	/* SUBMIT ONLY WHEN THE TILE ACCELERATOR IS FREE, AND NEVER WAIT. Busy
+	 * means this frame is dropped - the screen keeps the previous one -
+	 * and the guest goes straight back to running. */
+	if (pvr_check_ready() < 0) {
+		pvr_drops++;
+		pvr.polybuf_cnt_start = 0;
+		pvr.polybuf_cnt_pt = 0;
+		hw_render_end_frame();
+		return;
 	}
 
-	if (WITH_HYBRID_RENDERING && likely(pvr.polybuf_cnt_start))
+	pvr_commits++;
+
+	/* THE ORIGIN OF THIS LIST IS THE BUFFER JUST DISPLAYED. GP1(05)
+	 * names the buffer the guest finished drawing; everything recorded
+	 * since the previous commit was drawn into it, so that is what every
+	 * coordinate is relative to. Single-buffered titles name the same
+	 * buffer every time, which is what `overpaint` detects. */
+	pvr.start_x = pvr.view_x;
+	pvr.start_y = pvr.view_y;
+
+	if (likely(pvr.polybuf_cnt_pt)) {
+		pvr_start_scene(PVR_LIST_PT_POLY);
+		polybuf_render_pt();
+		pvr_list_finish();
+		pvr_set_list(PVR_LIST_TR_POLY);
+	} else {
+		pvr_start_scene(PVR_LIST_TR_POLY);
+	}
+
+	if (likely(pvr.polybuf_cnt_start))
 		polybuf_render_from_start();
 
 	if (!WITH_24BPP) {
-		overpaint = pvr.start_x == pvr.view_x
-			&& pvr.start_y == pvr.view_y;
 		vid_set_dithering(!overpaint);
 
 		if (overpaint) {
@@ -3205,14 +3380,17 @@ void hw_render_stop(void)
 
 	pvr_scene_finish();
 
-	/* Discard any textures covered by the draw area */
-	pvr_update_caches(pvr.start_x, pvr.start_y,
-			  gpu.screen.hres, gpu.screen.vres, true);
+	hw_render_end_frame();
+}
 
-	pvr.start_x = pvr.view_x;
-	pvr.start_y = pvr.view_y;
-	pvr.draw_offt_x = pvr.draw_dx - pvr.start_x + gpu.screen.x;
-	pvr.draw_offt_y = pvr.draw_dy - pvr.start_y + gpu.screen.y;
+/* One frame: close the list, submit (or drop) it, open the next. */
+static void pvr_commit_frame(void)
+{
+	if (!pvr.frame_open)
+		return;
+
+	hw_render_stop();
+	hw_render_start();
 }
 
 void renderer_flush_queues(void)
