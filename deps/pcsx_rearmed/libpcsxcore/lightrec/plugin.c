@@ -145,15 +145,84 @@ static bool has_interrupt(void)
 		(regs->cp0[12] & regs->cp0[13] & 0x0300);
 }
 
+/* bloop's clock model (bloop/src/clock.h; bleem's TMU chain,
+ * bloop/docs/bleemcast/asm/dynarec_services.md §4): the guest's clock IS the
+ * host timer.  psxRegs.cycle no longer advances by the cycles lightrec
+ * counted for the code it ran; it advances by the real time that passed,
+ * converted at PSXCLK.  Every scheduled event - vblank, root counters, CD
+ * sectors, DMA completion, SPU - keeps its cycle arithmetic untouched and
+ * therefore lands on wall time, all on the one clock.  The guest sees 60 Hz
+ * whatever the host manages, and a guest waiting for a vblank costs only the
+ * real time until that vblank.
+ *
+ * TMU1 is KOS's free-running uptime counter: 32-bit, counts DOWN, one tick
+ * per 80 ns (pclk 50 MHz / 4), never reloaded.  PSXCLK / 12.5 MHz = 2.709504
+ * guest cycles per tick, held as 16.16 fixed point with the remainder
+ * carried so nothing drifts.
+ *
+ * WALLCLOCK_SLOWDOWN stretches the tick (bloop's CLOCK_SLOWDOWN): at N the
+ * guest gets N times the work per frame and still sees 60 Hz.  It is a ruler
+ * for how far the emulator is from real time, never a shipping setting.
+ *
+ * The cycles lightrec counts are now only a guess at how long a slice will
+ * take, so slices are capped at WALLCLOCK_POLL_CYCLES to bound how late an
+ * event can be delivered on a slow host.
+ *
+ * There is no idle-loop detection and there is no need for one: a spin only
+ * costs the real time until the event it waits for, which is time the guest
+ * was going to spend anyway.  Detection is a cycle-counter feature. */
+#define WALL_TCNT1		(*(volatile u32 *)0xffd80018)
+#define WALL_TICK_HZ		12500000u
+#define WALL_CYCLES_PER_TICK_FP	((u32)(((u64)PSXCLK << 16) / WALL_TICK_HZ))
+/* A host stall (savestate inflate, a PVR wait) passes at most this much
+ * guest time - events coalesce, they do not burst. */
+#define WALL_MAX_DELTA		(PSXCLK / 30)
+
+static u32 wall_last_tcnt, wall_frac;
+static bool wall_started;
+unsigned int wall_clamps;
+
+static u32 wallclock_elapsed_cycles(void)
+{
+	u32 now = WALL_TCNT1, ticks, cycles;
+	u64 acc;
+
+	if (unlikely(!wall_started)) {
+		wall_started = true;
+		wall_last_tcnt = now;
+		return 0;
+	}
+
+	ticks = wall_last_tcnt - now;	/* counts down; wraps correctly */
+	wall_last_tcnt = now;
+
+	acc = (u64)ticks * WALL_CYCLES_PER_TICK_FP / WALLCLOCK_SLOWDOWN
+		+ wall_frac;
+	cycles = (u32)(acc >> 16);
+	wall_frac = (u32)acc & 0xffff;
+
+	if (unlikely(cycles > WALL_MAX_DELTA)) {
+		cycles = WALL_MAX_DELTA;
+		wall_clamps++;
+	}
+
+	return cycles;
+}
+
+static inline s32 wallclock_slice(s32 cycles)
+{
+	return cycles > WALLCLOCK_POLL_CYCLES ? WALLCLOCK_POLL_CYCLES : cycles;
+}
+
 static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
-	psxRegs.cycle += lightrec_current_cycle_count(state) / 1024;
+	psxRegs.cycle += wallclock_elapsed_cycles();
 	lightrec_reset_cycle_count(state, 0);
 }
 
 static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 {
-	s32 cycles_left = psxRegs.next_interupt - psxRegs.cycle;
+	s32 cycles_left = wallclock_slice(psxRegs.next_interupt - psxRegs.cycle);
 
 	if (block_stepping || cycles_left <= 0 || has_interrupt())
 		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
@@ -617,6 +686,7 @@ static void lightrec_plugin_execute_internal(bool block_only)
 
 	cycles_pcsx = psxRegs.next_interupt - psxRegs.cycle;
 	assert((s32)cycles_pcsx > 0);
+	cycles_pcsx = wallclock_slice(cycles_pcsx);
 
 	// step during early boot so that 0x80030000 fastboot hack works
 	block_stepping = block_only;

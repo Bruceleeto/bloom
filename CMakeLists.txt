@@ -134,6 +134,15 @@ set(WITH_GPUSTATUS_POLLING_THRESHOLD 350 CACHE STRING
 	"Threshold in CPU cycles for GPU status register polling detection (0 = disabled)"
 )
 
+# P1 of docs/chobo.md "Path to 60": the guest's clock IS the host TMU
+# (bleem's model).  Not optional - there is one clock and one code path.
+set(WITH_WALLCLOCK_POLL_CYCLES 16384 CACHE STRING
+	"Longest lightrec slice in guest cycles (bounds event delivery latency)"
+)
+set(WITH_WALLCLOCK_SLOWDOWN 1 CACHE STRING
+	"Stretch the host tick N times: the guest still sees 60 Hz and gets N times the work per frame. A ruler, not a setting."
+)
+
 add_library(libpcsxcore STATIC
 	${PCSX_REAL_DIR}/libpcsxcore/cdriso.c
 	${PCSX_REAL_DIR}/libpcsxcore/cdrom.c
@@ -189,6 +198,8 @@ target_compile_definitions(libpcsxcore PUBLIC
 	USE_C11_THREADS
 	HAVE_CDROM
 	GPUSTATUS_POLLING_THRESHOLD=${WITH_GPUSTATUS_POLLING_THRESHOLD}
+	WALLCLOCK_POLL_CYCLES=${WITH_WALLCLOCK_POLL_CYCLES}
+	WALLCLOCK_SLOWDOWN=${WITH_WALLCLOCK_SLOWDOWN}
 )
 target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)

@@ -35,6 +35,7 @@
 #define TEX_HEIGHT 512
 
 static unsigned int frames;
+static unsigned int last_vbl;
 static uint64_t timer_ms;
 
 static pvr_ptr_t pvram;
@@ -313,12 +314,16 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
 
 
-		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%% commits %u drops %u\n",
-		       (float)frames * 1000.0f / (float)(new_timer - timer_ms),
-		       (float)(new_timer - timer_ms) / (float)frames,
+		/* fps/frame: guest frames presented (GP1(05) commits). flips:
+		 * vout flips, which the vblank drives. vbl: emulated vblanks in
+		 * the window - 60 under WALLCLOCK whatever the host manages. */
+		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%% commits %u drops %u flips %u vbl %u\n",
+		       (float)pvr_commits * 1000.0f / (float)(new_timer - timer_ms),
+		       (float)(new_timer - timer_ms) / (float)(pvr_commits ? pvr_commits : 1),
 		       (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
 		       100.0f - 100.0f * idle_diff / cpu_diff,
-		       pvr_commits, pvr_drops);
+		       pvr_commits, pvr_drops, frames, frame_counter - last_vbl);
+		last_vbl = frame_counter;
 		fflush(stdout);
 
 		timer_ms = new_timer;

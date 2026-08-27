@@ -265,8 +265,12 @@ struct pvr_renderer {
 	struct texture_page_8bpp textures8[32];
 	struct texture_page_4bpp textures4[32];
 
-	pvr_ptr_t reap_list[2][32 * 4];
-	unsigned int reap_bank, to_reap[2];
+	/* Three banks: a discard made while recording frame N is freed at
+	 * commit N+2, by which time the render of the last scene that could
+	 * reference it (N-1) has finished - at 60 fps the previous render can
+	 * still be in flight when the next scene is submitted. */
+	pvr_ptr_t reap_list[3][32 * 4];
+	unsigned int reap_bank, to_reap[3];
 
 	/* TR polys grow up from polybuf[0]; PT polys grow down from the end. */
 	unsigned int polybuf_cnt_start;
@@ -495,7 +499,7 @@ static void pvr_reap_textures(void)
 {
 	unsigned int i, list;
 
-	pvr.reap_bank ^= 1;
+	pvr.reap_bank = pvr.reap_bank == 2 ? 0 : pvr.reap_bank + 1;
 	list = pvr.reap_bank;
 
 	for (i = 0; i < pvr.to_reap[list]; i++)
@@ -506,6 +510,7 @@ static void pvr_reap_textures(void)
 
 void pvr_renderer_shutdown(void)
 {
+	pvr_reap_textures();
 	pvr_reap_textures();
 	pvr_reap_textures();
 	if (!WITH_24BPP)
@@ -1030,6 +1035,7 @@ void invalidate_all_textures(void)
 	pvr_reap_textures();
 
 	pvr_wait_render_done();
+	pvr_reap_textures();
 	pvr_reap_textures();
 }
 
