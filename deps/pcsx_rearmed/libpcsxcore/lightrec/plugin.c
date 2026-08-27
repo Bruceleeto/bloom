@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <assert.h>
@@ -183,6 +184,51 @@ static u32 wall_charge_tcnt, wall_charge_ticks;
 static bool wall_started;
 unsigned int wall_clamps, wall_dropped_us;
 
+/* BENCH io: every HW-window access (both the direct-call shim and the
+ * generic lightrec_rw path land here), count and TMU1 ticks spent inside
+ * the handler - clock transitions + psxHw* device body. Reset by the
+ * BENCH printer. 12.5 ticks per us. */
+unsigned int io_calls;
+u32 io_ticks;
+/* Per-register split of the same, top entries printed as an IO line. The
+ * renderer commit runs inside the GP1 write and is charged separately
+ * (wall_charge_ticks, zeroed by the transition at the top of the handler),
+ * so it is taken back out here. */
+static u32 io_reg_ticks[0x2000 / 4], io_reg_calls[0x2000 / 4];
+#define IO_BEGIN()	u32 io_t0 = WALL_TCNT1
+#define IO_END()	do { \
+	u32 io_d = (io_t0 - WALL_TCNT1) - wall_charge_ticks; \
+	u32 io_i = ((mem) & 0x1fff) >> 2; \
+	io_ticks += io_d; io_calls++; \
+	io_reg_ticks[io_i] += io_d; io_reg_calls[io_i]++; } while (0)
+
+extern u32 bench_dma2_cycles, bench_dma2_kicks;	/* psxdma.c */
+
+void io_bench_print(unsigned int commits)
+{
+	unsigned int n, i, best;
+
+	printf("IO");
+	for (n = 0; n < 6; n++) {
+		best = 0;
+		for (i = 1; i < 0x2000 / 4; i++)
+			if (io_reg_ticks[i] > io_reg_ticks[best])
+				best = i;
+		if (!io_reg_ticks[best])
+			break;
+		printf(" %04x:%u/%.2f", 0x1000 + best * 4,
+		       io_reg_calls[best] / commits,
+		       (float)io_reg_ticks[best] / 12500.0f / (float)commits);
+		io_reg_ticks[best] = 0;
+	}
+	printf(" dma2 %u/%.2f\n", bench_dma2_kicks / commits,
+	       (float)bench_dma2_cycles / (PSXCLK / 1000.0f) / (float)commits);
+	bench_dma2_cycles = 0;
+	bench_dma2_kicks = 0;
+	memset(io_reg_ticks, 0, sizeof(io_reg_ticks));
+	memset(io_reg_calls, 0, sizeof(io_reg_calls));
+}
+
 /* Per-transition bound on how much guest time may pass: twice the cycles
  * the guest actually executed in the transition, plus a floor for the
  * plugin's own per-transition work, plus whatever host work was explicitly
@@ -275,45 +321,86 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 	}
 }
 
+/* I_STAT, I_MASK and DICR are plain words with no timing of their own:
+ * their handlers are register arithmetic plus an interrupt re-check. They
+ * are also the most frequent HW accesses in an IRQ-driven game (~1,600 per
+ * frame in Rayman, 2 ms of clock transitions on hardware), so serve them
+ * without transitioning the clock; if the write made an interrupt pending,
+ * exit the JIT so the plugin loop delivers it. Reads of a constant address
+ * already bypass the handler (lightrec_can_hw_direct); this covers the
+ * pointer-based ones and all the writes. */
+static inline bool hw_is_irq_reg(u32 mem)
+{
+	u32 r = mem & 0x1fff;
+
+	return r == 0x1070 || r == 0x1074 || r == 0x10f4;
+}
+
+static inline void hw_light_write_done(struct lightrec_state *state)
+{
+	if (has_interrupt())
+		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
+}
+
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	IO_BEGIN();
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite8(mem, val);
 
 	lightrec_tansition_from_pcsx(state);
+	IO_END();
 }
 
 static void hw_write_half(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	IO_BEGIN();
+	if (hw_is_irq_reg(mem)) {
+		psxHwWrite16(mem, val);
+		hw_light_write_done(state);
+		IO_END();
+		return;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite16(mem, val);
 
 	lightrec_tansition_from_pcsx(state);
+	IO_END();
 }
 
 static void hw_write_word(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	IO_BEGIN();
+	if (hw_is_irq_reg(mem)) {
+		psxHwWrite32(mem, val);
+		hw_light_write_done(state);
+		IO_END();
+		return;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite32(mem, val);
 
 	lightrec_tansition_from_pcsx(state);
+	IO_END();
 }
 
 static u8 hw_read_byte(struct lightrec_state *state, u32 op, void *host, u32 mem)
 {
 	u8 val;
 
+	IO_BEGIN();
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead8(mem);
 
 	lightrec_tansition_from_pcsx(state);
+	IO_END();
 
 	return val;
 }
@@ -323,11 +410,18 @@ static u16 hw_read_half(struct lightrec_state *state,
 {
 	u16 val;
 
+	IO_BEGIN();
+	if (hw_is_irq_reg(mem)) {
+		val = psxHu16(mem);
+		IO_END();
+		return val;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead16(mem);
 
 	lightrec_tansition_from_pcsx(state);
+	IO_END();
 
 	return val;
 }
@@ -338,6 +432,12 @@ static u32 hw_read_word(struct lightrec_state *state,
 	static u32 old_cycle, oldold_cycle, old_gpusr;
 	u32 val, diff;
 
+	IO_BEGIN();
+	if (hw_is_irq_reg(mem)) {
+		val = psxHu32(mem);
+		IO_END();
+		return val;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead32(mem);
@@ -360,6 +460,7 @@ static u32 hw_read_word(struct lightrec_state *state,
 	}
 
 	lightrec_tansition_from_pcsx(state);
+	IO_END();
 
 	return val;
 }

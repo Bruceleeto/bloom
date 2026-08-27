@@ -133,6 +133,10 @@ static u32 gpuDmaChainSize(u32 addr) {
 }
 #endif
 
+/* BENCH: guest cycles of GPU-DMA completion latency scheduled per window
+ * (the time between a chain kick and its IRQ), and chain kicks. */
+u32 bench_dma2_cycles, bench_dma2_kicks;
+
 void psxDma2(u32 madr, u32 bcr, u32 chcr) { // GPU
 	u32 *ptr, madr_next, *madr_next_p;
 	u32 words, words_left, words_max, words_copy;
@@ -185,6 +189,8 @@ void psxDma2(u32 madr, u32 bcr, u32 chcr) { // GPU
 
 			// careful: gpu_state_change() also messes with this
 			psxRegs.gpuIdleAfter = psxRegs.cycle + words / 4 + 16;
+			bench_dma2_cycles += words / 4;
+			bench_dma2_kicks++;
 			// already 32-bit word size ((size * 4) / 4)
 			set_event(PSXINT_GPUDMA, words / 4);
 			return;
@@ -211,6 +217,8 @@ void psxDma2(u32 madr, u32 bcr, u32 chcr) { // GPU
 				cycles_sum = Config.gpu_timing_override;
 
 			psxRegs.gpuIdleAfter = psxRegs.cycle + cycles_sum + cycles_last_cmd;
+			bench_dma2_cycles += cycles_sum;
+			bench_dma2_kicks++;
 			set_event(PSXINT_GPUDMA, cycles_sum);
 			//printf("%u dma2cf: %6ld,%4d %08x %08x %08x %08x\n", psxRegs.cycle,
 			//  cycles_sum, cycles_last_cmd, madr, bcr, chcr, HW_DMA2_MADR);
@@ -240,6 +248,7 @@ void gpuInterrupt() {
 		while (cycles_sum <= 0 && !(madr_next & 0x800000));
 		HW_DMA2_MADR = SWAPu32(madr_next);
 		psxRegs.gpuIdleAfter = psxRegs.cycle + cycles_sum + cycles_last_cmd;
+		bench_dma2_cycles += cycles_sum;
 		set_event(PSXINT_GPUDMA, cycles_sum);
 		//printf("%u dma2cn: %6d,%4d %08x\n", psxRegs.cycle, cycles_sum,
 		//  cycles_last_cmd, HW_DMA2_MADR);

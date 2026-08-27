@@ -228,6 +228,19 @@ struct lightrec_state {
 u32 lightrec_rw(struct lightrec_state *state, union code op, u32 addr,
 		u32 data, u32 *flags, struct block *block, u16 offset);
 
+/* Direct-call device access for HW-tagged plain loads/stores: called bare
+ * from generated code with the cycle contract emitted inline - no wrapper
+ * block, no lightrec_rw, no lightrec_get_map. Loads return the value
+ * already sign/zero-extended. */
+u32 lightrec_hw_lb(u32 addr, struct lightrec_state *state);
+u32 lightrec_hw_lbu(u32 addr, struct lightrec_state *state);
+u32 lightrec_hw_lh(u32 addr, struct lightrec_state *state);
+u32 lightrec_hw_lhu(u32 addr, struct lightrec_state *state);
+u32 lightrec_hw_lw(u32 addr, struct lightrec_state *state);
+void lightrec_hw_sb(u32 addr, u32 val, struct lightrec_state *state);
+void lightrec_hw_sh(u32 addr, u32 val, struct lightrec_state *state);
+void lightrec_hw_sw(u32 addr, u32 val, struct lightrec_state *state);
+
 void lightrec_free_block(struct lightrec_state *state, struct block *block);
 
 void remove_from_code_lut(struct blockcache *cache, struct block *block);

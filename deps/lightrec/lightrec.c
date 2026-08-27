@@ -2293,6 +2293,112 @@ void lightrec_destroy(struct lightrec_state *state)
 	free(state);
 }
 
+/* An IO_HW tag records where the op's FIRST access landed (or that its
+ * base register was zero) - later executions may point anywhere, and the
+ * BIOS really does write the exception vectors through ops tagged HW.
+ * Only the I/O window takes the fast path; everything else goes through
+ * the full map dispatch in lightrec_rw. */
+static inline const struct lightrec_mem_map_ops *
+hw_shim_ops(struct lightrec_state *state, u32 kaddr)
+{
+	const struct lightrec_mem_map *map = &state->maps[PSX_MAP_HW_REGISTERS];
+
+	if (likely(kaddr - map->pc < map->length))
+		return map->ops;
+
+	return NULL;
+}
+
+static u32 hw_shim_slow(struct lightrec_state *state, u32 op, u32 addr,
+			u32 data)
+{
+	return lightrec_rw(state, (union code){ .i.op = op }, addr, data,
+			   NULL, NULL, 0);
+}
+
+u32 lightrec_hw_lb(u32 addr, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		return (u32)(s32)(s8)ops->lb(state, 0, NULL, kaddr);
+	return hw_shim_slow(state, OP_LB, addr, 0);
+}
+
+u32 lightrec_hw_lbu(u32 addr, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		return (u8)ops->lb(state, 0, NULL, kaddr);
+	return hw_shim_slow(state, OP_LBU, addr, 0);
+}
+
+u32 lightrec_hw_lh(u32 addr, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		return (u32)(s32)(s16)ops->lh(state, 0, NULL, kaddr);
+	return hw_shim_slow(state, OP_LH, addr, 0);
+}
+
+u32 lightrec_hw_lhu(u32 addr, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		return (u16)ops->lh(state, 0, NULL, kaddr);
+	return hw_shim_slow(state, OP_LHU, addr, 0);
+}
+
+u32 lightrec_hw_lw(u32 addr, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		return ops->lw(state, 0, NULL, kaddr);
+	return hw_shim_slow(state, OP_LW, addr, 0);
+}
+
+void lightrec_hw_sb(u32 addr, u32 val, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		ops->sb(state, 0, NULL, kaddr, val);
+	else
+		hw_shim_slow(state, OP_SB, addr, val);
+}
+
+void lightrec_hw_sh(u32 addr, u32 val, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		ops->sh(state, 0, NULL, kaddr, val);
+	else
+		hw_shim_slow(state, OP_SH, addr, val);
+}
+
+void lightrec_hw_sw(u32 addr, u32 val, struct lightrec_state *state)
+{
+	u32 kaddr = kunseg(addr);
+	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+
+	if (likely(ops))
+		ops->sw(state, 0, NULL, kaddr, val);
+	else
+		hw_shim_slow(state, OP_SW, addr, val);
+}
+
 void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)
 {
 	u32 kaddr = kunseg(addr & ~0x3);
