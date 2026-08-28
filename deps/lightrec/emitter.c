@@ -132,6 +132,72 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	lightrec_jump_to_fast_eob(state, _jit, offset);
 }
 
+#if defined(__sh__) && LIGHTREC_NUM_PINNED > 0
+/* Indirect exit (jr / jalr with an unknown target): look the target up in
+ * the code LUT here, in the block, and enter it behind its pin-load stub
+ * with the pinned registers still in their registers - the same contract a
+ * direct link uses (links.c). Only a spent cycle counter, an empty LUT
+ * entry, or the preprocessed-not-compiled marker take the dispatcher
+ * route, which is what every indirect exit used to take.
+ *
+ * Registers: LIGHTREC_REG_PC (r4) holds the target. r5 (AUX), r6 and r7
+ * are dead at a block exit; r2 must hold the address mask on entry when
+ * the arch has no fast mask, r3 belongs to lightning, r1 is the cycle
+ * counter and r8-r11 are the pins. Mirrors the LUT lookup in
+ * generate_dispatcher(). */
+static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
+				      jit_state_t *_jit)
+{
+	struct lightrec_state *ls = state->state;
+	jit_node_t *to_slow1, *to_slow2, *to_slow3;
+
+	/* KUNSEG the target, fold the mirrors, and pick RAM or BIOS.
+	 * The LUT is byte-indexed (entry i at code_lut + i * 4 == pc & mask). */
+	jit_andi(LIGHTREC_REG_AUX, LIGHTREC_REG_PC, RAM_SIZE - 1);
+	jit_andi(_R6, LIGHTREC_REG_PC, BIOS_SIZE - 1);
+	jit_andi(_R7, LIGHTREC_REG_PC, BIT(28));
+	jit_addi(_R6, _R6, RAM_SIZE);
+	jit_movnr(LIGHTREC_REG_AUX, _R6, _R7);
+
+	jit_add_state(LIGHTREC_REG_AUX, LIGHTREC_REG_AUX);
+	jit_addi(LIGHTREC_REG_AUX, LIGHTREC_REG_AUX, lightrec_offset(code_lut));
+
+	jit_ldr_ui(_R6, LIGHTREC_REG_AUX);
+
+	to_slow1 = jit_blei(LIGHTREC_REG_CYCLE, 0);
+	to_slow2 = jit_beqi(_R6, 0);
+	to_slow3 = jit_beqi(_R6, (uintptr_t)ls->get_next_block);
+
+	/* What the dispatcher provides on block entry: curr_pc synced, and
+	 * the address mask blocks are compiled to expect. */
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, LIGHTREC_REG_PC);
+	if (!arch_has_fast_mask())
+		jit_movi(JIT_R1, 0x1fffffff);
+
+	jit_addi(_R6, _R6, LIGHTREC_PIN_STUB_BYTES);
+
+	jit_live(LIGHTREC_REG_CYCLE);
+	jit_live(LIGHTREC_REG_PC);
+	jit_live(JIT_R1);
+	jit_jmpr(_R6);
+
+	jit_patch(to_slow1);
+	jit_patch(to_slow2);
+	jit_patch(to_slow3);
+
+	/* Dispatcher route: pins written back, LUT entry address in AUX. */
+	lightrec_regcache_store_pins(state->reg_cache, _jit);
+	lightrec_jump_to_fn(_jit, ls->fast_eob);
+}
+#else
+static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
+				      jit_state_t *_jit)
+{
+	lightrec_regcache_store_pins(state->reg_cache, _jit);
+	lightrec_jump_to_eob(state, _jit);
+}
+#endif
+
 static void
 lightrec_jump_to_ds_check(struct lightrec_cstate *state, jit_state_t *_jit)
 {
@@ -212,8 +278,7 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 	} else if (is_known(state->v, reg_new_pc)) {
 		lightrec_jump_to_known_eob(state, _jit, state->v[reg_new_pc].value);
 	} else {
-		lightrec_regcache_store_pins(reg_cache, _jit);
-		lightrec_jump_to_eob(state, _jit);
+		lightrec_jump_to_indirect(state, _jit);
 	}
 
 	lightrec_regcache_reset(reg_cache);
