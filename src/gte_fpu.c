@@ -447,9 +447,17 @@ gte_mtx_use(const psxCP2Regs *r, int mx, int cv)
  * `CP2C` straight into the register file, which no counter can observe, so the
  * one path that does that says so explicitly.
  */
+#if defined(__sh__) && defined(GTE_RTP_SELFTEST)
+static void gte_rtp_selftest(void);
+#endif
+
 void gte_fpu_reset(void)
 {
 	int i;
+
+#if defined(__sh__) && defined(GTE_RTP_SELFTEST)
+	gte_rtp_selftest();
+#endif
 
 	for (i = 0; i < 3; i++) {
 		gte_cache[i].built = 0;
@@ -970,6 +978,34 @@ gte_rtp_end_i(psxCP2Regs *r, u32 quotient)
 	gte_end(r);
 }
 
+#ifdef __sh__
+/*
+ * On the target both transforms are `src/gte_rtp.S`: the same arithmetic as
+ * the C below, without the compiler's double-precision detours around the
+ * unsigned divide operands or the spilled loop.  The C versions stay as the
+ * reference the self-test compares against, and as the host build.
+ */
+void gte_rtpt_asm(psxCP2Regs *r, struct gte_hot *hot);
+void gte_rtps_asm(psxCP2Regs *r, struct gte_hot *hot);
+
+__attribute__((noinline)) void gte_fpu_rtps(psxCP2Regs *r)
+{
+	gte_mtx_use(r, GTE_MTX_ROT, 0);
+	gte_offsets(r);
+	gte_rtps_asm(r, &gte_hot);
+}
+
+__attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
+{
+	gte_mtx_use(r, GTE_MTX_ROT, 0);
+	gte_offsets(r);
+	gte_rtpt_asm(r, &gte_hot);
+}
+
+#define gte_fpu_rtps gte_fpu_rtps_c
+#define gte_fpu_rtpt gte_fpu_rtpt_c
+#endif
+
 __attribute__((noinline)) void gte_fpu_rtps(psxCP2Regs *r)
 {
 	u32 quotient;
@@ -1024,6 +1060,123 @@ __attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
 
 	gte_rtp_end_i(r, quotient);
 }
+
+#ifdef __sh__
+#undef gte_fpu_rtps
+#undef gte_fpu_rtpt
+
+#ifdef GTE_RTP_SELFTEST
+/*
+ * The assembly against the C it replaced, on random register files.  Runs
+ * once at the first reset when built with -DGTE_RTP_SELFTEST and prints one
+ * line: every data register, FLAG and the accumulated flag word must match
+ * bit for bit on every case, RTPS and RTPT alike.
+ */
+static u32 gte_st_seed = 0x2545f491;
+
+static u32 gte_st_rnd(void)
+{
+	gte_st_seed = gte_st_seed * 1664525u + 1013904223u;
+	return gte_st_seed >> 3;
+}
+
+/* Mostly in-game magnitudes, sometimes wild, so every limit fires. */
+static s32 gte_st_val(int bits_common, int bits_wild)
+{
+	u32 r = gte_st_rnd();
+	int bits = (r & 7) ? bits_common : bits_wild;
+	s32 v = (s32)(gte_st_rnd() & ((1u << bits) - 1));
+
+	return (r & 8) ? -v : v;
+}
+
+static void gte_st_fill(psxCP2Regs *r)
+{
+	int i;
+
+	memset(r, 0, sizeof(*r));
+
+	for (i = 0; i < 6; i++)
+		r->CP2D.r[i] = 0;
+	for (i = 0; i < 3; i++) {
+		r->CP2D.p[i * 2].sw.l = gte_st_val(11, 15);
+		r->CP2D.p[i * 2].sw.h = gte_st_val(11, 15);
+		r->CP2D.p[i * 2 + 1].sw.l = gte_st_val(11, 15);
+	}
+	for (i = 12; i < 20; i++)
+		r->CP2D.r[i] = gte_st_rnd();
+
+	for (i = 0; i < 5; i++) {
+		r->CP2C.p[i].sw.l = gte_st_val(12, 15);
+		r->CP2C.p[i].sw.h = gte_st_val(12, 15);
+	}
+	for (i = 5; i < 8; i++)
+		((s32 *)r->CP2C.r)[i] = gte_st_val(16, 31);
+	((s32 *)r->CP2C.r)[24] = gte_st_val(25, 31);
+	((s32 *)r->CP2C.r)[25] = gte_st_val(25, 31);
+	r->CP2C.p[26].w.l = (gte_st_rnd() & 7) ? (gte_st_rnd() & 0x7ff)
+					      : (gte_st_rnd() & 0xffff);
+	r->CP2C.p[27].sw.l = gte_st_val(12, 15);
+	((s32 *)r->CP2C.r)[28] = gte_st_val(24, 31);
+}
+
+static int gte_st_run(int rtpt, int n)
+{
+	static psxCP2Regs a, b;
+	int i, bad = 0;
+
+	for (i = 0; i < n; i++) {
+		gte_st_fill(&a);
+		psxCP2CtrlGen++;
+		b = a;
+
+		if (rtpt)
+			gte_fpu_rtpt_c(&a);
+		else
+			gte_fpu_rtps_c(&a);
+		u32 fa = gte_hot.flag;
+
+		if (rtpt)
+			gte_fpu_rtpt(&b);
+		else
+			gte_fpu_rtps(&b);
+		u32 fb = gte_hot.flag;
+
+		if (memcmp(&a, &b, sizeof(a)) || fa != fb) {
+			if (bad < 4) {
+				int k;
+				int first = -1;
+				for (k = 0; k < (int)sizeof(a); k++)
+					if (((u8 *)&a)[k] != ((u8 *)&b)[k]) { first = k; break; }
+				printf("GTE %s case %d: flag %08x vs %08x size %d firstbyte %d\n",
+				       rtpt ? "RTPT" : "RTPS", i, fa, fb, (int)sizeof(a), first);
+				for (k = 0; k < 64; k++) {
+					u32 x = ((u32 *)&a)[k], y = ((u32 *)&b)[k];
+					if (x != y)
+						printf("  r%d: %08x vs %08x\n", k, x, y);
+				}
+			}
+			bad++;
+		}
+	}
+	return bad;
+}
+
+static void gte_rtp_selftest(void)
+{
+	static int done;
+	int bs, bt;
+
+	if (done)
+		return;
+	done = 1;
+
+	bs = gte_st_run(0, 4000);
+	bt = gte_st_run(1, 4000);
+	printf("GTE RTP selftest: RTPS %d/4000 bad, RTPT %d/4000 bad\n", bs, bt);
+}
+#endif
+#endif
 
 /* ------------------------------------------------------------------ */
 /* The shared stages                                                   */
