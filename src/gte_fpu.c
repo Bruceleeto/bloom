@@ -169,12 +169,13 @@ struct gte_hot {
 	u32 flag;		/* accumulated during a command          */
 	float ofx, ofy;		/* OFX/OFY in screen units, not 16.16    */
 	u32 ofs_gen;		/* psxCP2CtrlGen when ofx/ofy were built */
-	u32 mtx_serial;		/* bumped whenever a cached matrix moves */
-	int xmtrx_mx;		/* which matrix XMTRX holds, -1 for none */
-	u32 xmtrx_serial;
+	int xmtrx_key;		/* (matrix, column) XMTRX holds, -1 for none */
+	int xmtrx_mx;		/* which matrix, for the column-only reload   */
+	u32 xmtrx_serial;	/* that matrix's serial when it was loaded    */
+	u32 xmtrx_col_serial;
 } __attribute__((aligned(32)));
 
-static struct gte_hot gte_hot = { .xmtrx_mx = -1 };
+static struct gte_hot gte_hot = { .xmtrx_key = -1, .xmtrx_mx = -1 };
 
 #define gte_flag	(gte_hot.flag)
 
@@ -323,95 +324,131 @@ static s32 gte_a(s32 mac, u32 maxflag, u32 minflag)
  * it as an out-of-range index whose accessors return zero. */
 #define GTE_CV_NONE 3
 
-struct gte_mtx_cache {
-	float m[16];
-	u32 src[5];		/* the packed matrix words, as last seen   */
-	u32 tsrc[3];		/* the translation words, as last seen     */
-	int tsel;		/* which translation the column holds      */
-	int built;
-	u32 gen;		/* psxCP2CtrlGen when m[] was built        */
-	u32 serial;		/* bumped whenever m[] changes             */
+/*
+ * Two caches, not one: the 3x3 per matrix, and the translation column per
+ * (matrix, selector) pair.
+ *
+ * They were one entry per matrix holding whichever column was last asked
+ * for, and Chocobo Racing asks for the rotation matrix with TR (RTPT, MVMVA
+ * cv=0) and without (MVMVA cv=3) turn and turn about: half of all MVMVA calls
+ * found the wrong column in the slot, rebuilt it, bumped the serial and
+ * reloaded all sixteen words of XMTRX - 30k host instructions a frame doing
+ * nothing new.  With the column its own entry, a selector change on a
+ * resident matrix is two `fmov.d` into xf12-xf15, and nothing rebuilds on
+ * the steady path at all.
+ */
+struct gte_rot_cache {
+	float m[12];		/* xf0..xf11: the 3x3, column-major, / 4096 */
+	u32 gen;		/* psxCP2CtrlGen when m[] was built         */
+	u32 serial;		/* bumped whenever m[] is rebuilt           */
 } __attribute__((aligned(32)));
 
-static struct gte_mtx_cache gte_cache[3];
-#define gte_mtx_serial	(gte_hot.mtx_serial)
+struct gte_col_cache {
+	float t[4];		/* xf12..xf15: the column, then 1.0         */
+	u32 gen;
+	u32 serial;
+} __attribute__((aligned(32)));
+
+static struct gte_rot_cache gte_rot[3];
+static struct gte_col_cache gte_col[3][4];
+static u32 gte_mtx_serial;
+
+#ifdef GTE_CACHE_STATS
+static u32 gte_stat[8];
+static void gte_stat_tick(void)
+{
+	if (++gte_stat[0] == 20000) {
+		printf("GTE cache: %u uses, rot rebuilds %u, col rebuilds %u, full loads %u col loads %u\n",
+		       gte_stat[0], gte_stat[1], gte_stat[3], gte_stat[5], gte_stat[6]);
+		memset(gte_stat, 0, sizeof(gte_stat));
+	}
+}
+#define GTE_STAT(n) (gte_stat[n]++)
+#else
+#define GTE_STAT(n) ((void)0)
+#define gte_stat_tick() ((void)0)
+#endif
 
 /*
- * Rebuild whatever the control file changed.  Out of line and cold: the check
- * that decides whether to come here is inline, and it holds on all but a
- * couple of thousand of the million-odd matrix uses in a bench window.
+ * Rebuild on a control-file write.  Out of line and cold, and **without a
+ * compare against the previous words**: Chocobo Racing sets a new rotation
+ * matrix about 110 times a frame, one per object, and a generation change
+ * turned out to be a real change two times in three - the twenty-byte memcmp
+ * that guarded the nine conversions cost more than the conversions.  The
+ * serial moves every time, so XMTRX reloads after every rebuild; that is ten
+ * instructions.
  */
-static void gte_mtx_rebuild(const psxCP2Regs *r, int mx, int cv)
+#ifdef __sh__
+void gte_rot_convert(const u32 *src, float *m);
+#endif
+
+static void gte_rot_rebuild(const psxCP2Regs *r, int mx)
 {
-	struct gte_mtx_cache *c = &gte_cache[mx];
-	const u32 *src = &r->CP2C.r[mx * 8];
+	struct gte_rot_cache *c = &gte_rot[mx];
+	const PAIR *p = &r->CP2C.p[mx * 8];
+
+	GTE_STAT(1);
+	c->gen = psxCP2CtrlGen;
+	c->serial = ++gte_mtx_serial;
+
+#ifdef __sh__
+	gte_rot_convert(&r->CP2C.r[mx * 8], c->m);
+	return;
+#endif
+
+	c->m[0]  = p[0].sw.l * (1.0f / 4096.0f);
+	c->m[4]  = p[0].sw.h * (1.0f / 4096.0f);
+	c->m[8]  = p[1].sw.l * (1.0f / 4096.0f);
+	c->m[1]  = p[1].sw.h * (1.0f / 4096.0f);
+	c->m[5]  = p[2].sw.l * (1.0f / 4096.0f);
+	c->m[9]  = p[2].sw.h * (1.0f / 4096.0f);
+	c->m[2]  = p[3].sw.l * (1.0f / 4096.0f);
+	c->m[6]  = p[3].sw.h * (1.0f / 4096.0f);
+	c->m[10] = p[4].sw.l * (1.0f / 4096.0f);
+
+	c->m[3] = c->m[7] = c->m[11] = 0.0f;
+}
+
+static void gte_col_rebuild(const psxCP2Regs *r, int mx, int cv)
+{
+	struct gte_col_cache *c = &gte_col[mx][cv];
 	int i;
 
+	GTE_STAT(3);
 	c->gen = psxCP2CtrlGen;
 
-	if (!c->built || memcmp(c->src, src, sizeof(c->src))) {
-		const PAIR *p = &r->CP2C.p[mx * 8];
-
-		for (i = 0; i < 5; i++)
-			c->src[i] = src[i];
-
-		c->m[0]  = p[0].sw.l * (1.0f / 4096.0f);
-		c->m[4]  = p[0].sw.h * (1.0f / 4096.0f);
-		c->m[8]  = p[1].sw.l * (1.0f / 4096.0f);
-		c->m[1]  = p[1].sw.h * (1.0f / 4096.0f);
-		c->m[5]  = p[2].sw.l * (1.0f / 4096.0f);
-		c->m[9]  = p[2].sw.h * (1.0f / 4096.0f);
-		c->m[2]  = p[3].sw.l * (1.0f / 4096.0f);
-		c->m[6]  = p[3].sw.h * (1.0f / 4096.0f);
-		c->m[10] = p[4].sw.l * (1.0f / 4096.0f);
-
-		c->m[3] = c->m[7] = c->m[11] = 0.0f;
-		c->m[15] = 1.0f;
-		c->built = 1;
-		c->serial = ++gte_mtx_serial;
-	}
-
 	if (cv == GTE_CV_NONE) {
-		if (c->tsel != cv || c->m[12] || c->m[13] || c->m[14]) {
-			c->tsel = cv;
-			c->m[12] = c->m[13] = c->m[14] = 0.0f;
-			c->serial = ++gte_mtx_serial;
-		}
+		/* No translation: a constant column.  Built at most once - the
+		 * serial only moves the first time. */
+		if (c->serial)
+			return;
+		c->t[0] = c->t[1] = c->t[2] = 0.0f;
 	} else {
 		const u32 *t = &r->CP2C.r[cv * 8 + 5];
 
-		if (c->tsel != cv || memcmp(c->tsrc, t, sizeof(c->tsrc))) {
-			c->tsel = cv;
-			for (i = 0; i < 3; i++) {
-				c->tsrc[i] = t[i];
-				c->m[12 + i] = (float)(s32)t[i];
-			}
-			c->serial = ++gte_mtx_serial;
-		}
+		for (i = 0; i < 3; i++)
+			c->t[i] = (float)(s32)t[i];
 	}
-}
 
-/* One compare against the control file's write counter, and on the path that
- * matters it is the only memory this touches. */
-static inline __attribute__((always_inline)) const float *
-gte_mtx_get(const psxCP2Regs *r, int mx, int cv)
-{
-	struct gte_mtx_cache *c = &gte_cache[mx];
-
-	if (!(c->built && c->gen == psxCP2CtrlGen && c->tsel == cv))
-		gte_mtx_rebuild(r, mx, cv);
-
-	return c->m;
+	c->t[3] = 1.0f;
+	c->serial = ++gte_mtx_serial;
 }
 
 /*
- * Put a matrix in XMTRX, skipping the load if it is already there.
+ * Put a matrix and a translation column in XMTRX, skipping whatever is
+ * already there.
  *
  * RTPS transforms one vertex per call and always against matrix 0, so without
  * this every call spends eight `fmov.d` and two `fschg` reloading the same
- * sixteen words - 257,286 times in a bench window, measured.  The cache's
- * serial says whether the array changed since XMTRX was filled from it, so a
- * rebuild invalidates residency without anything else having to notice.
+ * sixteen words - 257,286 times in a bench window, measured.
+ *
+ * **The hot check is two compares**: the column entry was checked at the
+ * current generation (which, by construction, means its matrix was too - the
+ * slow path checks the matrix first), and XMTRX holds this (matrix, column)
+ * pair.  Nothing in the control file can have changed without moving the
+ * generation, and XMTRX only changes on the slow path, which records what it
+ * loaded.  The serials are the slow path's business: they say whether a
+ * rebuild actually invalidated the resident matrix, or only its column.
  *
  * **Residency assumes nothing else disturbs the back bank**, and that spans
  * arbitrary guest code, interrupts and thread switches rather than the few
@@ -421,23 +458,52 @@ gte_mtx_get(const psxCP2Regs *r, int mx, int cv)
  * mode if something does is wrong geometry rather than a crash.
  */
 
-static void gte_mtx_load(const float *m);
+static void gte_mtx_load(const float *m, const float *t);
+static void gte_col_load(const float *t);
 
 #define gte_xmtrx_mx		(gte_hot.xmtrx_mx)
 #define gte_xmtrx_serial	(gte_hot.xmtrx_serial)
 
+static __attribute__((noinline)) void
+gte_mtx_use_slow(const psxCP2Regs *r, int mx, int cv, int key)
+{
+	struct gte_rot_cache *rc = &gte_rot[mx];
+	struct gte_col_cache *cc = &gte_col[mx][cv];
+	u32 gen = psxCP2CtrlGen;
+
+	if (rc->gen != gen)
+		gte_rot_rebuild(r, mx);
+	if (cc->gen != gen)
+		gte_col_rebuild(r, mx, cv);
+
+	if (gte_hot.xmtrx_mx == mx && gte_hot.xmtrx_serial == rc->serial) {
+		if (gte_hot.xmtrx_col_serial != cc->serial) {
+			GTE_STAT(6);
+			gte_col_load(cc->t);
+		}
+	} else {
+		GTE_STAT(5);
+		gte_hot.xmtrx_mx = mx;
+		gte_hot.xmtrx_serial = rc->serial;
+		gte_mtx_load(rc->m, cc->t);
+	}
+
+	gte_hot.xmtrx_col_serial = cc->serial;
+	gte_hot.xmtrx_key = key;
+}
+
 static inline __attribute__((always_inline)) void
 gte_mtx_use(const psxCP2Regs *r, int mx, int cv)
 {
-	const float *m = gte_mtx_get(r, mx, cv);
+	int key = mx * 4 + cv;
 
-	if (gte_xmtrx_mx == mx && gte_xmtrx_serial == gte_cache[mx].serial)
+	gte_stat_tick();
+
+	if (__builtin_expect(gte_col[mx][cv].gen == psxCP2CtrlGen &&
+			     gte_hot.xmtrx_key == key, 1))
 		return;
 
-	gte_xmtrx_mx = mx;
-	gte_xmtrx_serial = gte_cache[mx].serial;
-
-	gte_mtx_load(m);
+	gte_mtx_use_slow(r, mx, cv, key);
 }
 
 /*
@@ -460,10 +526,12 @@ void gte_fpu_reset(void)
 #endif
 
 	for (i = 0; i < 3; i++) {
-		gte_cache[i].built = 0;
-		gte_cache[i].tsel = -1;
+		gte_rot[i].gen = psxCP2CtrlGen - 1u;
+		for (int j = 0; j < 4; j++)
+			gte_col[i][j].gen = psxCP2CtrlGen - 1u;
 	}
 
+	gte_hot.xmtrx_key = -1;
 	gte_xmtrx_mx = -1;
 
 	/* The offsets are derived from the control file as well, and a reset
@@ -491,7 +559,7 @@ void gte_fpu_reset(void)
  * Nothing between this and the transforms disturbs the back bank: the limits
  * and the divide are integer, and no other code in the tree touches XF.
  */
-static void gte_mtx_load(const float *m)
+static void gte_mtx_load(const float *m, const float *t)
 {
 	__asm__ __volatile__(
 		"fschg\n\t"
@@ -501,10 +569,23 @@ static void gte_mtx_load(const float *m)
 		"fmov.d	@%[m]+, xd6\n\t"
 		"fmov.d	@%[m]+, xd8\n\t"
 		"fmov.d	@%[m]+, xd10\n\t"
-		"fmov.d	@%[m]+, xd12\n\t"
-		"fmov.d	@%[m]+, xd14\n\t"
+		"fmov.d	@%[t]+, xd12\n\t"
+		"fmov.d	@%[t]+, xd14\n\t"
 		"fschg"
-		: [m] "+r" (m)
+		: [m] "+r" (m), [t] "+r" (t)
+		:
+		: "memory");
+}
+
+/* The translation column alone: xf12..xf15. */
+static void gte_col_load(const float *t)
+{
+	__asm__ __volatile__(
+		"fschg\n\t"
+		"fmov.d	@%[t]+, xd12\n\t"
+		"fmov.d	@%[t]+, xd14\n\t"
+		"fschg"
+		: [t] "+r" (t)
 		:
 		: "memory");
 }
@@ -726,11 +807,17 @@ static void gte_floor3(float a, float b, float c, s32 *mac)
  */
 #include <math.h>
 
-static const float *gte_resident;
+static float gte_resident[16];
 
-static void gte_mtx_load(const float *m)
+static void gte_mtx_load(const float *m, const float *t)
 {
-	gte_resident = m;
+	memcpy(gte_resident, m, 12 * sizeof(float));
+	memcpy(gte_resident + 12, t, 4 * sizeof(float));
+}
+
+static void gte_col_load(const float *t)
+{
+	memcpy(gte_resident + 12, t, 4 * sizeof(float));
 }
 
 static void gte_xform(const s16 *v, s32 *mac)
@@ -1074,6 +1161,9 @@ __attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
  */
 static u32 gte_st_seed = 0x2545f491;
 
+static void gte_mvmva(psxCP2Regs *r, u32 op);
+static void gte_mvmva_c(psxCP2Regs *r, u32 op);
+
 static u32 gte_st_rnd(void)
 {
 	gte_st_seed = gte_st_seed * 1664525u + 1013904223u;
@@ -1112,6 +1202,20 @@ static void gte_st_fill(psxCP2Regs *r)
 	}
 	for (i = 5; i < 8; i++)
 		((s32 *)r->CP2C.r)[i] = gte_st_val(16, 31);
+	for (i = 8; i < 13; i++) {
+		r->CP2C.p[i].sw.l = gte_st_val(12, 15);
+		r->CP2C.p[i].sw.h = gte_st_val(12, 15);
+	}
+	for (i = 16; i < 21; i++) {
+		r->CP2C.p[i].sw.l = gte_st_val(12, 15);
+		r->CP2C.p[i].sw.h = gte_st_val(12, 15);
+	}
+	for (i = 13; i < 16; i++)
+		((s32 *)r->CP2C.r)[i] = gte_st_val(16, 31);
+	for (i = 21; i < 24; i++)
+		((s32 *)r->CP2C.r)[i] = gte_st_val(16, 31);
+	for (i = 9; i < 12; i++)
+		r->CP2D.p[i].sw.l = gte_st_val(11, 15);
 	((s32 *)r->CP2C.r)[24] = gte_st_val(25, 31);
 	((s32 *)r->CP2C.r)[25] = gte_st_val(25, 31);
 	r->CP2C.p[26].w.l = (gte_st_rnd() & 7) ? (gte_st_rnd() & 0x7ff)
@@ -1120,23 +1224,36 @@ static void gte_st_fill(psxCP2Regs *r)
 	((s32 *)r->CP2C.r)[28] = gte_st_val(24, 31);
 }
 
-static int gte_st_run(int rtpt, int n)
+/* 0: RTPS, 1: RTPT, 2: MVMVA with a random op word (sf=1, lm=0, mx<3) */
+static int gte_st_run(int which, int n)
 {
 	static psxCP2Regs a, b;
+	static const char *names[] = { "RTPS", "RTPT", "MVMVA" };
 	int i, bad = 0;
+	u32 op = 0;
 
 	for (i = 0; i < n; i++) {
 		gte_st_fill(&a);
 		psxCP2CtrlGen++;
 		b = a;
 
-		if (rtpt)
+		if (which == 2) {
+			u32 x = gte_st_rnd();
+			op = (1u << 19) | (((x % 3) & 3) << 17) |
+			     (((x >> 4) & 3) << 15) | (((x >> 8) & 3) << 13);
+		}
+
+		if (which == 2)
+			gte_mvmva_c(&a, op);
+		else if (which)
 			gte_fpu_rtpt_c(&a);
 		else
 			gte_fpu_rtps_c(&a);
 		u32 fa = gte_hot.flag;
 
-		if (rtpt)
+		if (which == 2)
+			gte_mvmva(&b, op);
+		else if (which)
 			gte_fpu_rtpt(&b);
 		else
 			gte_fpu_rtps(&b);
@@ -1148,8 +1265,8 @@ static int gte_st_run(int rtpt, int n)
 				int first = -1;
 				for (k = 0; k < (int)sizeof(a); k++)
 					if (((u8 *)&a)[k] != ((u8 *)&b)[k]) { first = k; break; }
-				printf("GTE %s case %d: flag %08x vs %08x size %d firstbyte %d\n",
-				       rtpt ? "RTPT" : "RTPS", i, fa, fb, (int)sizeof(a), first);
+				printf("GTE %s case %d op %08x: flag %08x vs %08x firstbyte %d\n",
+				       names[which], i, op, fa, fb, first);
 				for (k = 0; k < 64; k++) {
 					u32 x = ((u32 *)&a)[k], y = ((u32 *)&b)[k];
 					if (x != y)
@@ -1165,15 +1282,42 @@ static int gte_st_run(int rtpt, int n)
 static void gte_rtp_selftest(void)
 {
 	static int done;
-	int bs, bt;
+	int bs, bt, bm;
 
 	if (done)
 		return;
 	done = 1;
 
+	{
+		/* The matrix conversion against the C it replaced. */
+		int k, j, bc = 0;
+		for (k = 0; k < 2000; k++) {
+			union { u32 w[5]; PAIR p[5]; } src;
+			float ma[12], mb[12];
+			for (j = 0; j < 5; j++)
+				src.w[j] = gte_st_rnd() ^ (gte_st_rnd() << 13);
+			ma[0]  = src.p[0].sw.l * (1.0f / 4096.0f);
+			ma[4]  = src.p[0].sw.h * (1.0f / 4096.0f);
+			ma[8]  = src.p[1].sw.l * (1.0f / 4096.0f);
+			ma[1]  = src.p[1].sw.h * (1.0f / 4096.0f);
+			ma[5]  = src.p[2].sw.l * (1.0f / 4096.0f);
+			ma[9]  = src.p[2].sw.h * (1.0f / 4096.0f);
+			ma[2]  = src.p[3].sw.l * (1.0f / 4096.0f);
+			ma[6]  = src.p[3].sw.h * (1.0f / 4096.0f);
+			ma[10] = src.p[4].sw.l * (1.0f / 4096.0f);
+			ma[3] = ma[7] = ma[11] = 0.0f;
+			gte_rot_convert(src.w, mb);
+			if (memcmp(ma, mb, sizeof(ma)))
+				bc++;
+		}
+		printf("GTE selftest: rot_convert %d/2000 bad\n", bc);
+	}
+
 	bs = gte_st_run(0, 4000);
 	bt = gte_st_run(1, 4000);
-	printf("GTE RTP selftest: RTPS %d/4000 bad, RTPT %d/4000 bad\n", bs, bt);
+	bm = gte_st_run(2, 4000);
+	printf("GTE selftest: RTPS %d/4000 bad, RTPT %d/4000 bad, MVMVA %d/4000 bad\n",
+	       bs, bt, bm);
 }
 #endif
 #endif
@@ -1304,6 +1448,42 @@ static void gte_mac_to_rgb(psxCP2Regs *r)
  * exactly.  Both go down the integer path, which is the reference's arithmetic
  * transcribed; it is exact, and neither case is one a game issues in a loop.
  */
+#ifdef __sh__
+void gte_mvmva_asm(psxCP2Regs *r, const s16 *v, int stride,
+		   struct gte_hot *hot);
+static void gte_mvmva_c(psxCP2Regs *r, u32 op);
+
+/*
+ * The shape a game issues in a loop - `sf` set, a real matrix, `lm` clear -
+ * is `src/gte_rtp.S`: one `ftrv`, three `ftrc`, the IR clamps, and the MAC
+ * saturation flags raised from inside the clamp stubs (a saturated `ftrc`
+ * result is never a valid IR, so the in-range path tests nothing).  IR as the
+ * vector is three halfwords four bytes apart rather than two, hence the
+ * stride.  Everything else - no shift, the out-of-range matrix, `lm` - is the
+ * reference's integer arithmetic below.
+ */
+GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
+{
+	int mx = GTE_MX(op);
+	int cv = GTE_CV(op);
+	int vs = GTE_V(op);
+
+	if (GTE_SF(op) && mx < 3 && !GTE_LM(op)) {
+		gte_mtx_use(r, mx, cv);
+
+		if (vs < 3)
+			gte_mvmva_asm(r, D_V(vs), 2, &gte_hot);
+		else
+			gte_mvmva_asm(r, &D_IR1, 4, &gte_hot);
+		return;
+	}
+
+	gte_mvmva_c(r, op);
+}
+
+#define gte_mvmva gte_mvmva_c
+#endif
+
 GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
 {
 	int sf = GTE_SF(op);
@@ -1345,6 +1525,10 @@ GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
 
 	gte_end(r);
 }
+
+#ifdef __sh__
+#undef gte_mvmva
+#endif
 
 /* ------------------------------------------------------------------ */
 /* The lighting family                                                 */

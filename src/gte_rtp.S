@@ -371,3 +371,243 @@ _gte_rtps_asm:
 	RTP_VERTEX 0, 12, 24
 	RTP_LEAVE
 	.size	_gte_rtps_asm, . - _gte_rtps_asm
+
+/*
+ * MVMVA, the fast shape: sf=1, a real matrix, lm=0.
+ *
+ *   r4  the COP2 file      r5  the vector (three s16)      r6  their stride
+ *   r7  &gte_hot
+ *
+ * XMTRX already holds the selected matrix and translation column.  MAC1..3
+ * are the truncated transform; IR1..3 clamp them to s16.  The reference's
+ * A1..A3 flags say MAC left the 32-bit range, which here is `ftrc` having
+ * saturated to INT_MAX / INT_MIN - never a valid IR, so those tests live in
+ * the clamp stubs and the in-range path pays nothing for them.
+ */
+	.balign	4
+	.global	_gte_mvmva_asm
+	.type	_gte_mvmva_asm, @function
+_gte_mvmva_asm:
+	mov.w	@r5, r0
+	lds	r0, fpul
+	add	r6, r5
+	float	fpul, fr0
+	mov.w	@r5, r0
+	lds	r0, fpul
+	add	r6, r5
+	float	fpul, fr1
+	mov.w	@r5, r0
+	lds	r0, fpul
+	mov	r4, r6
+	float	fpul, fr2
+	add	#64, r6			/* MAC1..3 @36/40/44 */
+	fldi1	fr3
+	mov	r4, r2
+	ftrv	xmtrx, fv0
+	add	#32, r2			/* IR1..3 @4/8/12 */
+	mov	#0, r3
+
+	/* MAC1 / IR1 */
+	ftrc	fr0, fpul
+	sts	fpul, r1
+	mov.l	r1, @(36, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	11f
+12:	mov.w	r0, @(4, r2)
+
+	/* MAC2 / IR2 */
+	ftrc	fr1, fpul
+	sts	fpul, r1
+	mov.l	r1, @(40, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	21f
+22:	mov.w	r0, @(8, r2)
+
+	/* MAC3 / IR3 */
+	ftrc	fr2, fpul
+	sts	fpul, r1
+	mov.l	r1, @(44, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	31f
+32:	mov.w	r0, @(12, r2)
+
+	mov.l	r3, @r7			/* gte_hot.flag */
+	mov.w	80f, r0
+	rts
+	 mov.l	r3, @(r0, r4)		/* FLAG */
+
+	/* Out of range.  r1 = MAC: raise the saturation flag if ftrc
+	 * saturated, then the clamp's, and substitute the bound. */
+11:	mov.l	91f, r0
+	or	r0, r3
+	cmp/pz	r1
+	bt	13f
+	mov.l	81f, r0
+	cmp/eq	r0, r1
+	bf	14f
+	mov.l	94f, r0
+	or	r0, r3
+14:	mov.w	84f, r0
+	bra	12b
+	 nop
+13:	mov.l	82f, r0
+	cmp/eq	r0, r1
+	bf	15f
+	mov.l	97f, r0
+	or	r0, r3
+15:	mov.w	83f, r0
+	bra	12b
+	 nop
+
+21:	mov.l	92f, r0
+	or	r0, r3
+	cmp/pz	r1
+	bt	23f
+	mov.l	81f, r0
+	cmp/eq	r0, r1
+	bf	24f
+	mov.l	95f, r0
+	or	r0, r3
+24:	mov.w	84f, r0
+	bra	22b
+	 nop
+23:	mov.l	82f, r0
+	cmp/eq	r0, r1
+	bf	25f
+	mov.l	98f, r0
+	or	r0, r3
+25:	mov.w	83f, r0
+	bra	22b
+	 nop
+
+31:	mov.l	93f, r0
+	or	r0, r3
+	cmp/pz	r1
+	bt	33f
+	mov.l	81f, r0
+	cmp/eq	r0, r1
+	bf	34f
+	mov.l	96f, r0
+	or	r0, r3
+34:	mov.w	84f, r0
+	bra	32b
+	 nop
+33:	mov.l	82f, r0
+	cmp/eq	r0, r1
+	bf	35f
+	mov.l	99f, r0
+	or	r0, r3
+35:	mov.w	83f, r0
+	bra	32b
+	 nop
+
+80:	.word	252			/* FLAG's offset in the file */
+83:	.word	0x7fff
+84:	.word	0x8000
+	.align	2
+81:	.long	0x80000000		/* ftrc saturated low */
+82:	.long	0x7fffffff		/* ftrc saturated high */
+91:	.long	0x81000000		/* limB1 */
+92:	.long	0x80800000		/* limB2 */
+93:	.long	0x00400000		/* limB3, no master bit */
+94:	.long	0x88000000		/* A1 negative: master | bit 27 */
+95:	.long	0x84000000		/* A2 negative: master | bit 26 */
+96:	.long	0x82000000		/* A3 negative: master | bit 25 */
+97:	.long	0x40000000		/* A1 positive: bit 30 */
+98:	.long	0x20000000		/* A2 positive: bit 29 */
+99:	.long	0x10000000		/* A3 positive: bit 28 */
+	.size	_gte_mvmva_asm, . - _gte_mvmva_asm
+
+/*
+ * The 3x3 of a control-file matrix as XMTRX columns 0-2, scaled by 1/4096.
+ *
+ *   r4  the five packed words (R11R12, R13R21, R22R23, R31R32, R33)
+ *   r5  twelve floats out, column-major: m[i + 4j] = R(j+1)(i+1)
+ *
+ * Each halfword converts straight into the register that is its slot, so the
+ * stores are six paired moves.  gcc produced ~150 instructions for this from
+ * the C; this is ~60.
+ */
+	.balign	4
+	.global	_gte_rot_convert
+	.type	_gte_rot_convert, @function
+_gte_rot_convert:
+	fmov.s	fr12, @-r15
+	mova	1f, r0
+	fmov.s	@r0, fr12		/* 1/4096 */
+
+	mov.l	@(0, r4), r1		/* R11 | R12 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr0		/* m[0] = R11 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr4		/* m[4] = R12 */
+
+	mov.l	@(4, r4), r1		/* R13 | R21 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr8		/* m[8] = R13 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr1		/* m[1] = R21 */
+
+	mov.l	@(8, r4), r1		/* R22 | R23 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr5		/* m[5] = R22 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr9		/* m[9] = R23 */
+
+	mov.l	@(12, r4), r1		/* R31 | R32 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr2		/* m[2] = R31 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr6		/* m[6] = R32 */
+
+	mov.w	@(16, r4), r0		/* R33 */
+	lds	r0, fpul
+	float	fpul, fr10		/* m[10] = R33 */
+
+	fmul	fr12, fr0
+	fmul	fr12, fr1
+	fmul	fr12, fr2
+	fldi0	fr3
+	fmul	fr12, fr4
+	fmul	fr12, fr5
+	fmul	fr12, fr6
+	fldi0	fr7
+	fmul	fr12, fr8
+	fmul	fr12, fr9
+	fmul	fr12, fr10
+	fldi0	fr11
+
+	fschg
+	fmov.d	dr0, @r5
+	add	#8, r5
+	fmov.d	dr2, @r5
+	add	#8, r5
+	fmov.d	dr4, @r5
+	add	#8, r5
+	fmov.d	dr6, @r5
+	add	#8, r5
+	fmov.d	dr8, @r5
+	add	#8, r5
+	fmov.d	dr10, @r5
+	fschg
+	rts
+	 fmov.s	@r15+, fr12
+
+	.align	2
+1:	.long	0x39800000
+	.size	_gte_rot_convert, . - _gte_rot_convert
