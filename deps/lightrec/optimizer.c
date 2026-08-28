@@ -1405,11 +1405,38 @@ static bool is_local_branch(const struct block *block, unsigned int idx)
 	}
 }
 
+/* Target of the branch at 'idx' when it is known at compile time: j / jal,
+ * and the PC-relative conditional branches. jr / jalr are not. */
+static bool branch_static_target(const struct block *block, unsigned int idx,
+				 u32 *target)
+{
+	const union code c = block->opcode_list[idx].c;
+	u32 pc = block->pc + (idx << 2);
+
+	switch (c.i.op) {
+	case OP_J:
+	case OP_JAL:
+		*target = (pc & 0xf0000000) | (c.j.imm << 2);
+		return true;
+	case OP_BEQ:
+	case OP_BNE:
+	case OP_BLEZ:
+	case OP_BGTZ:
+	case OP_REGIMM:
+		*target = pc + 4 + ((s16)c.i.imm << 2);
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int lightrec_handle_load_delays(struct lightrec_state *state,
 				       struct block *block)
 {
 	struct opcode *op, *list = block->opcode_list;
+	union code target_op;
 	unsigned int i;
+	u32 target;
 	s16 imm;
 
 	for (i = 0; i < block->nb_ops; i++) {
@@ -1434,6 +1461,20 @@ static int lightrec_handle_load_delays(struct lightrec_state *state,
 				 * the load delay. */
 				continue;
 			}
+		} else if (branch_static_target(block, i - 1, &target)) {
+			/* Same test for a static target outside the block:
+			 * read its first opcode now instead of at every
+			 * execution (lightrec_check_load_delay). If it does
+			 * not read the register, the load can complete in
+			 * the delay slot and the exit stays a plain link.
+			 * Assumes the target's first word does not change
+			 * behind this block's back - the hash does not cover
+			 * it - which is the same assumption a direct link
+			 * makes about the target's code. */
+			target_op = lightrec_read_opcode(state, target);
+
+			if (!opcode_reads_register(target_op, op->c.i.rt))
+				continue;
 		}
 
 		op->flags |= LIGHTREC_LOAD_DELAY;
