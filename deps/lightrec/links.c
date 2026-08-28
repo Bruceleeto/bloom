@@ -8,6 +8,7 @@
 #include "lightrec-private.h"
 #include "links.h"
 #include "memmanager.h"
+#include "regcache.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -54,10 +55,13 @@ static inline void links_unlock(struct lightrec_links *links)
  * The preprocessed-not-compiled marker counts as "no code". */
 static inline u32 link_value(struct lightrec_state *state, void *ptr)
 {
+	/* Real code starts with the pinned-register load stub; a link
+	 * carries the pins in their registers and enters behind it. The
+	 * dispatcher fallback writes them back first (regcache.c). */
 	if (ptr && ptr != (void *)state->get_next_block)
-		return (u32)(uintptr_t)ptr;
+		return (u32)(uintptr_t)ptr + LIGHTREC_PIN_STUB_BYTES;
 
-	return (u32)(uintptr_t)state->eob_wrapper_func;
+	return (u32)(uintptr_t)state->eob_wrapper_pins_func;
 }
 
 struct lightrec_links * lightrec_links_init(struct lightrec_state *state)

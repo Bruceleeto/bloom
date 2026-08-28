@@ -1225,7 +1225,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	struct block *block;
 	jit_state_t *_jit;
 	jit_node_t *to_end, *to_loop, *to_slow_path, *loop, *loop2,
-		   *addr, *addr2, *addr3, *addr4, *addr5, *addr6;
+		   *addr, *addr2, *addr3, *addr4, *addr5, *addr6, *addr7,
+		   *to_addr6;
 	unsigned int i;
 
 	block = lightrec_malloc(state, MEM_FOR_IR, sizeof(*block));
@@ -1248,14 +1249,20 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	jit_getarg_i(LIGHTREC_REG_CYCLE, jit_arg());
 
 	/* Force all callee-saved registers to be pushed on the stack */
-	for (i = 0; i < NUM_REGS; i++)
+	for (i = 0; i < NUM_VREGS; i++)
 		jit_movr(JIT_V(i + FIRST_REG), JIT_V(i + FIRST_REG));
 
 	to_loop = jit_jmpi();
 
+	/* A direct link whose target has no code yet lands here: the pinned
+	 * registers are still in their registers, write them back first. */
+	addr7 = jit_indirect();
+	lightrec_regcache_pin_stores_raw(_jit);
+
 	/* The block will jump here, with the number of cycles remaining in
 	 * LIGHTREC_REG_CYCLE */
 	addr2 = jit_indirect();
+	jit_movr(JIT_V0, LIGHTREC_REG_PC);
 
 	sync_next_pc(_jit);
 
@@ -1275,7 +1282,11 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	jit_addi(JIT_V1, JIT_V1, lightrec_offset(code_lut));
 
 	/* The block will jump here if it already knows the code LUT entry */
+	to_addr6 = jit_jmpi();
 	addr6 = jit_indirect();
+	jit_movr(JIT_V0, LIGHTREC_REG_PC);
+	jit_movr(JIT_V1, LIGHTREC_REG_AUX);
+	jit_patch(to_addr6);
 
 	if (lut_is_32bit(state))
 		jit_ldr_ui(JIT_V1, JIT_V1);
@@ -1298,6 +1309,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_movi(JIT_R1, 0x1fffffff);
 
 	/* Call the block's code */
+	jit_movr(LIGHTREC_REG_PC, JIT_V0);
 	jit_jmpr(JIT_V1);
 
 	jit_patch(to_slow_path);
@@ -1374,6 +1386,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		 * be executed with the interpreter, passing the branch's PC
 		 * in JIT_V0 and the address of the block in JIT_V1. */
 		addr4 = jit_indirect();
+		jit_movr(JIT_V0, LIGHTREC_REG_PC);
+		jit_movr(JIT_V1, LIGHTREC_REG_AUX);
 
 		sync_next_pc(_jit);
 		update_cycle_counter_before_c(_jit);
@@ -1401,6 +1415,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		 * first opcode, to make sure that it does not read the register
 		 * in question; and if it does, handle it accordingly. */
 		addr5 = jit_indirect();
+		jit_movr(JIT_V0, LIGHTREC_REG_PC);
+		jit_movr(JIT_V1, LIGHTREC_REG_AUX);
 
 		sync_next_pc(_jit);
 		update_cycle_counter_before_c(_jit);
@@ -1432,6 +1448,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		goto err_free_jit;
 
 	state->eob_wrapper_func = jit_address(addr2);
+	state->eob_wrapper_pins_func = jit_address(addr7);
 	if (OPT_DETECT_IMPOSSIBLE_BRANCHES)
 		state->interpreter_func = jit_address(addr4);
 	if (OPT_HANDLE_LOAD_DELAYS)
@@ -1749,7 +1766,17 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	jit_prolog();
 	jit_tramp(256);
 
-	start_of_block = jit_label();
+	/* Pinned registers (regcache.c): the code-LUT entry is this fixed
+	 * stub of loads; a direct link enters just behind it with the pins
+	 * already in their registers. */
+	lightrec_regcache_entry_loads(cstate->reg_cache, _jit);
+	lightrec_regcache_pin_block(cstate->reg_cache, _jit);
+
+	/* An address-taken label: a plain one that nothing branches to is
+	 * dropped, and the SH-4 backend's scheduler then pairs the block's
+	 * first instruction into the stub - which must stay exactly
+	 * LIGHTREC_PIN_STUB_BYTES, since links enter behind it. */
+	start_of_block = jit_indirect();
 
 	for (i = 0; i < block->nb_ops; i++) {
 		elm = &block->opcode_list[i];
@@ -1782,6 +1809,17 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		cstate->cycles += lightrec_cycles_of_opcode(state, elm->c);
 	}
 
+	/* Out-of-line entries for the code LUT: anything arriving from the
+	 * dispatcher or a direct link has the pinned registers' homes full
+	 * of scratch, so load them, then join the in-line code. */
+	for (i = 0; i < cstate->nb_targets; i++) {
+		target = &cstate->targets[i];
+
+		target->label = jit_indirect();
+		lightrec_regcache_entry_loads(cstate->reg_cache, _jit);
+		jit_patch_at(jit_jmpi(), target->local_label);
+	}
+
 	for (i = 0; i < cstate->nb_local_branches; i++) {
 		struct lightrec_branch *branch = &cstate->local_branches[i];
 
@@ -1796,7 +1834,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		for (j = 0; j < cstate->nb_targets; j++) {
 			if (cstate->targets[j].offset == branch->target) {
 				jit_patch_at(branch->branch,
-					     cstate->targets[j].label);
+					     cstate->targets[j].local_label);
 				break;
 			}
 		}
