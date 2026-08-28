@@ -47,6 +47,11 @@ static void rec_SPECIAL(struct lightrec_cstate *state, const struct block *block
 static void rec_REGIMM(struct lightrec_cstate *state, const struct block *block, u16 offset);
 static void rec_CP0(struct lightrec_cstate *state, const struct block *block, u16 offset);
 static void rec_CP2(struct lightrec_cstate *state, const struct block *block, u16 offset);
+static bool rec_load_hw_call(struct lightrec_cstate *cstate,
+			     const struct block *block, u16 offset,
+			     bool is_unsigned);
+static bool rec_store_hw_call(struct lightrec_cstate *cstate,
+			      const struct block *block, u16 offset);
 static void rec_META(struct lightrec_cstate *state, const struct block *block, u16 offset);
 static void rec_cp2_do_mtc2(struct lightrec_cstate *state,
 			    const struct block *block, u16 offset, u8 reg, u8 in_reg);
@@ -1795,6 +1800,11 @@ static void rec_store(struct lightrec_cstate *state,
 	case LIGHTREC_IO_DIRECT_HW:
 		rec_store_io(state, block, offset, code, swap_code);
 		break;
+	case LIGHTREC_IO_HW:
+		if (!is_swc2 && rec_store_hw_call(state, block, offset))
+			break;
+		rec_io(state, block, offset, true, false);
+		return;
 	default:
 		rec_io(state, block, offset, true, false);
 		return;
@@ -2102,6 +2112,176 @@ static void rec_load_direct(struct lightrec_cstate *cstate,
 	lightrec_free_reg(reg_cache, rt);
 }
 
+/* HW-tagged plain loads/stores as direct C calls, same shape as the GTE
+ * direct call: resolve the handler at compile time, keep the live
+ * registers, skip the wrapper block, lightrec_rw and lightrec_get_map.
+ * The wrapper's cycle contract is emitted inline: current_cycle synced
+ * before the call (the devices are cycle-accurate), the down-counter
+ * rebuilt from a possibly updated target_cycle after it. */
+static void rec_hw_cycle_sync_in(struct regcache *reg_cache,
+				 jit_state_t *_jit)
+{
+	u8 tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_ldxi_ui(tmp, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
+	jit_subr(tmp, tmp, LIGHTREC_REG_CYCLE);
+	jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, tmp);
+
+	lightrec_free_reg(reg_cache, tmp);
+}
+
+static void rec_hw_cycle_sync_out(struct regcache *reg_cache,
+				  jit_state_t *_jit)
+{
+	u8 tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_ldxi_ui(tmp, LIGHTREC_REG_STATE, lightrec_offset(current_cycle));
+	jit_ldxi_ui(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE,
+		    lightrec_offset(target_cycle));
+	jit_subr(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, tmp);
+
+	lightrec_free_reg(reg_cache, tmp);
+}
+
+static bool rec_load_hw_call(struct lightrec_cstate *cstate,
+			     const struct block *block, u16 offset,
+			     bool is_unsigned)
+{
+	struct regcache *reg_cache = cstate->reg_cache;
+	const struct opcode *op = &block->opcode_list[offset];
+	bool load_delay = op_flag_load_delay(op->flags) && !cstate->no_load_delay;
+	jit_state_t *_jit = block->_jit;
+	union code c = op->c;
+	u8 rs, tmp, rt, out_reg, flags = REG_EXT;
+	void *fn;
+
+	switch (c.i.op) {
+	case OP_LB:	fn = lightrec_hw_lb; break;
+	case OP_LBU:	fn = lightrec_hw_lbu; break;
+	case OP_LH:	fn = lightrec_hw_lh; break;
+	case OP_LHU:	fn = lightrec_hw_lhu; break;
+	case OP_LW:	fn = lightrec_hw_lw; break;
+	default:
+		return false;	/* LWC2/LWL/LWR/meta: generic path */
+	}
+
+	if (load_delay)
+		out_reg = REG_TEMP;
+	else
+		out_reg = c.i.rt;	/* 0: still read, for the side effect */
+
+	if (is_unsigned)
+		flags |= REG_ZEXT;
+
+	jit_note(__FILE__, __LINE__);
+
+	rec_hw_cycle_sync_in(reg_cache, _jit);
+
+	/* A LUI folded into this load (LIGHTREC_MOVI) was not emitted: build
+	 * the full address here, as rec_load_memory does. */
+	if (op_flag_movi(op->flags)) {
+		rec_movi(cstate, block, offset, true);
+		c.i.imm = 0;
+	}
+
+	rs = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rs, 0);
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	jit_addi(tmp, rs, (s16)c.i.imm);
+	lightrec_free_reg(reg_cache, rs);
+
+	lightrec_save_temps(reg_cache, _jit);
+
+	/* jit_pushargr moves each argument into r4.. as it is pushed, and
+	 * the regcache hands out r4-r7 as temporaries, so an argument still
+	 * sitting in one of those can be overwritten by an earlier push.
+	 * Stage everything in r2/r3 (never allocator temps; spilled above,
+	 * reloaded below) and pass state LAST so its move lands after. */
+	jit_movr(JIT_R1, tmp);
+
+	jit_prepare();
+	jit_pushargr(JIT_R1);
+	jit_pushargr(LIGHTREC_REG_STATE);
+
+	lightrec_regcache_mark_live(reg_cache, _jit);
+	jit_finishi(fn);
+
+	lightrec_free_reg(reg_cache, tmp);
+	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	/* Park the return value: restore_temps may reload r1-r3. */
+	jit_retval_i(JIT_R1);
+	jit_stxi_i(lightrec_offset(temp_reg), LIGHTREC_REG_STATE, JIT_R1);
+
+	lightrec_restore_temps(reg_cache, _jit);
+
+	rec_hw_cycle_sync_out(reg_cache, _jit);
+
+	if (out_reg) {
+		rt = lightrec_alloc_reg_out(reg_cache, _jit, out_reg, flags);
+		jit_ldxi_i(rt, LIGHTREC_REG_STATE, lightrec_offset(temp_reg));
+		lightrec_free_reg(reg_cache, rt);
+	}
+
+	return true;
+}
+
+static bool rec_store_hw_call(struct lightrec_cstate *cstate,
+			      const struct block *block, u16 offset)
+{
+	struct regcache *reg_cache = cstate->reg_cache;
+	union code c = block->opcode_list[offset].c;
+	jit_state_t *_jit = block->_jit;
+	u8 rs, rt, tmp;
+	void *fn;
+
+	switch (c.i.op) {
+	case OP_SB:	fn = lightrec_hw_sb; break;
+	case OP_SH:	fn = lightrec_hw_sh; break;
+	case OP_SW:	fn = lightrec_hw_sw; break;
+	default:
+		return false;	/* SWC2/SWL/SWR/meta: generic path */
+	}
+
+	jit_note(__FILE__, __LINE__);
+
+	rec_hw_cycle_sync_in(reg_cache, _jit);
+
+	rs = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rs, 0);
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	jit_addi(tmp, rs, (s16)c.i.imm);
+	lightrec_free_reg(reg_cache, rs);
+
+	rt = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rt, 0);
+
+	lightrec_save_temps(reg_cache, _jit);
+
+	/* See rec_load_hw_call: stage in r2/r3, state last. */
+	if (rt == JIT_R1) {
+		jit_movr(JIT_R2, rt);
+		jit_movr(JIT_R1, tmp);
+	} else {
+		jit_movr(JIT_R1, tmp);
+		jit_movr(JIT_R2, rt);
+	}
+
+	jit_prepare();
+	jit_pushargr(JIT_R1);
+	jit_pushargr(JIT_R2);
+	jit_pushargr(LIGHTREC_REG_STATE);
+
+	lightrec_regcache_mark_live(reg_cache, _jit);
+	jit_finishi(fn);
+
+	lightrec_free_reg(reg_cache, tmp);
+	lightrec_free_reg(reg_cache, rt);
+	lightrec_regcache_mark_live(reg_cache, _jit);
+	lightrec_restore_temps(reg_cache, _jit);
+
+	rec_hw_cycle_sync_out(reg_cache, _jit);
+
+	return true;
+}
+
 static void rec_load(struct lightrec_cstate *state, const struct block *block,
 		     u16 offset, jit_code_t code, jit_code_t swap_code,
 		     bool is_unsigned)
@@ -2125,6 +2305,11 @@ static void rec_load(struct lightrec_cstate *state, const struct block *block,
 	case LIGHTREC_IO_DIRECT:
 		rec_load_direct(state, block, offset, code, swap_code, is_unsigned);
 		break;
+	case LIGHTREC_IO_HW:
+		if (rec_load_hw_call(state, block, offset, is_unsigned))
+			break;
+		rec_io(state, block, offset, false, true);
+		return;
 	default:
 		rec_io(state, block, offset, false, true);
 		return;

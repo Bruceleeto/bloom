@@ -162,6 +162,22 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 	}
 }
 
+/* I_STAT / I_MASK / DMA ICR: served straight from the register file, no
+ * clock transition - their value does not depend on the cycle count. A
+ * write can still raise or ack an interrupt, so the exit flag is checked. */
+static inline bool hw_is_irq_reg(u32 mem)
+{
+	u32 r = mem & 0x1fff;
+
+	return r == 0x1070 || r == 0x1074 || r == 0x10f4;
+}
+
+static inline void hw_light_write_done(struct lightrec_state *state)
+{
+	if (has_interrupt())
+		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
+}
+
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
@@ -175,6 +191,11 @@ static void hw_write_byte(struct lightrec_state *state,
 static void hw_write_half(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	if (hw_is_irq_reg(mem)) {
+		psxHwWrite16(mem, val);
+		hw_light_write_done(state);
+		return;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite16(mem, val);
@@ -185,6 +206,11 @@ static void hw_write_half(struct lightrec_state *state,
 static void hw_write_word(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	if (hw_is_irq_reg(mem)) {
+		psxHwWrite32(mem, val);
+		hw_light_write_done(state);
+		return;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite32(mem, val);
@@ -210,6 +236,8 @@ static u16 hw_read_half(struct lightrec_state *state,
 {
 	u16 val;
 
+	if (hw_is_irq_reg(mem))
+		return psxHu16(mem);
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead16(mem);
@@ -225,6 +253,8 @@ static u32 hw_read_word(struct lightrec_state *state,
 	static u32 old_cycle, oldold_cycle, old_gpusr;
 	u32 val, diff;
 
+	if (hw_is_irq_reg(mem))
+		return psxHu32(mem);
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead32(mem);
