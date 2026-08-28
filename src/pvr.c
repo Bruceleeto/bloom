@@ -796,7 +796,6 @@ void cvt16_block(uint32_t *dst, const uint32_t *src);		/* cvt16.s */
 void cvt16_block_mask(uint32_t *dst, const uint32_t *src);
 void cvt16_block_noalpha(uint32_t *dst, const uint32_t *src);
 static bool pvr_loading_fb;	/* inside pvr_load_bg() */
-unsigned int pvr_noalpha_blocks, pvr_fb_quads, pvr_fb_merged;
 static void pvr_fb_quad(unsigned int page_offset, uint16_t xmin, uint16_t xmax, uint16_t ymin, uint16_t ymax);
 static void pvr_fb_flush_pending(void);
 
@@ -875,7 +874,6 @@ static void load_block(struct texture_page *page, unsigned int page_offset,
 		} else if (pvr_loading_fb && !(page16->sprite_mask & BITLL(y * 4 + x))) {
 			cvt16_block_noalpha((uint32_t *)(page16->stage + (y * 16 * 128 + x * 32) / 2), src);
 			page16->noalpha_mask |= BITLL(y * 4 + x);
-			pvr_noalpha_blocks++;
 		} else {
 			cvt16_block((uint32_t *)(page16->stage + (y * 16 * 128 + x * 32) / 2), src);
 			page16->noalpha_mask &= ~BITLL(y * 4 + x);
@@ -1111,7 +1109,6 @@ static void invalidate_texture_area(unsigned int page_offset,
 			pend->ymin = min32(pend->ymin, ymin);
 			pend->xmax = max32(pend->xmax, xmax);
 			pend->ymax = max32(pend->ymax, ymax);
-			pvr_fb_merged++;
 		} else {
 			*pend = (struct fb_pending){ xmin, xmax, ymin, ymax, true };
 		}
@@ -1150,7 +1147,6 @@ static void pvr_fb_quad(unsigned int page_offset, uint16_t xmin, uint16_t xmax,
 	};
 
 	process_poly(&poly, true);
-	pvr_fb_quads++;
 }
 
 /* Emit the pending merged FB quads; from here on every upload records
