@@ -8,6 +8,8 @@
 #include <arch/cache.h>
 #include <arch/timer.h>
 #include <dc/pvr.h>
+#include <dc/pvr/pvr_dma.h>
+#include <malloc.h>
 #include <dc/video.h>
 #include <gpulib/gpu.h>
 #include <gpulib/gpu_timing.h>
@@ -138,6 +140,19 @@ struct texture_page {
 struct texture_page_16bpp {
 	struct texture_page base;
 	uint64_t bgload_mask;
+	/* RAM staging copy of the page texture (64x256 px, 128 B rows):
+	 * blocks are converted here with plain stores and pushed to
+	 * texture RAM in one copy per dirty row span at the commit
+	 * (pvr_flush_staging), instead of one SQ lock + 16 flushes per
+	 * block. dirty_mask: blocks converted since the last flush. */
+	uint16_t *stage;
+	uint64_t dirty_mask;
+	/* Blocks converted without the alpha bit (FB quad only reads them:
+	 * drawn over black, opaque black equals a hole). A sprite binding
+	 * one of these reconverts it. sprite_mask: blocks bound by polys
+	 * this frame, final by the time pvr_load_bg() runs. */
+	uint64_t noalpha_mask;
+	uint64_t sprite_mask;
 	bool is_mask;
 };
 
@@ -262,6 +277,12 @@ struct pvr_renderer {
 	struct texture_settings settings;
 
 	struct texture_page_16bpp textures16_mask[32];
+	/* FB quads pending as one bounding box per page: valid only while
+	 * no other primitive has been recorded this frame (nothing to
+	 * overdraw yet, so a wider quad of the same VRAM is exact). */
+	struct fb_pending { uint16_t xmin, xmax, ymin, ymax; bool set; } fb_pending[32];
+	bool fb_pending_any, fb_merge_ok;
+	bool staging_dma_inflight;
 	struct texture_page_16bpp textures16[32];
 	struct texture_page_8bpp textures8[32];
 	struct texture_page_4bpp textures4[32];
@@ -771,39 +792,14 @@ static const void * texture_page_get_addr(unsigned int page_offset)
 	return &gpu.vram[page_x * 64 + page_y * 256 * 1024];
 }
 
-static void
-load_block_16bpp(struct texture_page_16bpp *page,
-		 uint32_t *sq, const uint16_t *src)
-{
-	uint32_t px, *src32 = (uint32_t *)src;
-	unsigned int y, x;
+void cvt16_block(uint32_t *dst, const uint32_t *src);		/* cvt16.s */
+void cvt16_block_mask(uint32_t *dst, const uint32_t *src);
+void cvt16_block_noalpha(uint32_t *dst, const uint32_t *src);
+static bool pvr_loading_fb;	/* inside pvr_load_bg() */
+unsigned int pvr_noalpha_blocks, pvr_fb_quads, pvr_fb_merged;
+static void pvr_fb_quad(unsigned int page_offset, uint16_t xmin, uint16_t xmax, uint16_t ymin, uint16_t ymax);
+static void pvr_fb_flush_pending(void);
 
-	for (y = 0; y < 16; y++) {
-		for (x = 0; x < 8; x++) {
-			px = bgr_to_rgb32(src32[x]);
-
-			if (likely(px >> 16)) {
-				if (unlikely(page->is_mask))
-					px ^= 0x80000000;
-				else
-					px |= 0x80000000;
-			}
-
-			if (likely((uint16_t)px)) {
-				if (unlikely(page->is_mask))
-					px ^= 0x8000;
-				else
-					px |= 0x8000;
-			}
-
-			sq[x] = px;
-		}
-
-		sq_flush(sq);
-		sq += 128 / sizeof(*sq);
-		src32 += 2048 / sizeof(*src32);
-	}
-}
 
 static void load_block_8bpp(struct texture_page *page,
 			    uint32_t *sq, const uint8_t *src)
@@ -866,13 +862,80 @@ static void load_block(struct texture_page *page, unsigned int page_offset,
 
 		load_block_8bpp(page, sq, src);
 	} else {
-		dst = (pvr_ptr_t)((uintptr_t)page->tex + y * 16 * 128 + x * 32);
-		sq = sq_lock(pvr_ptr_get_sq_addr(dst));
+		struct texture_page_16bpp *page16 = to_texture_page_16bpp(page);
 
-		load_block_16bpp(to_texture_page_16bpp(page), sq, src);
+		if (unlikely(!page16->stage)) {
+			page16->stage = memalign(32, 64 * 256 * 2);
+			if (!page16->stage)
+				return;
+		}
+
+		if (page16->is_mask) {
+			cvt16_block_mask((uint32_t *)(page16->stage + (y * 16 * 128 + x * 32) / 2), src);
+		} else if (pvr_loading_fb && !(page16->sprite_mask & BITLL(y * 4 + x))) {
+			cvt16_block_noalpha((uint32_t *)(page16->stage + (y * 16 * 128 + x * 32) / 2), src);
+			page16->noalpha_mask |= BITLL(y * 4 + x);
+			pvr_noalpha_blocks++;
+		} else {
+			cvt16_block((uint32_t *)(page16->stage + (y * 16 * 128 + x * 32) / 2), src);
+			page16->noalpha_mask &= ~BITLL(y * 4 + x);
+		}
+		page16->dirty_mask |= BITLL(y * 4 + x);
+		return;
 	}
 
 	sq_unlock();
+}
+
+/* Push every 16bpp page's dirty blocks to texture RAM: one pvr_txr_load
+ * (a single SQ copy) per page, covering the dirty block-row span. Called
+ * at the commit, after the last texture load and before the scene is
+ * finished, so nothing is ever rendered from a stale texture. */
+static void pvr_staging_dma_wait(void)
+{
+	if (pvr.staging_dma_inflight) {
+		while (!pvr_dma_ready())
+			;
+		pvr.staging_dma_inflight = false;
+	}
+}
+
+static void pvr_flush_staging_page(struct texture_page_16bpp *page16)
+{
+	unsigned int row0, row1;
+	uint64_t m = page16->dirty_mask;
+
+	if (!m || !page16->base.tex || !page16->stage)
+		return;
+
+	row0 = __builtin_ctzll(m) / 4;
+	row1 = (63 - __builtin_clzll(m)) / 4;
+
+	/* CH2 DMA, one at a time. The staging rows were written back by the
+	 * converter (ocbwb). RULE: no store-queue write to the TA while a
+	 * CH2 DMA is in flight (texture RAM and the TA FIFO share the
+	 * channel) - callers wait (pvr_staging_dma_wait) before any. */
+	pvr_staging_dma_wait();
+	if (pvr_txr_load_dma(page16->stage + row0 * 16 * 128 / 2,
+			     (pvr_ptr_t)((uintptr_t)page16->base.tex + row0 * 16 * 128),
+			     (row1 - row0 + 1) * 16 * 128, false, NULL, NULL) == 0)
+		pvr.staging_dma_inflight = true;
+	else
+		pvr_txr_load(page16->stage + row0 * 16 * 128 / 2,
+			     (pvr_ptr_t)((uintptr_t)page16->base.tex + row0 * 16 * 128),
+			     (row1 - row0 + 1) * 16 * 128);
+
+	page16->dirty_mask = 0;
+}
+
+static void pvr_flush_staging(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 32; i++) {
+		pvr_flush_staging_page(&pvr.textures16[i]);
+		pvr_flush_staging_page(&pvr.textures16_mask[i]);
+	}
 }
 
 __noinline
@@ -989,6 +1052,10 @@ static void discard_texture_page(struct texture_page *page)
 	pvr_reap_ptr(page->tex);
 	page->tex = NULL;
 	page->block_mask = 0;
+	if (page->settings.bpp == TEXTURE_16BPP) {
+		to_texture_page_16bpp(page)->dirty_mask = 0;
+		to_texture_page_16bpp(page)->noalpha_mask = 0;
+	}
 }
 
 static void invalidate_texture(struct texture_page *page, uint64_t block_mask)
@@ -1012,7 +1079,6 @@ static void invalidate_texture_area(unsigned int page_offset,
 {
 	uint16_t umin, umax, vmin, vmax;
 	uint64_t block_mask;
-	struct poly poly;
 
 	umin = xmin % 64;
 	vmin = ymin % 256;
@@ -1020,10 +1086,15 @@ static void invalidate_texture_area(unsigned int page_offset,
 	vmax = (ymax - 1) % 256;
 
 	block_mask = get_block_mask(umin << 2, umax << 2, vmin, vmax);
-	invalidate_textures(page_offset, block_mask);
 
-	if (invalidate_only)
+	if (invalidate_only) {
+		/* The commit's discard of the draw area: VRAM did not change,
+		 * the staging mirror stays valid. */
+		invalidate_textures(page_offset, block_mask);
 		return;
+	}
+
+	invalidate_textures(page_offset, block_mask);
 
 	/* Recorded whatever the upload targets: which VRAM window is on
 	 * screen is only known at the commit, where pvr_load_bg() converts
@@ -1032,10 +1103,35 @@ static void invalidate_texture_area(unsigned int page_offset,
 	pvr.textures16[page_offset].bgload_mask |= block_mask;
 	pvr.has_bg = 1;
 
-	/* The 16bpp texture has transparency, which we don't want here (as VRAM
-	 * writes overwrite whatever was there before). Add a black square
-	 * behind the textured one to make sure the transparent pixels end up
-	 * black. */
+	if (pvr.fb_merge_ok) {
+		struct fb_pending *pend = &pvr.fb_pending[page_offset];
+
+		if (pend->set) {
+			pend->xmin = min32(pend->xmin, xmin);
+			pend->ymin = min32(pend->ymin, ymin);
+			pend->xmax = max32(pend->xmax, xmax);
+			pend->ymax = max32(pend->ymax, ymax);
+			pvr_fb_merged++;
+		} else {
+			*pend = (struct fb_pending){ xmin, xmax, ymin, ymax, true };
+		}
+		pvr.fb_pending_any = true;
+		return;
+	}
+
+	pvr_fb_quad(page_offset, xmin, xmax, ymin, ymax);
+}
+
+/* Record the quad that shows an uploaded VRAM area on screen. The 16bpp
+ * texture has transparency, which we don't want here (as VRAM writes
+ * overwrite whatever was there before): a black square goes behind the
+ * textured one so transparent pixels end up black. */
+static void pvr_fb_quad(unsigned int page_offset, uint16_t xmin, uint16_t xmax,
+			uint16_t ymin, uint16_t ymax)
+{
+	uint16_t umin = xmin % 64, vmin = ymin % 256;
+	uint16_t umax = (xmax - 1) % 64, vmax = (ymax - 1) % 256;
+	struct poly poly;
 
 	poly_alloc_cache(&poly);
 
@@ -1054,6 +1150,27 @@ static void invalidate_texture_area(unsigned int page_offset,
 	};
 
 	process_poly(&poly, true);
+	pvr_fb_quads++;
+}
+
+/* Emit the pending merged FB quads; from here on every upload records
+ * its own quad, in order. */
+static void pvr_fb_flush_pending(void)
+{
+	unsigned int i;
+
+	pvr.fb_merge_ok = false;
+	if (!pvr.fb_pending_any)
+		return;
+	pvr.fb_pending_any = false;
+
+	for (i = 0; i < 32; i++) {
+		if (pvr.fb_pending[i].set) {
+			pvr_fb_quad(i, pvr.fb_pending[i].xmin, pvr.fb_pending[i].xmax,
+				    pvr.fb_pending[i].ymin, pvr.fb_pending[i].ymax);
+			pvr.fb_pending[i].set = false;
+		}
+	}
 }
 
 void invalidate_all_textures(void)
@@ -1077,7 +1194,6 @@ static void pvr_update_caches(int x, int y, int w, int h, bool invalidate_only)
 {
 	unsigned int x2, y2, dx, dy, page_offset;
 	uint16_t xmin, xmax, ymin, ymax;
-
 	if (screen_bpp == 24)
 		return;
 
@@ -1099,8 +1215,7 @@ static void pvr_update_caches(int x, int y, int w, int h, bool invalidate_only)
 			ymax = min32(dy + 256, y2);
 			page_offset = ((dy & 511) >> 4) + ((dx & 1023) >> 6);
 
-			invalidate_texture_area(page_offset,
-						xmin, xmax, ymin, ymax,
+			invalidate_texture_area(page_offset, xmin, xmax, ymin, ymax,
 						invalidate_only);
 		}
 	}
@@ -1412,6 +1527,10 @@ static void pvr_maybe_free_page(struct texture_page *page)
 	if (page->tex && !page->inuse_mask && !page->old_inuse_mask) {
 		pvr_mem_free(page->tex);
 		page->tex = NULL;
+		if (page->settings.bpp == TEXTURE_16BPP) {
+			to_texture_page_16bpp(page)->dirty_mask = 0;
+			to_texture_page_16bpp(page)->noalpha_mask = 0;
+		}
 	}
 }
 
@@ -1487,10 +1606,19 @@ poly_get_texture_page(const struct poly *poly)
 		page->old_inuse_mask = 0;
 	}
 
-	if (unlikely(poly->flags & POLY_FB))
+	if (unlikely(poly->flags & POLY_FB)) {
 		to_texture_page_16bpp(page)->bgload_mask |= block_mask;
-	else
+	} else {
+		if (poly->bpp == TEXTURE_16BPP && !(poly->clut & CLUT_IS_MASK)) {
+			struct texture_page_16bpp *page16 = to_texture_page_16bpp(page);
+
+			page16->sprite_mask |= block_mask;
+			/* Loaded without alpha for the FB quad: not good enough
+			 * for a sprite, reload with it. */
+			page->block_mask &= ~(page16->noalpha_mask & block_mask);
+		}
 		maybe_update_texture(page, poly->texpage_id, block_mask);
+	}
 
 	return page;
 }
@@ -2065,8 +2193,12 @@ static void pvr_load_bg(void)
 		if (x1 > x0 && y1 > y0) {
 			mask = get_block_mask(x0 << 2, x1 << 2, y0, y1);
 			mask &= page16->bgload_mask;
-			if (mask)
+			if (mask) {
 				maybe_update_texture(&page16->base, i, mask);
+				/* Kick this page's DMA now: it overlaps the next
+				 * page's conversion (CPU only, no TA writes). */
+				pvr_flush_staging_page(page16);
+			}
 		}
 
 		page16->bgload_mask = 0;
@@ -2361,6 +2493,9 @@ static void process_poly(struct poly *poly, bool scissor)
 	uint8_t codebook;
 	bool check_mask, set_mask;
 	pvr_list_t list;
+
+	if (unlikely(pvr.fb_merge_ok) && !(poly->flags & POLY_FB))
+		pvr_fb_flush_pending();
 
 	if (poly->flags & POLY_TEXTURED) {
 		if (scissor && unlikely(poly->bpp != TEXTURE_4BPP)) {
@@ -3147,6 +3282,8 @@ static void reset_texture_page(struct texture_page *page)
 		page->old_inuse_mask = page->inuse_mask;
 		page->inuse_mask = 0;
 	}
+	if (page->settings.bpp == TEXTURE_16BPP)
+		to_texture_page_16bpp(page)->sprite_mask = 0;
 }
 
 static void reset_texture_pages(void)
@@ -3189,6 +3326,7 @@ static void hw_render_end_frame(void)
 	pvr.draw_offt_x = pvr.draw_dx + gpu.screen.x;
 	pvr.draw_offt_y = pvr.draw_dy + gpu.screen.y;
 	pvr.frame_open = 0;
+	pvr.fb_merge_ok = true;
 }
 
 static void pvr_render_black_square(uint16_t x0, uint16_t x1,
@@ -3365,6 +3503,7 @@ static void hw_render_stop_body(void)
 		&& pvr.start_y == pvr.view_y;
 
 	process_gpu_commands();
+	pvr_fb_flush_pending();
 
 	pvr_work_end();
 
@@ -3425,8 +3564,16 @@ static void hw_render_stop_body(void)
 
 	pvr_list_finish();
 
-	if (pvr.has_bg)
+	if (pvr.has_bg) {
+		pvr_loading_fb = true;
 		pvr_load_bg();
+		pvr_loading_fb = false;
+	}
+
+	/* Remaining dirty pages (sprite loads during the frame), then wait:
+	 * everything below writes the TA. */
+	pvr_flush_staging();
+	pvr_staging_dma_wait();
 
 	pvr_render_outlines();
 

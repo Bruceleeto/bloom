@@ -248,9 +248,14 @@ void wallclock_charge_begin(void)
 	wall_charge_tcnt = WALL_TCNT1;
 }
 
+unsigned int wall_charge_total;	/* BENCH: commit ticks per window */
+
 void wallclock_charge_end(void)
 {
-	wall_charge_ticks += wall_charge_tcnt - WALL_TCNT1;	/* counts down */
+	u32 t = wall_charge_tcnt - WALL_TCNT1;	/* counts down */
+
+	wall_charge_ticks += t;
+	wall_charge_total += t;
 }
 
 static inline u32 wall_ticks_to_cycles(u32 ticks)

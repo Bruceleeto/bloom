@@ -37,6 +37,8 @@
 static unsigned int frames;
 static unsigned int last_vbl;
 extern unsigned int wall_clamps, wall_dropped_us;	/* plugin.c */
+extern unsigned int wall_charge_total;
+extern unsigned int pvr_noalpha_blocks, pvr_fb_quads, pvr_fb_merged;
 extern unsigned int io_calls;
 extern uint32_t io_ticks;				/* plugin.c */
 void io_bench_print(unsigned int commits);
@@ -325,7 +327,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		/* work: W, host ms from the guest leaving VSync to its GP1(05),
 		 * mean and max over the window - the progress metric under the
 		 * wall clock, where fps only moves at 16.7/33.3 ms steps. */
-		printf("BENCH fps %5.1f frame %6.2f ms work %5.2f max %5.2f pvr %5.2f%% sh4 %5.2f%% commits %u drops %u flips %u vbl %u clamp %u drop %.1f io %u %.2f\n",
+		printf("BENCH fps %5.1f frame %6.2f ms work %5.2f max %5.2f pvr %5.2f%% sh4 %5.2f%% commits %u drops %u flips %u vbl %u clamp %u drop %.1f io %u %.2f commit %.2f noalpha %u fbq %u merged %u\n",
 		       (float)pvr_commits * 1000.0f / (float)(new_timer - timer_ms),
 		       (float)(new_timer - timer_ms) / (float)(pvr_commits ? pvr_commits : 1),
 		       (float)pvr_work_us_sum / 1000.0f / (float)(pvr_work_frames ? pvr_work_frames : 1),
@@ -335,7 +337,13 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		       pvr_commits, pvr_drops, frames, frame_counter - last_vbl,
 		       wall_clamps, (float)wall_dropped_us / 1000.0f,
 		       io_calls / (pvr_commits ? pvr_commits : 1),
-		       (float)io_ticks / 12500.0f / (float)(pvr_commits ? pvr_commits : 1));
+		       (float)io_ticks / 12500.0f / (float)(pvr_commits ? pvr_commits : 1),
+		       (float)wall_charge_total / 12500.0f / (float)(pvr_commits ? pvr_commits : 1),
+		       pvr_noalpha_blocks / (pvr_commits ? pvr_commits : 1),
+		       pvr_fb_quads / (pvr_commits ? pvr_commits : 1),
+		       pvr_fb_merged / (pvr_commits ? pvr_commits : 1));
+		wall_charge_total = 0;
+		pvr_noalpha_blocks = pvr_fb_quads = pvr_fb_merged = 0;
 		io_bench_print(pvr_commits ? pvr_commits : 1);
 		io_calls = 0;
 		io_ticks = 0;

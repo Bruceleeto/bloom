@@ -283,6 +283,7 @@ add_executable(bloom
 	src/background.cpp
 	src/cdr.c
 	src/copy32.s
+	src/cvt16.s
 	src/dynload.c
 	src/emu.c
 	src/genmenu.cpp
