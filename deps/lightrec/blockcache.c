@@ -6,6 +6,7 @@
 #include "blockcache.h"
 #include "debug.h"
 #include "lightrec-private.h"
+#include "links.h"
 #include "memmanager.h"
 #include "reaper.h"
 #include "recompiler.h"
@@ -67,6 +68,7 @@ void remove_from_code_lut(struct blockcache *cache, struct block *block)
 	if (block->function) {
 		memset(lut_address(state, offset), 0,
 		       block->nb_ops * lut_elm_size(state));
+		lightrec_links_lut_cleared(state, offset, block->nb_ops);
 	}
 }
 

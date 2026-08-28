@@ -8,6 +8,8 @@
 #include "debug.h"
 #include "disassembler.h"
 #include "emitter.h"
+#include "links.h"
+
 #include "lightning-wrapper.h"
 #include "optimizer.h"
 #include "regcache.h"
@@ -67,13 +69,54 @@ lightrec_jump_to_eob(struct lightrec_cstate *state, jit_state_t *_jit)
 	lightrec_jump_to_fn(_jit, state->state->eob_wrapper_func);
 }
 
+static void lightrec_jump_to_fast_eob(struct lightrec_cstate *state,
+				      jit_state_t *_jit, u32 offset)
+{
+	/* Load the LUT entry address to JIT_V1 where the dispatcher expects it */
+	jit_movi(JIT_V1, (uintptr_t)lut_address(state->state, offset));
+
+	lightrec_jump_to_fn(_jit, state->state->fast_eob);
+}
+
+/* Direct block link (links.h): the target is known, so jump through a
+ * literal word that holds its code address - or the dispatcher's eob
+ * wrapper while it has none. The word starts out as a per-exit magic that
+ * lightrec_links_register_block() locates and resolves once the block is
+ * emitted. Only the cycle check stays in line; a spent counter takes the
+ * usual fast_eob route. */
 static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 				       jit_state_t *_jit, u32 imm)
 {
-	/* Load the LUT entry address to JIT_V1 where the dispatcher expects it */
-	jit_movi(JIT_V1, (uintptr_t)lut_address(state->state, lut_offset(imm)));
+	u32 offset = lut_offset(imm);
+	jit_node_t *to_eob;
 
-	lightrec_jump_to_fn(_jit, state->state->fast_eob);
+	if (lightrec_store_next_pc()
+	    || state->nb_links >= ARRAY_SIZE(state->links)) {
+		lightrec_jump_to_fast_eob(state, _jit, offset);
+		return;
+	}
+
+	to_eob = jit_blei(LIGHTREC_REG_CYCLE, 0);
+
+	/* What the dispatcher provides on block entry: curr_pc synced, and
+	 * the address mask blocks are compiled to expect. */
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	if (!arch_has_fast_mask())
+		jit_movi(JIT_R1, 0x1fffffff);
+
+	jit_movi(JIT_V1, LINK_MAGIC(state->nb_links));
+
+	jit_live(LIGHTREC_REG_CYCLE);
+	jit_live(JIT_V0);
+	jit_live(JIT_R1);
+	jit_jmpr(JIT_V1);
+
+	state->links[state->nb_links].offset = offset;
+	state->links[state->nb_links].magic = LINK_MAGIC(state->nb_links);
+	state->nb_links++;
+
+	jit_patch(to_eob);
+	lightrec_jump_to_fast_eob(state, _jit, offset);
 }
 
 static void
@@ -1335,6 +1378,63 @@ static void rec_and_mask(struct lightrec_cstate *cstate,
 	}
 }
 
+/* Invalidate the code LUT entry for a store. addr_reg + lut_offt is the
+ * entry. The entry is NULL for anything that is not the first word of
+ * live code, so it is read and tested in line and the store to NULL moves
+ * to a C helper that also unlinks the edges pointing at it (links.h).
+ * Everything the rare path needs is allocated before the branch so the
+ * register cache sees one path. */
+static void rec_store_invalidate_lut(struct lightrec_cstate *cstate,
+				     const struct block *block,
+				     u8 addr_reg, s32 lut_offt,
+				     bool two_words)
+{
+	const struct lightrec_state *state = cstate->state;
+	struct regcache *reg_cache = cstate->reg_cache;
+	jit_state_t *_jit = block->_jit;
+	jit_node_t *to_skip;
+	u8 old, old2;
+
+	old = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	if (lut_is_32bit(state))
+		jit_ldxi_i(old, addr_reg, lut_offt);
+	else
+		jit_ldxi(old, addr_reg, lut_offt);
+
+	if (two_words) {
+		old2 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+		if (lut_is_32bit(state))
+			jit_ldxi_i(old2, addr_reg, lut_offt + 4);
+		else
+			jit_ldxi(old2, addr_reg, lut_offt + sizeof(uintptr_t));
+
+		jit_orr(old, old, old2);
+		lightrec_free_reg(reg_cache, old2);
+	}
+
+	to_skip = jit_beqi(old, 0);
+
+	/* Rare path: the store landed on the first word of live code. Hand
+	 * the entry's address (bit 0 flagging the second word) to the
+	 * out-of-line stub through state, never through a register: the
+	 * register cache keeps temporaries in r4-r7 and the stub saves all
+	 * of them itself. Kept to a store and a call so the cold code at
+	 * every store site stays small - it is the icache that pays for it. */
+	jit_addi(old, addr_reg, lut_offt + two_words);
+	jit_stxi_i(lightrec_offset(link_inv_arg), LIGHTREC_REG_STATE, old);
+	jit_movi(old, (uintptr_t)state->link_inv_stub);
+	lightrec_regcache_mark_live(reg_cache, _jit);
+	jit_prepare();
+	jit_callr(old);
+	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	jit_patch(to_skip);
+
+	lightrec_free_reg(reg_cache, old);
+}
+
 static void rec_store_memory(struct lightrec_cstate *cstate,
 			     const struct block *block,
 			     u16 offset, jit_code_t code,
@@ -1406,9 +1506,11 @@ static void rec_store_memory(struct lightrec_cstate *cstate,
 
 	lightrec_free_reg(reg_cache, src_reg);
 
-	if (invalidate) {
-		tmp3 = lightrec_alloc_reg_in(reg_cache, _jit, 0, 0);
+	/* The data address is dead once the store is emitted */
+	if (addr_offset)
+		lightrec_free_reg(reg_cache, tmp2);
 
+	if (invalidate) {
 		if (c.i.op != OP_SW) {
 			jit_andi(tmp, addr_reg, ~3);
 			addr_reg = tmp;
@@ -1426,16 +1528,9 @@ static void rec_store_memory(struct lightrec_cstate *cstate,
 			addr_reg = tmp;
 		}
 
-		if (lut_is_32bit(state))
-			jit_stxi_i(lut_offt, addr_reg, tmp3);
-		else
-			jit_stxi(lut_offt, addr_reg, tmp3);
-
-		lightrec_free_reg(reg_cache, tmp3);
+		rec_store_invalidate_lut(cstate, block, addr_reg, lut_offt,
+					 c.i.op == OP_META_SWU);
 	}
-
-	if (addr_offset)
-		lightrec_free_reg(reg_cache, tmp2);
 	if (need_tmp)
 		lightrec_free_reg(reg_cache, tmp);
 	lightrec_free_reg(reg_cache, rs);
@@ -1563,7 +1658,7 @@ static void rec_store_direct(struct lightrec_cstate *cstate, const struct block 
 	jit_state_t *_jit = block->_jit;
 	jit_node_t *to_not_ram, *to_end;
 	bool swc2 = c.i.op == OP_SWC2;
-	u8 src_reg, addr_reg, tmp, tmp2, tmp3, rs, rt, reg_imm, reg_ram_size;
+	u8 src_reg, addr_reg, tmp, tmp2, rs, rt, reg_imm, reg_ram_size;
 	u8 in_reg = swc2 ? REG_TEMP : c.i.rt;
 	u32 mask;
 	bool different_offsets = state->offset_ram != state->offset_scratch;
@@ -1572,7 +1667,6 @@ static void rec_store_direct(struct lightrec_cstate *cstate, const struct block 
 
 	rs = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rs, 0);
 	tmp2 = lightrec_alloc_reg_temp(reg_cache, _jit);
-	tmp3 = lightrec_alloc_reg_in(reg_cache, _jit, 0, 0);
 
 	/* Convert to KUNSEG and avoid RAM mirrors */
 	if (c.i.imm) {
@@ -1613,22 +1707,10 @@ static void rec_store_direct(struct lightrec_cstate *cstate, const struct block 
 		jit_lshi(tmp, tmp, 1);
 	jit_add_state(tmp, tmp);
 
-	/* Write NULL to the code LUT to invalidate any block that's there */
-	if (lut_is_32bit(state))
-		jit_stxi_i(lightrec_offset(code_lut), tmp, tmp3);
-	else
-		jit_stxi(lightrec_offset(code_lut), tmp, tmp3);
-
-	if (c.i.op == OP_META_SWU) {
-		/* With a SWU opcode, we might have touched the following 32-bit
-		 * word, so invalidate it as well */
-		if (lut_is_32bit(state)) {
-			jit_stxi_i(lightrec_offset(code_lut) + 4, tmp, tmp3);
-		} else {
-			jit_stxi(lightrec_offset(code_lut) + sizeof(uintptr_t),
-				 tmp, tmp3);
-		}
-	}
+	/* Invalidate any block that's there. With a SWU opcode we might
+	 * have touched the following 32-bit word, so that one too. */
+	rec_store_invalidate_lut(cstate, block, tmp, lightrec_offset(code_lut),
+				 c.i.op == OP_META_SWU);
 
 	if (different_offsets) {
 		jit_movi(tmp, state->offset_ram);
@@ -1647,7 +1729,6 @@ static void rec_store_direct(struct lightrec_cstate *cstate, const struct block 
 		jit_addr(tmp2, tmp2, tmp);
 
 	lightrec_free_reg(reg_cache, tmp);
-	lightrec_free_reg(reg_cache, tmp3);
 	lightrec_free_reg(reg_cache, reg_imm);
 
 	rt = lightrec_alloc_reg_in(reg_cache, _jit, in_reg, 0);

@@ -114,12 +114,23 @@ struct u16x2 {
 #endif
 };
 
+struct lightrec_link;
+struct lightrec_links;
+
+/* A static exit recorded while emitting a block: the LUT offset of its
+ * target and the placeholder written into the literal pool (links.h). */
+struct lightrec_pending_link {
+	u32 offset;
+	u32 magic;
+};
+
 struct block {
 	jit_state_t *_jit;
 	struct opcode *opcode_list;
 	void (*function)(void);
 	const u32 *code;
 	struct block *next;
+	struct lightrec_link *links;
 	u32 pc;
 	u32 hash;
 	u32 precompile_date;
@@ -157,8 +168,10 @@ struct lightrec_cstate {
 	struct lightrec_branch local_branches[512];
 	struct lightrec_branch_target targets[512];
 	u16 movi_temp[32];
+	struct lightrec_pending_link links[256];
 	unsigned int nb_local_branches;
 	unsigned int nb_targets;
+	unsigned int nb_links;
 	unsigned int cycles;
 
 	struct regcache *reg_cache;
@@ -172,6 +185,7 @@ struct lightrec_state {
 	u32 curr_pc;
 	u32 next_pc;
 	uintptr_t wrapper_regs[NUM_TEMPS];
+	uintptr_t wrapper_temps_r4[4];	/* r4-r7 temps, lightrec_save_temps() */
 	uintptr_t wrapper_cycle;
 	u8 in_delay_slot_n;
 	u32 current_cycle;
@@ -180,7 +194,10 @@ struct lightrec_state {
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
 	void *c_wrapper;
-	struct block *dispatcher, *c_wrapper_block;
+	void *link_inv_stub;
+	u32 link_inv_arg;
+	struct block *dispatcher, *c_wrapper_block, *link_inv_stub_block;
+	struct lightrec_links *links;
 	void *c_wrappers[C_WRAPPERS_COUNT];
 	struct blockcache *block_cache;
 	struct recompiler *rec;
@@ -268,6 +285,10 @@ static inline void * lut_read(struct lightrec_state *state, u32 offset)
 		return *lut_entry;
 }
 
+void lightrec_links_lut_changed(struct lightrec_state *state,
+				u32 offset, void *ptr);
+void lightrec_link_inv_cb(u32 arg, struct lightrec_state *state);
+
 static inline void lut_write(struct lightrec_state *state, u32 offset, void *ptr)
 {
 	void **lut_entry = lut_address(state, offset);
@@ -276,6 +297,10 @@ static inline void lut_write(struct lightrec_state *state, u32 offset, void *ptr
 		*(u32 *) lut_entry = (u32)(uintptr_t) ptr;
 	else
 		*lut_entry = ptr;
+
+	/* Linked edges mirror the LUT */
+	if (state->links)
+		lightrec_links_lut_changed(state, offset, ptr);
 }
 
 static inline u32 get_ds_pc(const struct block *block, u16 offset, s16 imm)

@@ -13,6 +13,7 @@
 #include "lightrec-config.h"
 #include "lightning-wrapper.h"
 #include "lightrec.h"
+#include "links.h"
 #include "memmanager.h"
 #include "reaper.h"
 #include "recompiler.h"
@@ -126,11 +127,20 @@ static const struct lightrec_mem_map_ops lightrec_default_ops = {
 static void __segfault_cb(struct lightrec_state *state, u32 addr,
 			  const struct block *block)
 {
+	unsigned int i;
+
 	lightrec_set_exit_flags(state, LIGHTREC_EXIT_SEGFAULT);
 	pr_err("Segmentation fault in recompiled code: invalid "
 	       "load/store at address "PC_FMT"\n", addr);
 	if (block)
 		pr_err("Was executing block "PC_FMT"\n", block->pc);
+	pr_err("curr_pc %08x next_pc %08x\n", (unsigned int)state->curr_pc,
+	       (unsigned int)state->next_pc);
+	for (i = 0; i < 32; i += 4) {
+		pr_err("r%02u %08x %08x %08x %08x\n", i,
+		       (unsigned int)state->regs.gpr[i], (unsigned int)state->regs.gpr[i + 1],
+		       (unsigned int)state->regs.gpr[i + 2], (unsigned int)state->regs.gpr[i + 3]);
+	}
 }
 
 static void lightrec_swl(struct lightrec_state *state,
@@ -229,6 +239,7 @@ static void lightrec_invalidate_map(struct lightrec_state *state,
 	if (map == &state->maps[PSX_MAP_KERNEL_USER_RAM]) {
 		memset(lut_address(state, lut_offset(addr)), 0,
 		       ((len + 3) / 4) * lut_elm_size(state));
+		lightrec_links_lut_cleared(state, lut_offset(addr), (len + 3) / 4);
 	}
 }
 
@@ -1013,6 +1024,7 @@ static struct block * generate_wrapper(struct lightrec_state *state)
 	block->opcode_list = NULL;
 	block->flags = BLOCK_NO_OPCODE_LIST;
 	block->nb_ops = 0;
+	block->links = NULL;
 
 	block->function = lightrec_emit_code(state, block, _jit,
 					     &block->code_size);
@@ -1107,6 +1119,105 @@ static void sync_next_pc(jit_state_t *_jit)
 		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE,
 			    lightrec_offset(next_pc));
 	}
+}
+
+/* Rare path of an invalidating store: the store hit the first word of
+ * live code. arg is the LUT entry's address, bit 0 set if the following
+ * entry must go too (unaligned store). Clearing through lut_write() also
+ * unlinks every edge that pointed at the entry. */
+/* arg first: it is the one operand that may sit in an argument register,
+ * and the first argument move must not clobber it. */
+void lightrec_link_inv_cb(u32 arg, struct lightrec_state *state)
+{
+	uintptr_t entry = (uintptr_t)arg & ~(uintptr_t)1;
+	u32 offset = (entry - (uintptr_t)state->code_lut) / lut_elm_size(state);
+
+	lut_write(state, offset, NULL);
+	if (arg & 1)
+		lut_write(state, offset + 1, NULL);
+}
+
+/* Out-of-line stub for the store-invalidate rare path (emitter.c,
+ * rec_store_invalidate_lut). The call site only stores the LUT entry's
+ * address to state->link_inv_arg and jsr's here, so it stays a few bytes
+ * of cold code; this stub saves every caller-saved register the register
+ * cache can hand out (r1 cycle, r2-r3, r4-r7), calls C, restores them.
+ * Nothing is passed in an argument register, so no live temporary can be
+ * clobbered on the way in. */
+static struct block * generate_link_inv_stub(struct lightrec_state *state)
+{
+	struct block *block;
+	jit_state_t *_jit;
+	unsigned int i;
+
+	block = lightrec_malloc(state, MEM_FOR_IR, sizeof(*block));
+	if (!block)
+		goto err_no_mem;
+
+	_jit = jit_new_state();
+	if (!_jit)
+		goto err_free_block;
+
+	jit_name("link inv stub");
+	jit_note(__FILE__, __LINE__);
+
+	jit_prolog();
+
+	jit_stxi(lightrec_offset(wrapper_cycle), LIGHTREC_REG_STATE,
+		 LIGHTREC_REG_CYCLE);
+	for (i = 0; i < NUM_TEMPS; i++) {
+		jit_stxi(lightrec_offset(wrapper_regs[i]),
+			 LIGHTREC_REG_STATE, JIT_R(FIRST_TEMP + i));
+	}
+	for (i = 0; i < 4; i++) {
+		jit_stxi(lightrec_offset(wrapper_temps_r4[i]),
+			 LIGHTREC_REG_STATE, _R4 + i);
+	}
+
+	jit_ldxi_ui(JIT_R2, LIGHTREC_REG_STATE, lightrec_offset(link_inv_arg));
+
+	jit_prepare();
+	jit_pushargr(JIT_R2);
+	jit_pushargr(LIGHTREC_REG_STATE);
+	jit_finishi(lightrec_link_inv_cb);
+
+	for (i = 0; i < 4; i++) {
+		jit_ldxi(_R4 + i, LIGHTREC_REG_STATE,
+			 lightrec_offset(wrapper_temps_r4[i]));
+	}
+	for (i = 0; i < NUM_TEMPS; i++) {
+		jit_ldxi(JIT_R(FIRST_TEMP + i), LIGHTREC_REG_STATE,
+			 lightrec_offset(wrapper_regs[i]));
+	}
+	jit_ldxi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE,
+		 lightrec_offset(wrapper_cycle));
+
+	jit_ret();
+	jit_epilog();
+
+	block->_jit = _jit;
+	block->opcode_list = NULL;
+	block->flags = BLOCK_NO_OPCODE_LIST;
+	block->nb_ops = 0;
+	block->links = NULL;
+
+	block->function = lightrec_emit_code(state, block, _jit,
+					     &block->code_size);
+	if (!block->function)
+		goto err_free_jit;
+
+	state->link_inv_stub = block->function;
+
+	jit_clear_state();
+	return block;
+
+err_free_jit:
+	jit_destroy_state();
+err_free_block:
+	lightrec_free(state, MEM_FOR_IR, sizeof(*block), block);
+err_no_mem:
+	pr_err("Unable to compile link inv stub: Out of memory\n");
+	return NULL;
 }
 
 static struct block * generate_dispatcher(struct lightrec_state *state)
@@ -1313,6 +1424,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	block->opcode_list = NULL;
 	block->flags = BLOCK_NO_OPCODE_LIST;
 	block->nb_ops = 0;
+	block->links = NULL;
 
 	block->function = lightrec_emit_code(state, block, _jit,
 					     &block->code_size);
@@ -1451,6 +1563,7 @@ static struct block * lightrec_precompile_block(struct lightrec_state *state,
 	block->opcode_list = list;
 	block->code = code;
 	block->next = NULL;
+	block->links = NULL;
 	block->flags = 0;
 	block->code_size = 0;
 	block->precompile_date = state->current_cycle;
@@ -1559,6 +1672,11 @@ static void lightrec_reap_function(struct lightrec_state *state, void *data)
 	lightrec_free_function(state, data);
 }
 
+static void lightrec_reap_links(struct lightrec_state *state, void *data)
+{
+	lightrec_links_free_list(state, data);
+}
+
 static void lightrec_reap_opcode_list(struct lightrec_state *state, void *data)
 {
 	lightrec_free_opcode_list(state, data);
@@ -1578,6 +1696,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	jit_node_t *start_of_block;
 	bool skip_next = false;
 	void *old_fn, *new_fn;
+	struct lightrec_link *old_links;
 	size_t old_code_size;
 	unsigned int i, j;
 	u8 old_flags;
@@ -1597,6 +1716,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	oldjit = block->_jit;
 	old_fn = block->function;
 	old_code_size = block->code_size;
+	old_links = block->links;
 	block->_jit = _jit;
 
 	lightrec_regcache_reset(cstate->reg_cache);
@@ -1610,6 +1730,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	cstate->cycles = 0;
 	cstate->nb_local_branches = 0;
 	cstate->nb_targets = 0;
+	cstate->nb_links = 0;
 	cstate->no_load_delay = false;
 
 	/*
@@ -1704,6 +1825,23 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 	block->function = new_fn;
 	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
+
+	/* Resolve this block's static exits before anything can reach the
+	 * new code. The old generation's links stay registered until its
+	 * code is reaped, so it keeps mirroring the LUT while it runs. */
+	if (lightrec_links_register_block(state, block, cstate->links,
+					  cstate->nb_links)) {
+		pr_err("Unable to link block at "PC_FMT"\n", block->pc);
+		block->function = old_fn;
+		block->links = old_links;
+		block->_jit = oldjit;
+		if (ENABLE_THREADED_COMPILER)
+			lightrec_reaper_continue(state->reaper);
+		lightrec_free_function(state, new_fn);
+		jit_clear_state();
+		_jit_destroy_state(_jit);
+		return -EINVAL;
+	}
 
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
@@ -1805,11 +1943,16 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 			 block->pc);
 
 		if (ENABLE_THREADED_COMPILER) {
+			/* FIFO: the links go before the code they live in */
+			if (old_links)
+				lightrec_reaper_add(state->reaper,
+						    lightrec_reap_links, old_links);
 			lightrec_reaper_add(state->reaper,
 					    lightrec_reap_jit, oldjit);
 			lightrec_reaper_add(state->reaper,
 					    lightrec_reap_function, old_fn);
 		} else {
+			lightrec_links_free_list(state, old_links);
 			_jit_destroy_state(oldjit);
 			lightrec_free_function(state, old_fn);
 		}
@@ -1904,6 +2047,8 @@ void lightrec_free_block(struct lightrec_state *state, struct block *block)
 
 	if (!(old_flags & BLOCK_NO_OPCODE_LIST))
 		lightrec_free_opcode_list(state, block->opcode_list);
+	if (block->links)
+		lightrec_links_free_list(state, block->links);
 	if (block->_jit)
 		_jit_destroy_state(block->_jit);
 	if (block->function) {
@@ -2026,6 +2171,14 @@ struct lightrec_state * lightrec_init(char *argv0,
 	if (!state->c_wrapper_block)
 		goto err_free_dispatcher;
 
+	state->link_inv_stub_block = generate_link_inv_stub(state);
+	if (!state->link_inv_stub_block)
+		goto err_free_wrapper;
+
+	state->links = lightrec_links_init(state);
+	if (!state->links)
+		goto err_free_stub;
+
 	state->c_wrappers[C_WRAPPER_RW] = lightrec_rw_cb;
 	state->c_wrappers[C_WRAPPER_RW_GENERIC] = lightrec_rw_generic_cb;
 	state->c_wrappers[C_WRAPPER_MFC] = lightrec_mfc_cb;
@@ -2064,6 +2217,10 @@ struct lightrec_state * lightrec_init(char *argv0,
 
 	return state;
 
+err_free_stub:
+	lightrec_free_block(state, state->link_inv_stub_block);
+err_free_wrapper:
+	lightrec_free_block(state, state->c_wrapper_block);
 err_free_dispatcher:
 	lightrec_free_block(state, state->dispatcher);
 err_free_reaper:
@@ -2094,8 +2251,10 @@ void lightrec_destroy(struct lightrec_state *state)
 	lightrec_print_info(state);
 
 	lightrec_free_block_cache(state->block_cache);
+	lightrec_links_destroy(state);
 	lightrec_free_block(state, state->dispatcher);
 	lightrec_free_block(state, state->c_wrapper_block);
+	lightrec_free_block(state, state->link_inv_stub_block);
 
 	if (ENABLE_THREADED_COMPILER) {
 		lightrec_free_recompiler(state->rec);
@@ -2133,11 +2292,13 @@ void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)
 
 	memset(lut_address(state, lut_offset(kaddr)), 0,
 	       ((len + 3) / 4) * lut_elm_size(state));
+	lightrec_links_lut_cleared(state, lut_offset(kaddr), (len + 3) / 4);
 }
 
 void lightrec_invalidate_all(struct lightrec_state *state)
 {
 	memset(state->code_lut, 0, lut_elm_size(state) * CODE_LUT_SIZE);
+	lightrec_links_lut_cleared_all(state);
 }
 
 void lightrec_set_unsafe_opt_flags(struct lightrec_state *state, u32 flags)
