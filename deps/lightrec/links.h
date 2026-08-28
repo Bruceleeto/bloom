@@ -27,6 +27,13 @@
 struct lightrec_link {
 	u32 offset;			/* LUT offset of the target */
 	u32 *word;			/* literal in the owner's code */
+	/* SH-4 far-exit patching (links.c): the `mov.l lit,rN` that loads
+	 * the literal and the `jmp @rN` behind it. While the target is
+	 * within BRA range they read `nop` / `bra target` instead; the
+	 * original words are kept to put the far form back. */
+	u16 *movl, *jmp;
+	u16 movl_word, jmp_word;
+	_Bool patched;
 	struct lightrec_link *next_target;	/* hash chain by offset */
 	struct lightrec_link *next_owner;	/* the owner's list */
 };
