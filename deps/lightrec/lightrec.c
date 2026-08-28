@@ -969,6 +969,22 @@ static void * lightrec_emit_code(struct lightrec_state *state,
 		printf("LRBLK %08x %08x %u %u\n", block->pc,
 		       (unsigned int)(uintptr_t)code,
 		       (unsigned int)new_code_size, block->nb_ops);
+		/* Codegen survey (docs/cmpclass.py): host bytes and guest words
+		 * for the hot list, the BIOS and the game's boot range. */
+		{
+			static const u32 hot[] = { 0xbfc05810, 0x801b9574, 0x801b95ac, 0x00000000, 0x801b8ee0, 0x80166724, 0x801ad7f0, 0x0000256c, 0x0000272c, 0x801b8f44, 0x00002a20, 0x80137b3c, 0x801b92b4, 0x801bf470, 0x00001888, 0x0000253c, 0x801b9310, 0x80137b88, 0x801bc9fc, 0x80137bd4, 0x80137c04, 0x80137998, 0x00002854, 0x801be700, 0x801379f8, 0x80154834, 0x801361e4, 0x80139a90, 0x8013c6fc, 0x801548dc, 0x8013c348, 0x80135f5c, 0x80137b9c, 0x80137bb8, 0x00002904, 0x80150480, 0x801b9260, 0x801b8e60, 0x0000283c, 0x00002614, 0x8013a49c, 0x801b8ed8, 0x80166690, 0x801bee58, 0x80150660, 0x000024ec, 0x00002814, 0x80150114, 0x801bc8dc, 0x00002600, 0x801b40b0, 0x801bf3b4, 0x801398b8, 0x000026ac, 0x80168fc8, 0x80154764, 0x801bee18, 0x801b4078, 0x801b4050, 0x801b4028, 0x801bf00c };
+			const u8 *cb = code; unsigned int i;
+			for (i = 0; i < sizeof(hot) / sizeof(hot[0]); i++)
+				if (hot[i] == block->pc) break;
+			if (i == sizeof(hot) / sizeof(hot[0]) && (block->pc >> 20) != 0xbfc && (block->pc >> 16) != 0x8003 && block->nb_ops) return code;
+			printf("LRCODE %08x ", block->pc);
+			for (i = 0; i < new_code_size; i++)
+				printf("%02x", cb[i]);
+			printf("\nLRMIPS %08x ", block->pc);
+			for (i = 0; i < block->nb_ops; i++)
+				printf("%08x", block->code ? block->code[i] : 0);
+			printf("\n");
+		}
 	}
 
 	return code;
