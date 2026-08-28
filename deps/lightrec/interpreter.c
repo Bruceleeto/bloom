@@ -388,6 +388,10 @@ static u32 int_do_branch(struct interpreter *inter, u32 old_pc, u32 next_pc)
 	if (!inter->delay_slot && op_flag_local_branch(inter->op->flags) &&
 	    (s16)inter->op->c.i.imm >= 0) {
 		next_pc = old_pc + ((1 + (s16)inter->op->c.i.imm) << 2);
+		if (((kunseg(next_pc) - kunseg(inter->block->pc)) >> 2) >= inter->block->nb_ops)
+			pr_err("PROBE local branch off %u op %08x f=%04x old_pc %08x imm %d\n",
+			       inter->offset, inter->op->c.opcode, inter->op->flags,
+			       old_pc, (s16)inter->op->c.i.imm);
 		next_pc = lightrec_emulate_block(inter->state, inter->block, next_pc);
 	}
 
@@ -1224,6 +1228,15 @@ u32 lightrec_emulate_block(struct lightrec_state *state, struct block *block, u3
 		return lightrec_emulate_block_list(state, block, offset);
 
 	pr_err(PC_FMT" is outside block at "PC_FMT"\n", pc, block->pc);
+	{
+		unsigned int i;
+		pr_err("PROBE nb_ops %u flags 0x%x cur_off %u\n",
+		       block->nb_ops, block->flags, block->nb_ops);
+		for (i = 0; i < block->nb_ops; i++)
+			pr_err("PROBE %2u: %08x f=%04x\n", i,
+			       block->opcode_list[i].c.opcode,
+			       block->opcode_list[i].flags);
+	}
 
 	lightrec_set_exit_flags(state, LIGHTREC_EXIT_SEGFAULT);
 

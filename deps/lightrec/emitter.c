@@ -316,21 +316,28 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 		/* Clean remaining registers */
 		lightrec_clean_regs(reg_cache, _jit);
 
-		target_offset = offset + 1 + (s16)op->i.imm
-			- !!op_flag_no_ds(op->flags);
-		pr_debug("Adding local branch to offset 0x%"PRIx32"\n",
-			 target_offset << 2);
-		branch = &state->local_branches[
-			state->nb_local_branches++];
+		if (op_flag_idle_loop(op->flags)) {
+			/* We have an idle loop that branched - we can skip
+			 * all the way to the next IRQ event. */
+			jit_lti(JIT_R2, LIGHTREC_REG_CYCLE, 0);
+			jit_movzr(LIGHTREC_REG_CYCLE, JIT_R2, JIT_R2);
+		} else {
+			target_offset = offset + 1 + (s16)op->i.imm
+				- !!op_flag_no_ds(op->flags);
+			pr_debug("Adding local branch to offset 0x%"PRIx32"\n",
+				 target_offset << 2);
+			branch = &state->local_branches[
+				state->nb_local_branches++];
 
-		branch->target = target_offset;
+			branch->target = target_offset;
 
-		if (no_indirection)
-			branch->branch = jit_new_node_pww(code2, NULL, rs, rt);
-		else if (is_forward)
-			branch->branch = jit_b();
-		else
-			branch->branch = jit_bgti(LIGHTREC_REG_CYCLE, 0);
+			if (no_indirection)
+				branch->branch = jit_new_node_pww(code2, NULL, rs, rt);
+			else if (is_forward)
+				branch->branch = jit_b();
+			else
+				branch->branch = jit_bgti(LIGHTREC_REG_CYCLE, 0);
+		}
 	}
 
 	if (!op_flag_local_branch(op->flags) || !is_forward) {
@@ -541,22 +548,22 @@ static void rec_alu_shiftv(struct lightrec_cstate *state, const struct block *bl
 }
 
 static void rec_movi(struct lightrec_cstate *state,
-		     const struct block *block, u16 offset)
+		     const struct block *block, u16 offset, bool is_io)
 {
 	struct regcache *reg_cache = state->reg_cache;
 	union code c = block->opcode_list[offset].c;
 	jit_state_t *_jit = block->_jit;
 	u16 flags = REG_EXT;
 	s32 value = (s32)(s16) c.i.imm;
-	u8 rt;
+	u8 rt, reg = is_io ? c.i.rs : c.r.rt;
 
 	if (op_flag_movi(block->opcode_list[offset].flags))
-		value += (s32)((u32)state->movi_temp[c.i.rt] << 16);
+		value += (s32)((u32)state->movi_temp[reg] << 16);
 
 	if (value >= 0)
 		flags |= REG_ZEXT;
 
-	rt = lightrec_alloc_reg_out(reg_cache, _jit, c.i.rt, flags);
+	rt = lightrec_alloc_reg_out(reg_cache, _jit, reg, flags);
 
 	jit_movi(rt, value);
 
@@ -573,7 +580,7 @@ static void rec_ADDIU(struct lightrec_cstate *state,
 	if (op->i.rs && !op_flag_movi(op->flags))
 		rec_alu_imm(state, block, offset, jit_code_addi, false);
 	else
-		rec_movi(state, block, offset);
+		rec_movi(state, block, offset, false);
 }
 
 static void rec_ADDI(struct lightrec_cstate *state,
@@ -654,15 +661,19 @@ static void rec_ORI(struct lightrec_cstate *state,
 	const struct opcode *op = &block->opcode_list[offset];
 	struct regcache *reg_cache = state->reg_cache;
 	jit_state_t *_jit = block->_jit;
+	u16 flags = REG_EXT;
 	s32 val;
 	u8 rt;
 
 	_jit_name(_jit, __func__);
 
 	if (op_flag_movi(op->flags)) {
-		rt = lightrec_alloc_reg_out(reg_cache, _jit, op->i.rt, REG_EXT);
-
 		val = ((u32)state->movi_temp[op->i.rt] << 16) | op->i.imm;
+		if (val >= 0)
+			flags |= REG_ZEXT;
+
+		rt = lightrec_alloc_reg_out(reg_cache, _jit, op->i.rt, flags);
+
 		jit_movi(rt, val);
 
 		lightrec_free_reg(reg_cache, rt);
@@ -1223,8 +1234,10 @@ static void rec_io(struct lightrec_cstate *state,
 
 	jit_note(__FILE__, __LINE__);
 
-	if (op_flag_movi(block->opcode_list[offset].flags)) {
-		rec_movi(state, block, offset);
+	/* A LUI folded into this load (LIGHTREC_MOVI) was not emitted: the
+	 * full address has to be built here, as rec_load_memory does. */
+	if (op_flag_movi(flags)) {
+		rec_movi(state, block, offset, true);
 		c.i.imm = 0;
 	}
 
@@ -1755,7 +1768,7 @@ static void rec_load_memory(struct lightrec_cstate *cstate,
 		flags |= REG_ZEXT;
 
 	if (op_flag_movi(op->flags)) {
-		rec_movi(cstate, block, offset);
+		rec_movi(cstate, block, offset, true);
 		c.i.imm = 0;
 	}
 
@@ -1871,7 +1884,7 @@ static void rec_load_direct(struct lightrec_cstate *cstate,
 	jit_note(__FILE__, __LINE__);
 
 	if (op_flag_movi(op->flags)) {
-		rec_movi(cstate, block, offset);
+		rec_movi(cstate, block, offset, true);
 		c.i.imm = 0;
 	}
 
