@@ -172,6 +172,7 @@ struct lightrec_state {
 	u32 curr_pc;
 	u32 next_pc;
 	uintptr_t wrapper_regs[NUM_TEMPS];
+	uintptr_t wrapper_cycle;
 	u8 in_delay_slot_n;
 	u32 current_cycle;
 	u32 target_cycle;
