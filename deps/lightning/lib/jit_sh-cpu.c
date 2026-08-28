@@ -2932,6 +2932,8 @@ _ldxi_c(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 			movr(r0, r1);
 			ldxi_c(r0, r0, i0);
 		}
+	} else if (i0 == 0) {
+		LDB(r0, r1);
 	} else if (i0 >= 0 && i0 <= 0xf) {
 		LDDB(r1, i0);
 		movr(r0, _R0);
@@ -2954,6 +2956,8 @@ _ldxi_s(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 			movr(r0, r1);
 			ldxi_s(r0, r0, i0);
 		}
+	} else if (i0 == 0) {
+		LDW(r0, r1);
 	} else if (i0 >= 0 && i0 <= 0x1f && !(i0 & 0x1)) {
 		LDDW(r1, i0 >> 1);
 		movr(r0, _R0);
@@ -2989,6 +2993,11 @@ _ldxi_uc(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 {
 	assert(r1 != _R0);
 
+	if (i0 == 0 && r1 != _GBR) {
+		LDB(r0, r1);
+		EXTUB(r0, r0);
+		return;
+	}
 	ldxi_c(_R0, r1, i0);
 	extr_uc(r0, _R0);
 }
@@ -2998,6 +3007,11 @@ _ldxi_us(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 {
 	assert(r1 != _R0);
 
+	if (i0 == 0 && r1 != _GBR) {
+		LDW(r0, r1);
+		EXTUW(r0, r0);
+		return;
+	}
 	ldxi_s(_R0, r1, i0);
 	extr_us(r0, _R0);
 }
@@ -3115,6 +3129,8 @@ _stxi_c(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0, jit_uint16_t r1)
 			stxi_c(i0, rn(reg), r1);
 			jit_unget_reg(reg);
 		}
+	} else if (i0 == 0) {
+		STB(r0, r1);
 	} else if (r0 != _R0 && i0 >= 0 && i0 <= 0xf) {
 		movr(_R0, r1);
 		STDB(r0, i0);
@@ -3141,6 +3157,8 @@ _stxi_s(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0, jit_uint16_t r1)
 			stxi_s(i0, rn(reg), r1);
 			jit_unget_reg(reg);
 		}
+	} else if (i0 == 0) {
+		STW(r0, r1);
 	} else if (r0 != _R0 && i0 >= 0 && i0 <= 0x1f && !(i0 & 0x1)) {
 		movr(_R0, r1);
 		STDW(r0, i0 >> 1);

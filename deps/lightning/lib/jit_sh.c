@@ -681,7 +681,7 @@ _emit_code(jit_state_t *_jit)
 		else {							\
 		    word = _jit->code.length				\
 			- (_jit->pc.uc - _jit->code.ptr);		\
-		    if (word < 4094) {					\
+		    if (word < 4094 && !(node->flag & jit_flag_vfar)) {	\
 			word = name##r##type(0, rn(node->v.w),		\
 					     rn(node->w.w));		\
 		    } else {						\
@@ -703,7 +703,7 @@ _emit_code(jit_state_t *_jit)
 		else {							\
 		    word = _jit->code.length				\
 			- (_jit->pc.uc - _jit->code.ptr);		\
-		    if (word < 4094) {					\
+		    if (word < 4094 && !(node->flag & jit_flag_vfar)) {	\
 			word = name##i##type(0, rn(node->v.w),		\
 					     node->w.w);		\
 		    } else {						\
@@ -1286,17 +1286,27 @@ _emit_code(jit_state_t *_jit)
 		    jit_word_t bw = _jitc->patches.ptr[offset].inst;
 		    jit_uint16_t bop = *(jit_uint16_t *)bw;
 		    jit_word_t bdisp;
-		    if (bn->code == jit_code_movi || (bn->flag & jit_flag_far))
+		    if (bn->code == jit_code_movi || (bn->flag & jit_flag_vfar))
 			continue;
 		    if ((bop & 0xf900) == 0x8900) {		/* BT/BF(/S) */
 			temp = bn->u.n;
 			bdisp = ((temp->u.w - bw) >> 1) - 2;
-			if (!(temp->flag & jit_flag_patch) ||
-			    bdisp < -128 || bdisp > 127) {
-			    bn->flag |= jit_flag_far;
-			    _jitc->again = 1;
+			if (!(bn->flag & jit_flag_far)) {
+			    if (!(temp->flag & jit_flag_patch) ||
+				bdisp < -128 || bdisp > 127) {
+				bn->flag |= jit_flag_far;
+				_jitc->again = 1;
+			    }
+			} else {
+			    /* Reserved form: the BRA sits one word behind. */
+			    if (!(temp->flag & jit_flag_patch) ||
+				bdisp - 1 < -2048 || bdisp - 1 > 2046) {
+				bn->flag |= jit_flag_vfar;
+				_jitc->again = 1;
+			    }
 			}
-		    } else if ((bop & 0xf000) == 0xa000) {	/* BRA */
+		    } else if ((bop & 0xf000) == 0xa000 &&
+			       !(bn->flag & jit_flag_far)) {	/* BRA */
 			temp = bn->u.n;
 			bdisp = ((temp->u.w - bw) >> 1) - 2;
 			if (!(temp->flag & jit_flag_patch) ||
