@@ -151,6 +151,10 @@ struct lightrec_branch {
 struct lightrec_branch_target {
 	struct jit_node *label;
 	u32 offset;
+	/* Where local branches and the fall-through land; `label` is the
+	 * out-of-line entry used by the code LUT, which first loads the
+	 * pinned registers (regcache.c). */
+	jit_node_t *local_label;
 };
 
 enum c_wrappers {
@@ -205,6 +209,7 @@ struct lightrec_state {
 	struct reaper *reaper;
 	void *tlsf;
 	void (*eob_wrapper_func)(void);
+	void (*eob_wrapper_pins_func)(void);
 	void (*interpreter_func)(void);
 	void (*ds_check_func)(void);
 	void (*memset_func)(void);

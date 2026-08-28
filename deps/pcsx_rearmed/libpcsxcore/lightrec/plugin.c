@@ -115,6 +115,13 @@ enum my_cp2_opcodes {
 };
 
 
+/* Fixed-point scale between PCSX cycles and lightrec's cycle counter. It
+ * carries the fractional cycle multiplier (175% -> 7 at scale 4, exact).
+ * It used to be 1024, which pushed every per-block cycle decrement out of
+ * SH-4's 8-bit add-immediate range: three emitted instructions per block
+ * exit (`mov #n,r0; shll8 r0; add r0,r1`) where `add #-n,r1` does. */
+#define CYCLE_SCALE 4
+
 static char cache_buf[64 * 1024];
 
 static void cop2_op(struct lightrec_state *state, u32 func)
@@ -298,7 +305,7 @@ static inline s32 wallclock_slice(s32 cycles)
 
 static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
-	u32 counted = lightrec_current_cycle_count(state) / 1024;
+	u32 counted = lightrec_current_cycle_count(state) / CYCLE_SCALE;
 	u32 elapsed = wallclock_elapsed_cycles();
 	u32 cap = counted * WALL_CATCHUP + WALL_FLOOR
 		+ wall_ticks_to_cycles(wall_charge_ticks);
@@ -322,7 +329,7 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 	if (block_stepping || cycles_left <= 0 || has_interrupt())
 		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 	else {
-		lightrec_set_target_cycle_count(state, cycles_left * 1024);
+		lightrec_set_target_cycle_count(state, cycles_left * CYCLE_SCALE);
 	}
 }
 
@@ -846,7 +853,7 @@ static void lightrec_plugin_execute_internal(bool block_only)
 	if (use_pcsx_interpreter) {
 		psxInt.ExecuteBlock(&psxRegs, 0);
 	} else {
-		u32 cycles_lightrec = cycles_pcsx * 1024;
+		u32 cycles_lightrec = cycles_pcsx * CYCLE_SCALE;
 		if (unlikely(use_lightrec_interpreter)) {
 			psxRegs.pc = lightrec_run_interpreter(lightrec_state,
 							      psxRegs.pc,
@@ -943,12 +950,12 @@ static void lightrec_plugin_apply_config()
 	static u32 cycles_per_op_old;
 	u32 cycle_mult = Config.cycle_multiplier_override && Config.cycle_multiplier == CYCLE_MULT_DEFAULT
 		? Config.cycle_multiplier_override : Config.cycle_multiplier;
-	u32 cycles_per_op = cycle_mult * 1024 / 100;
+	u32 cycles_per_op = (cycle_mult * CYCLE_SCALE + 50) / 100;
 	assert(cycles_per_op);
 
 	if (cycles_per_op_old && cycles_per_op_old != cycles_per_op) {
 		SysPrintf("lightrec: reinit block cache for cycles_per_op %.2f\n",
-			cycles_per_op / 1024.f);
+			cycles_per_op / (float)CYCLE_SCALE);
 	}
 	cycles_per_op_old = cycles_per_op;
 	lightrec_set_cycles_per_opcode(lightrec_state, cycles_per_op);

@@ -62,8 +62,11 @@ static void rec_cp2_do_mfc2(struct lightrec_cstate *state,
 static void
 lightrec_jump_to_fn(jit_state_t *_jit, void (*fn)(void))
 {
-	/* Prevent jit_jmpi() from using our cycles register as a temporary */
+	/* Prevent jit_jmpi() from using our cycles register, or the handoff
+	 * registers the dispatcher reads, as its temporary */
 	jit_live(LIGHTREC_REG_CYCLE);
+	jit_live(LIGHTREC_REG_PC);
+	jit_live(LIGHTREC_REG_AUX);
 
 	jit_patch_abs(jit_jmpi(), fn);
 }
@@ -77,8 +80,8 @@ lightrec_jump_to_eob(struct lightrec_cstate *state, jit_state_t *_jit)
 static void lightrec_jump_to_fast_eob(struct lightrec_cstate *state,
 				      jit_state_t *_jit, u32 offset)
 {
-	/* Load the LUT entry address to JIT_V1 where the dispatcher expects it */
-	jit_movi(JIT_V1, (uintptr_t)lut_address(state->state, offset));
+	/* Load the LUT entry address to LIGHTREC_REG_AUX where the dispatcher expects it */
+	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)lut_address(state->state, offset));
 
 	lightrec_jump_to_fn(_jit, state->state->fast_eob);
 }
@@ -97,30 +100,35 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 
 	if (lightrec_store_next_pc()
 	    || state->nb_links >= ARRAY_SIZE(state->links)) {
+		lightrec_regcache_store_pins(state->reg_cache, _jit);
 		lightrec_jump_to_fast_eob(state, _jit, offset);
 		return;
 	}
 
+	/* Pinned registers cross the link in their registers (the target
+	 * is entered behind its load stub, links.c); only the fallback to
+	 * the dispatcher writes them back. */
 	to_eob = jit_blei(LIGHTREC_REG_CYCLE, 0);
 
 	/* What the dispatcher provides on block entry: curr_pc synced, and
 	 * the address mask blocks are compiled to expect. */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, LIGHTREC_REG_PC);
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
 
-	jit_movi(JIT_V1, LINK_MAGIC(state->nb_links));
+	jit_movi(LIGHTREC_REG_AUX, LINK_MAGIC(state->nb_links));
 
 	jit_live(LIGHTREC_REG_CYCLE);
-	jit_live(JIT_V0);
+	jit_live(LIGHTREC_REG_PC);
 	jit_live(JIT_R1);
-	jit_jmpr(JIT_V1);
+	jit_jmpr(LIGHTREC_REG_AUX);
 
 	state->links[state->nb_links].offset = offset;
 	state->links[state->nb_links].magic = LINK_MAGIC(state->nb_links);
 	state->nb_links++;
 
 	jit_patch(to_eob);
+	lightrec_regcache_store_pins(state->reg_cache, _jit);
 	lightrec_jump_to_fast_eob(state, _jit, offset);
 }
 
@@ -177,8 +185,9 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 			lightrec_rec_opcode(state, block, offset + 1);
 	}
 
-	/* Clean the remaining registers */
-	lightrec_clean_regs(reg_cache, _jit);
+	/* Clean the remaining registers; the pins stay in their registers
+	 * for a direct link, and are stored on every other way out. */
+	lightrec_regcache_clean_unpinned(reg_cache, _jit);
 
 	if (cycles && update_cycles) {
 		jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, cycles);
@@ -191,9 +200,10 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 		 * will be written after the first opcode of the target is
 		 * executed. Handle this by jumping to a special section of
 		 * the dispatcher. It expects the loaded value to be in
-		 * REG_TEMP, and the target register number to be in JIT_V1.*/
-		jit_movi(JIT_V1, ds->c.i.rt);
+		 * REG_TEMP, and the target register number to be in LIGHTREC_REG_AUX.*/
+		jit_movi(LIGHTREC_REG_AUX, ds->c.i.rt);
 
+		lightrec_regcache_store_pins(reg_cache, _jit);
 		lightrec_jump_to_ds_check(state, _jit);
 	} else if (reg_new_pc < 0) {
 		/* We already know the target: we can try to load it directly
@@ -202,6 +212,7 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 	} else if (is_known(state->v, reg_new_pc)) {
 		lightrec_jump_to_known_eob(state, _jit, state->v[reg_new_pc].value);
 	} else {
+		lightrec_regcache_store_pins(reg_cache, _jit);
 		lightrec_jump_to_eob(state, _jit);
 	}
 
@@ -216,12 +227,12 @@ void lightrec_emit_jump_to_interpreter(struct lightrec_cstate *state,
 
 	lightrec_clean_regs(reg_cache, _jit);
 
-	/* Call the interpreter with the block's address in JIT_V1 and the
-	 * PC (which might have an offset) in JIT_V0. */
+	/* Call the interpreter with the block's address in LIGHTREC_REG_AUX and the
+	 * PC (which might have an offset) in LIGHTREC_REG_PC. */
 	lightrec_load_next_pc_imm(reg_cache, _jit, block->pc,
 				  block->pc + (offset << 2));
 
-	jit_movi(JIT_V1, (uintptr_t)block);
+	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)block);
 
 	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 	lightrec_jump_to_fn(_jit, state->state->interpreter_func);
@@ -234,7 +245,7 @@ static void lightrec_emit_eob(struct lightrec_cstate *state,
 	jit_state_t *_jit = block->_jit;
 	u32 imm = block->pc + (offset << 2);
 
-	lightrec_clean_regs(reg_cache, _jit);
+	lightrec_regcache_clean_unpinned(reg_cache, _jit);
 
 	lightrec_load_next_pc_imm(reg_cache, _jit, block->pc, imm);
 
@@ -299,9 +310,14 @@ static void lightrec_do_early_unload(struct lightrec_cstate *state,
 	for (i = 0; i < ARRAY_SIZE(reg_ops); i++) {
 		reg = reg_ops[i].reg;
 
+		/* A pinned register keeps its home and its dirt: it goes
+		 * back to the state block at the exits, not at its last use.
+		 * A discarded one just drops the dirt. */
 		switch (reg_ops[i].op) {
 		case LIGHTREC_REG_UNLOAD:
-			lightrec_clean_reg_if_loaded(reg_cache, _jit, reg, true);
+			if (!lightrec_reg_is_pinned(reg))
+				lightrec_clean_reg_if_loaded(reg_cache, _jit,
+							     reg, true);
 			break;
 
 		case LIGHTREC_REG_DISCARD:
@@ -309,7 +325,9 @@ static void lightrec_do_early_unload(struct lightrec_cstate *state,
 			break;
 
 		case LIGHTREC_REG_CLEAN:
-			lightrec_clean_reg_if_loaded(reg_cache, _jit, reg, false);
+			if (!lightrec_reg_is_pinned(reg))
+				lightrec_clean_reg_if_loaded(reg_cache, _jit,
+							     reg, false);
 			break;
 		default:
 			break;
@@ -382,8 +400,8 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 		if (link)
 			update_ra_register(reg_cache, _jit, 31, block->pc, link);
 
-		/* Clean remaining registers */
-		lightrec_clean_regs(reg_cache, _jit);
+		/* Clean remaining registers; pinned ones stay put */
+		lightrec_regcache_local_edge(reg_cache, _jit);
 
 		if (op_flag_idle_loop(op->flags)) {
 			/* We have an idle loop that branched - we can skip
@@ -524,7 +542,8 @@ static void rec_alloc_rs_rd(struct regcache *reg_cache,
 		discard = unload_flags == LIGHTREC_REG_DISCARD;
 	}
 
-	if (OPT_EARLY_UNLOAD && rs && rd != rs && (unload || discard)) {
+	if (OPT_EARLY_UNLOAD && rs && rd != rs && (unload || discard) &&
+	    !lightrec_reg_is_pinned(rs) && !lightrec_reg_is_pinned(rd)) {
 		rs = lightrec_alloc_reg_in(reg_cache, _jit, rs, in_flags);
 		lightrec_remap_reg(reg_cache, _jit, rs, rd, discard);
 		lightrec_set_reg_out_flags(reg_cache, rs, out_flags);
@@ -1258,34 +1277,28 @@ static void call_to_c_wrapper(struct lightrec_cstate *state,
 {
 	struct regcache *reg_cache = state->reg_cache;
 	jit_state_t *_jit = block->_jit;
-	s8 tmp, tmp2;
+	s8 tmp2;
 
 	/* Make sure JIT_R1 is not mapped; it will be used in the C wrapper. */
 	tmp2 = lightrec_alloc_reg(reg_cache, _jit, JIT_R1);
 
 	jit_movi(tmp2, (unsigned int)wrapper << (1 + __WORDSIZE / 32));
 
-	tmp = lightrec_alloc_reg_temp_with_value(reg_cache, _jit,
-						 (intptr_t)state->state->c_wrapper);
+	/* The wrapper block preserves r1-r3 itself; r4-r7 slots are ours. */
+	lightrec_save_argregs(reg_cache, _jit);
 
-	lightrec_free_reg(reg_cache, tmp2);
-
-#ifdef __mips__
-	/* On MIPS, register t9 is always used as the target register for JALR.
-	 * Therefore if it does not contain the target address we must
-	 * invalidate it. */
-	if (tmp != _T9)
-		lightrec_unload_reg(reg_cache, _jit, _T9);
-#endif
-
+	/* Call by address: a temporary holding it could be r4, which the
+	 * argument push below overwrites (r4-r7 are allocator slots). */
 	jit_prepare();
 	jit_pushargi(arg);
 
 	lightrec_regcache_mark_live(reg_cache, _jit);
-	jit_callr(tmp);
+	jit_finishi((jit_pointer_t)state->state->c_wrapper);
 
-	lightrec_free_reg(reg_cache, tmp);
+	lightrec_free_reg(reg_cache, tmp2);
 	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	lightrec_restore_argregs(reg_cache, _jit);
 }
 
 static void rec_io(struct lightrec_cstate *state,
@@ -2236,8 +2249,14 @@ static bool rec_store_hw_call(struct lightrec_cstate *cstate,
 
 	lightrec_save_temps(reg_cache, _jit);
 
-	/* See rec_load_hw_call: stage in r2/r3, state last. */
-	if (rt == JIT_R1) {
+	/* See rec_load_hw_call: stage in r2/r3, state last. Both may
+	 * already be allocator registers, so order the moves (or go
+	 * through r0) so neither clobbers the other. */
+	if (rt == JIT_R1 && tmp == JIT_R2) {
+		jit_movr(_R0, tmp);
+		jit_movr(JIT_R2, rt);
+		jit_movr(JIT_R1, _R0);
+	} else if (rt == JIT_R1) {
 		jit_movr(JIT_R2, rt);
 		jit_movr(JIT_R1, tmp);
 	} else {
@@ -2954,7 +2973,8 @@ static void rec_meta_MOV(struct lightrec_cstate *state,
 	discard_rs = OPT_EARLY_UNLOAD
 		&& LIGHTREC_FLAGS_GET_RS(op->flags) == LIGHTREC_REG_DISCARD;
 
-	if ((unload_rs || discard_rs) && c.m.rs) {
+	if ((unload_rs || discard_rs) && c.m.rs &&
+	    !lightrec_reg_is_pinned(c.m.rs) && !lightrec_reg_is_pinned(c.m.rd)) {
 		/* If the source register is going to be unloaded or discarded,
 		 * then we can simply mark its host register as now pointing to
 		 * the destination register. */
@@ -3475,13 +3495,13 @@ void lightrec_rec_opcode(struct lightrec_cstate *state,
 			jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 		state->cycles = 0;
 
-		lightrec_storeback_regs(reg_cache, _jit);
-		lightrec_regcache_reset(reg_cache);
+		lightrec_regcache_sync_target(reg_cache, _jit);
 
 		pr_debug("Adding branch target at offset 0x%x\n", offset << 2);
 		target = &state->targets[state->nb_targets++];
 		target->offset = offset;
-		target->label = jit_indirect();
+		target->local_label = jit_label();
+		target->label = NULL;	/* entry stub, emitted at block end */
 	}
 
 	if (likely(op->opcode)) {

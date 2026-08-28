@@ -10,11 +10,33 @@
 #include "lightrec-config.h"
 
 #if defined(__sh__) && OPT_SH4_USE_GBR
-#  define NUM_REGS JIT_V_NUM
+#  define NUM_VREGS JIT_V_NUM
 #  define LIGHTREC_REG_STATE _GBR
 #else
-#  define NUM_REGS (JIT_V_NUM - 1)
+#  define NUM_VREGS (JIT_V_NUM - 1)
 #  define LIGHTREC_REG_STATE (JIT_V(JIT_V_NUM - 1))
+#endif
+
+/* SH-4: the argument registers r4-r7 are allocator slots too (bloop's pool
+ * is r3-r12). They are caller-saved, so they are spilled around C calls,
+ * but only when they hold something (lightrec_save_temps). */
+#if defined(__sh__)
+#  define NUM_ARGREGS 4
+#else
+#  define NUM_ARGREGS 0
+#endif
+#define NUM_REGS (NUM_VREGS + NUM_ARGREGS)
+
+/* Block <-> dispatcher handoff registers: the next PC, and the LUT entry
+ * address / block pointer / delay-slot register number. On SH-4 these are
+ * r4/r5 - dead at every block exit - so that r8-r12 stay free for pinned
+ * guest registers; the dispatcher copies them into its own locals. */
+#if defined(__sh__)
+#  define LIGHTREC_REG_PC _R4
+#  define LIGHTREC_REG_AUX _R5
+#else
+#  define LIGHTREC_REG_PC JIT_V0
+#  define LIGHTREC_REG_AUX JIT_V1
 #endif
 
 #if defined(__powerpc__)
@@ -22,6 +44,13 @@
 /* JIT_R0 is callee-saved on PowerPC, we have to use something else */
 #  define LIGHTREC_REG_CYCLE _R10
 #  define FIRST_TEMP 0
+#elif defined(__sh__)
+/* r1 is the cycle counter, r2 the one allocator temporary; r3 is left to
+ * lightning, which needs a free register of its own for long branches and
+ * wide displacements - with the r4-r7 pool it would otherwise have none. */
+#  define NUM_TEMPS 1
+#  define LIGHTREC_REG_CYCLE JIT_R0
+#  define FIRST_TEMP 1
 #else
 #  define NUM_TEMPS (JIT_R_NUM - 1)
 #  define LIGHTREC_REG_CYCLE JIT_R0
@@ -81,6 +110,25 @@ void lightrec_unload_reg(struct regcache *cache, jit_state_t *_jit, u8 jit_reg);
 void lightrec_storeback_regs(struct regcache *cache, jit_state_t *_jit);
 _Bool lightrec_has_dirty_regs(struct regcache *cache);
 
+/* Pinned guest registers - see the contract in regcache.c. */
+#if defined(__sh__) && OPT_SH4_USE_GBR
+#  define LIGHTREC_NUM_PINNED 6
+#elif defined(__sh__)
+#  define LIGHTREC_NUM_PINNED 4
+#else
+#  define LIGHTREC_NUM_PINNED 0
+#endif
+/* Size of the code-LUT entry stub in front of every block / target. */
+#define LIGHTREC_PIN_STUB_BYTES (2 * LIGHTREC_NUM_PINNED)
+_Bool lightrec_reg_is_pinned(u16 reg);
+void lightrec_regcache_pin_block(struct regcache *cache, jit_state_t *_jit);
+void lightrec_regcache_local_edge(struct regcache *cache, jit_state_t *_jit);
+void lightrec_regcache_sync_target(struct regcache *cache, jit_state_t *_jit);
+void lightrec_regcache_clean_unpinned(struct regcache *cache, jit_state_t *_jit);
+void lightrec_regcache_store_pins(struct regcache *cache, jit_state_t *_jit);
+void lightrec_regcache_entry_loads(struct regcache *cache, jit_state_t *_jit);
+void lightrec_regcache_pin_stores_raw(jit_state_t *_jit);
+
 _Bool lightrec_reg_is_loaded(struct regcache *cache, u16 reg);
 void lightrec_clean_reg_if_loaded(struct regcache *cache, jit_state_t *_jit,
 				  u16 reg, _Bool unload);
@@ -101,5 +149,7 @@ __cnst const char * lightrec_reg_name(u8 reg);
 void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit);
 void lightrec_save_temps(struct regcache *cache, jit_state_t *_jit);
 void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit);
+void lightrec_save_argregs(struct regcache *cache, jit_state_t *_jit);
+void lightrec_restore_argregs(struct regcache *cache, jit_state_t *_jit);
 
 #endif /* __REGCACHE_H__ */
