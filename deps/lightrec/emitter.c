@@ -2475,13 +2475,16 @@ static void
 rec_mfc0(struct lightrec_cstate *state, const struct block *block, u16 offset)
 {
 	struct regcache *reg_cache = state->reg_cache;
-	union code c = block->opcode_list[offset].c;
+	const struct opcode *op = &block->opcode_list[offset];
+	union code c = op->c;
 	jit_state_t *_jit = block->_jit;
+	bool load_delay = op_flag_load_delay(op->flags) && !state->no_load_delay;
 	u8 rt;
 
 	jit_note(__FILE__, __LINE__);
 
-	rt = lightrec_alloc_reg_out(reg_cache, _jit, c.i.rt, REG_EXT);
+	rt = lightrec_alloc_reg_out(reg_cache, _jit,
+				    load_delay ? REG_TEMP : c.i.rt, REG_EXT);
 
 	jit_ldxi_i(rt, LIGHTREC_REG_STATE, lightrec_offset(regs.cp0[c.r.rd]));
 
@@ -2731,17 +2734,22 @@ static void rec_cp2_do_mfc2(struct lightrec_cstate *state,
 static void rec_cp2_basic_MFC2(struct lightrec_cstate *state,
 			       const struct block *block, u16 offset)
 {
-	const union code c = block->opcode_list[offset].c;
+	const struct opcode *op = &block->opcode_list[offset];
+	bool load_delay = op_flag_load_delay(op->flags) && !state->no_load_delay;
 
-	rec_cp2_do_mfc2(state, block, offset, c.r.rd, c.r.rt);
+	rec_cp2_do_mfc2(state, block, offset, op->c.r.rd,
+			load_delay ? REG_TEMP : op->c.r.rt);
 }
 
 static void rec_cp2_basic_CFC2(struct lightrec_cstate *state,
 			       const struct block *block, u16 offset)
 {
 	struct regcache *reg_cache = state->reg_cache;
-	const union code c = block->opcode_list[offset].c;
+	const struct opcode *op = &block->opcode_list[offset];
+	const union code c = op->c;
 	jit_state_t *_jit = block->_jit;
+	bool load_delay = op_flag_load_delay(op->flags) && !state->no_load_delay;
+	u8 out_reg = load_delay ? REG_TEMP : c.r.rt;
 	u8 rt;
 
 	_jit_name(block->_jit, __func__);
@@ -2760,11 +2768,11 @@ static void rec_cp2_basic_CFC2(struct lightrec_cstate *state,
 	case 27:
 	case 29:
 	case 30:
-		rt = lightrec_alloc_reg_out(reg_cache, _jit, c.r.rt, REG_EXT);
+		rt = lightrec_alloc_reg_out(reg_cache, _jit, out_reg, REG_EXT);
 		jit_ldxi_s(rt, LIGHTREC_REG_STATE, cp2c_s_offset(c.r.rd));
 		break;
 	default:
-		rt = lightrec_alloc_reg_out(reg_cache, _jit, c.r.rt, REG_ZEXT);
+		rt = lightrec_alloc_reg_out(reg_cache, _jit, out_reg, REG_ZEXT);
 		jit_ldxi_ui(rt, LIGHTREC_REG_STATE, cp2c_i_offset(c.r.rd));
 		break;
 	}

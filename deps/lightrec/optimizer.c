@@ -1324,7 +1324,7 @@ static int lightrec_switch_delay_slots(struct lightrec_state *state, struct bloc
 		if (op_flag_sync(next->flags))
 			continue;
 
-		if (op_flag_load_delay(next->flags) && opcode_is_load(next_op))
+		if (op_flag_load_delay(next->flags) && opcode_has_load_delay(next_op))
 			continue;
 
 		if (!lightrec_can_switch_delay_slot(list->c, next_op))
@@ -1355,9 +1355,12 @@ static int lightrec_detect_impossible_branches(struct lightrec_state *state,
 		op = next;
 		next = &list[i + 1];
 
+		/* A MFC/CFC in the delay slot is a load delay, and is handled
+		 * by the same REG_TEMP + ds_check path as a load in the delay
+		 * slot (see rec_mfc0 / rec_cp2_basic_MFC2 / CFC2), so it does
+		 * not need the interpreter. */
 		if (!has_delay_slot(op->c) ||
 		    (!has_delay_slot(next->c) &&
-		     !opcode_is_mfc(next->c) &&
 		     !(next->i.op == OP_CP0 && next->r.rs == OP_CP0_RFE)))
 			continue;
 
@@ -1573,7 +1576,7 @@ static int lightrec_local_branches(struct lightrec_state *state, struct block *b
 		pr_debug("Found local branch to offset 0x%"PRIx32"\n", offset << 2);
 
 		ds = get_delay_slot(block->opcode_list, i);
-		if (op_flag_load_delay(ds->flags) && opcode_is_load(ds->c)) {
+		if (op_flag_load_delay(ds->flags) && opcode_has_load_delay(ds->c)) {
 			pr_debug("Branch delay slot has a load delay - skip\n");
 			continue;
 		}
