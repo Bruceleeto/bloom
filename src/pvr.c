@@ -524,6 +524,59 @@ static inline uint32_t max32(uint32_t a, uint32_t b)
 	return a < b ? b : a;
 }
 
+static void clear_framebuffer(uint16_t x0, uint16_t y0,
+			      uint16_t w0, uint16_t h0, uint16_t c);
+
+/* GP0(02) fills a VRAM rectangle. In the hardware path the PVR draws
+ * that fill as a quad, so the 16-bit shadow copy only matters to a later
+ * reader of that region of VRAM: texture/palette loads, VRAM reads and
+ * copies, savestates. Record the rectangle and apply it when one of those
+ * readers touches it, instead of filling ~150 KB through the dcache on
+ * every frame. */
+#define PENDING_CLEARS 4
+
+struct pending_clear {
+	uint16_t x, y, w, h, color;
+};
+
+static struct pending_clear pending_clears[PENDING_CLEARS];
+static unsigned int nb_pending_clears;
+
+__noinline
+static void apply_pending_clears(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < nb_pending_clears; i++) {
+		clear_framebuffer(pending_clears[i].x, pending_clears[i].y,
+				  pending_clears[i].w, pending_clears[i].h,
+				  pending_clears[i].color);
+	}
+
+	nb_pending_clears = 0;
+}
+
+/* Coordinates in 16-bit VRAM words, like the rest of the file. */
+static inline void sync_pending_clears(unsigned int x, unsigned int y,
+				       unsigned int w, unsigned int h)
+{
+	const struct pending_clear *pc;
+	unsigned int i;
+
+	if (likely(!nb_pending_clears))
+		return;
+
+	for (i = 0; i < nb_pending_clears; i++) {
+		pc = &pending_clears[i];
+
+		if (x < pc->x + pc->w && pc->x < x + w
+		    && y < pc->y + pc->h && pc->y < y + h) {
+			apply_pending_clears();
+			return;
+		}
+	}
+}
+
 static inline unsigned int clut_get_offset(uint16_t clut)
 {
 	return ((clut >> 6) & 0x1ff) * 2048 + (clut & 0x3f) * 32;
@@ -557,6 +610,8 @@ static void load_palette(struct texture_page *page, unsigned int offset,
 		palette_addr = page->vq->codebook8[offset].palette;
 		nb = 256;
 	}
+
+	sync_pending_clears((clut & 0x3f) * 16, (clut >> 6) & 0x1ff, nb, 1);
 
 	sq = (uint64_t *)sq_lock(pvr_ptr_get_sq_addr(palette_addr));
 	palette = clut_get_ptr(clut);
@@ -790,6 +845,9 @@ static void load_block(struct texture_page *page, unsigned int page_offset,
 	const void *src = texture_page_get_addr(page_offset);
 	uint32_t *sq;
 	pvr_ptr_t dst;
+
+	sync_pending_clears((page_offset & 0xf) * 64 + x * 16,
+			    (page_offset / 16) * 256 + y * 16, 16, 16);
 
 	src += y * 16 * 2048 + x * 32;
 
@@ -1052,6 +1110,8 @@ void renderer_update_caches(int x, int y, int w, int h, int state_changed)
 
 void renderer_sync(void)
 {
+	if (unlikely(nb_pending_clears))
+		apply_pending_clears();
 }
 
 void renderer_notify_res_change(void)
@@ -2434,7 +2494,16 @@ static void cmd_clear_image(const union PacketBuffer *pbuffer)
 	if (h0 + y0 > 512)
 		h0 = 512 - y0;
 
-	clear_framebuffer(x0, y0, w0, h0, color);
+	if (WITH_24BPP && screen_bpp == 24) {
+		clear_framebuffer(x0, y0, w0, h0, color);
+	} else {
+		if (unlikely(nb_pending_clears == PENDING_CLEARS))
+			apply_pending_clears();
+
+		pending_clears[nb_pending_clears++] = (struct pending_clear){
+			.x = x0, .y = y0, .w = w0, .h = h0, .color = color,
+		};
+	}
 
 	pvr_update_caches(x0, y0, w0, h0, true);
 

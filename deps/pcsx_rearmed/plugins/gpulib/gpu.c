@@ -507,6 +507,7 @@ static noinline void start_vram_transfer(struct psx_gpu *gpu, uint32_t pos_word,
   renderer_flush_queues();
   if (is_read) {
     const uint16_t *mem = VRAM_MEM_XY(gpu->vram, gpu->dma.x, gpu->dma.y);
+    renderer_sync();
     gpu->status |= PSX_GPU_STATUS_IMG;
     // XXX: wrong for width 1
     gpu->gp0 = LE16TOH(mem[0]) | ((uint32_t)LE16TOH(mem[1]) << 16);
