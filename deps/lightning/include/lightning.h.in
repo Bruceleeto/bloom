@@ -163,6 +163,7 @@ typedef jit_int32_t		jit_fpr_t;
 #define jit_flag_data		0x0004	/* data in the constant pool */
 #define jit_flag_use		0x0008	/* do not remove marker label */
 #define jit_flag_synth		0x0010	/* synthesized instruction */
+#define jit_flag_far		0x0800	/* SH: branch/jump needs its long form */
 #define jit_flag_head		0x1000	/* label reached by normal flow */
 #define jit_flag_varargs	0x2000	/* call{r,i} to varargs function */
 

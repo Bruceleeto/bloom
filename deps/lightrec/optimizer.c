@@ -1529,6 +1529,21 @@ static int lightrec_swap_load_delays(struct lightrec_state *state,
 	return 0;
 }
 
+/*
+ * Hardware registers that only move when the scheduler runs an event: the
+ * GPU status word (GPU/DMA state), the IRQ status word and the DMA channel
+ * control words (busy bit).  Timers are not on the list - a counter changes
+ * every cycle, and a loop waiting on one is not waiting for an event.
+ */
+static bool lightrec_hw_reg_event_only(u32 kaddr)
+{
+	if (kaddr == 0x1f801814 || kaddr == 0x1f801070)
+		return true;
+
+	/* D0..D6 CHCR: 0x1f801088 + n * 0x10 */
+	return (kaddr & 0xffffff8f) == 0x1f801088 && kaddr <= 0x1f8010e8;
+}
+
 static bool lightrec_detect_idle_range(struct block *block, u16 min, u16 max)
 {
 	struct opcode *list = block->opcode_list;
@@ -1557,6 +1572,12 @@ static bool lightrec_detect_idle_range(struct block *block, u16 min, u16 max)
 			case LIGHTREC_IO_SCRATCH:
 			case LIGHTREC_IO_DIRECT_HW:
 				continue;
+			case LIGHTREC_IO_HW:
+				/* A poll of an event-driven register waits for
+				 * an event, like a poll of RAM does. */
+				if (op_flag_io_event(list[i].flags))
+					continue;
+				return false;
 			default:
 				return false;
 			}
@@ -1960,6 +1981,10 @@ static int lightrec_flag_io(struct lightrec_state *state, struct block *block)
 						pr_debug("Flagging opcode %u as I/O access\n",
 							 i);
 						list->flags |= LIGHTREC_IO_MODE(LIGHTREC_IO_HW);
+
+						if (!opcode_is_store(list->c) &&
+						    lightrec_hw_reg_event_only(kunseg_val))
+							list->flags |= LIGHTREC_IO_EVENT;
 					}
 					break;
 				default:

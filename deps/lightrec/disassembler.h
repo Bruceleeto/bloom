@@ -26,6 +26,11 @@
 #define LIGHTREC_NO_INVALIDATE	BIT(4)
 #define LIGHTREC_NO_MASK	BIT(5)
 #define LIGHTREC_LOAD_DELAY	BIT(6)
+/* A load from a hardware register whose value only changes when a scheduled
+ * event runs (GPU status, IRQ status, DMA channel control): a loop that does
+ * nothing but read it and branch is an idle loop, exactly as one polling a
+ * RAM word is. */
+#define LIGHTREC_IO_EVENT	BIT(10)
 
 /* I/O mode for load/store opcodes */
 #define LIGHTREC_IO_MODE_LSB	7
@@ -363,6 +368,11 @@ static inline _Bool op_flag_no_div_check(u32 flags)
 static inline _Bool op_flag_idle_loop(u32 flags)
 {
 	return OPT_DETECT_IDLE && (flags & LIGHTREC_IDLE_LOOP);
+}
+
+static inline _Bool op_flag_io_event(u32 flags)
+{
+	return OPT_FLAG_IO && (flags & LIGHTREC_IO_EVENT);
 }
 
 

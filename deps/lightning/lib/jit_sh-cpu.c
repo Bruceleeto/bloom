@@ -1512,10 +1512,12 @@ emit_branch_opcode(jit_state_t *_jit, jit_word_t i0, jit_word_t w,
 		else
 			BF(0);
 
-		/* Leave space after the BF/BT in case we need to add a
-		 * BRA opcode. */
-		w = _jit->code.length - (_jit->pc.uc + _jitc->ioff * 2 - _jit->code.ptr);
-		if (w > 254) {
+		/* Only a branch that a previous pass of this function found
+		 * out of 8-bit range keeps the two words behind it, where
+		 * patch_at() puts the BRA (jit_flag_far, see the epilog in
+		 * jit_sh.c). Everything else is emitted short and verified
+		 * there; a miss re-emits the function. */
+		if (_jitc->far) {
 			NOP();
 			NOP();
 		}
@@ -3659,6 +3661,17 @@ _jmpi_p(jit_state_t *_jit, jit_word_t i0)
 
     _jitc->idirect++;
     flush(1);
+
+    /* Forward jump inside the function: BRA reaches +-4 KiB, which the
+     * epilog verifies (jit_flag_far); the far form below is only for
+     * targets a previous pass found out of range. */
+    if (!_jitc->far) {
+	w = _jit->pc.w + _jitc->ioff * 2;
+	BRA(0);
+	NOP();
+	_jitc->idirect--;
+	return (w);
+    }
 
     reg = jit_get_reg(jit_class_gpr);
     w = movi_p(rn(reg), i0);

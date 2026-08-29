@@ -603,6 +603,7 @@ struct jit_function {
 
 /* data used only during jit generation */
 struct jit_compiler {
+    jit_bool_t		 far;		/* SH: node being emitted needs the long branch form */
 #if __ia64__
     struct {
 	jit_uint64_t	  i : 41;

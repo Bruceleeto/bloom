@@ -185,9 +185,20 @@ static inline void hw_light_write_done(struct lightrec_state *state)
 		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 }
 
+/*
+ * Bumped by every hardware write.  The GPU status poll-skipper below only
+ * fast-forwards when nothing has been written to hardware since the previous
+ * read: a loop that reads GPUSTAT at a steady rhythm while feeding the GPU or
+ * a DMA channel is working, not waiting, and skipping time under it hands the
+ * guest an interrupt in the middle of that work.  (Spyro, 2026-08-29: this
+ * was the state corruption blamed on the threaded compiler.)
+ */
+static u32 hw_write_epoch;
+
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	hw_write_epoch++;
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite8(mem, val);
@@ -195,9 +206,11 @@ static void hw_write_byte(struct lightrec_state *state,
 	lightrec_tansition_from_pcsx(state);
 }
 
+
 static void hw_write_half(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	hw_write_epoch++;
 	if (hw_is_irq_reg(mem)) {
 		psxHwWrite16(mem, val);
 		hw_light_write_done(state);
@@ -213,6 +226,7 @@ static void hw_write_half(struct lightrec_state *state,
 static void hw_write_word(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	hw_write_epoch++;
 	if (hw_is_irq_reg(mem)) {
 		psxHwWrite32(mem, val);
 		hw_light_write_done(state);
@@ -257,7 +271,8 @@ static u16 hw_read_half(struct lightrec_state *state,
 static u32 hw_read_word(struct lightrec_state *state,
 			u32 op, void *host, u32 mem)
 {
-	static u32 old_cycle, oldold_cycle, old_gpusr;
+	static u32 old_cycle, oldold_cycle, old_gpusr, old_epoch;
+	static unsigned int matches;
 	u32 val, diff;
 
 	if (hw_is_irq_reg(mem))
@@ -269,18 +284,27 @@ static u32 hw_read_word(struct lightrec_state *state,
 	if (GPUSTATUS_POLLING_THRESHOLD > 0 && mem == 0x1f801814) {
 		diff = psxRegs.cycle - old_cycle;
 
+		/* A pure poll: same rhythm, nothing written to hardware in
+		 * between, seen at least twice before anything is skipped. */
 		if (diff > 0
 		    && diff < GPUSTATUS_POLLING_THRESHOLD
-		    && diff == old_cycle - oldold_cycle) {
-			while (psxRegs.next_interupt > psxRegs.cycle && val == old_gpusr) {
-				psxRegs.cycle += diff;
-				val = psxHwRead32(mem);
+		    && diff == old_cycle - oldold_cycle
+		    && hw_write_epoch == old_epoch
+		    && val == old_gpusr) {
+			if (++matches >= 2) {
+				while (psxRegs.next_interupt > psxRegs.cycle && val == old_gpusr) {
+					psxRegs.cycle += diff;
+					val = psxHwRead32(mem);
+				}
 			}
+		} else {
+			matches = 0;
 		}
 
 		oldold_cycle = old_cycle;
 		old_cycle = psxRegs.cycle;
 		old_gpusr = val;
+		old_epoch = hw_write_epoch;
 	}
 
 	lightrec_tansition_from_pcsx(state);

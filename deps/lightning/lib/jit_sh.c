@@ -758,6 +758,7 @@ _emit_code(jit_state_t *_jit)
 #endif
 	value = jit_classify(node->code);
 	jit_regarg_set(node, value);
+	_jitc->far = !!(node->flag & jit_flag_far);
 	switch (node->code) {
 	    case jit_code_align:
 		/* Must align to a power of two */
@@ -1274,6 +1275,37 @@ _emit_code(jit_state_t *_jit)
 		break;
 	    case jit_code_epilog:
 		assert(_jitc->function == _jitc->functions.ptr + node->w.w);
+		/* Branch relaxation: forward BT/BF and BRA were emitted
+		 * short. Now that their labels are placed, flag every one
+		 * that does not reach and emit the function again; the
+		 * flagged ones then get the reserved / register form. The
+		 * flagged set only grows, so this terminates. */
+		for (offset = undo.patch_offset;
+		     offset < _jitc->patches.offset; offset++) {
+		    jit_node_t *bn = _jitc->patches.ptr[offset].node;
+		    jit_word_t bw = _jitc->patches.ptr[offset].inst;
+		    jit_uint16_t bop = *(jit_uint16_t *)bw;
+		    jit_word_t bdisp;
+		    if (bn->code == jit_code_movi || (bn->flag & jit_flag_far))
+			continue;
+		    if ((bop & 0xf900) == 0x8900) {		/* BT/BF(/S) */
+			temp = bn->u.n;
+			bdisp = ((temp->u.w - bw) >> 1) - 2;
+			if (!(temp->flag & jit_flag_patch) ||
+			    bdisp < -128 || bdisp > 127) {
+			    bn->flag |= jit_flag_far;
+			    _jitc->again = 1;
+			}
+		    } else if ((bop & 0xf000) == 0xa000) {	/* BRA */
+			temp = bn->u.n;
+			bdisp = ((temp->u.w - bw) >> 1) - 2;
+			if (!(temp->flag & jit_flag_patch) ||
+			    bdisp < -2048 || bdisp > 2046) {
+			    bn->flag |= jit_flag_far;
+			    _jitc->again = 1;
+			}
+		    }
+		}
 		if (_jitc->again) {
 		    for (temp = undo.node->next;
 			 temp != node; temp = temp->next) {
@@ -1284,6 +1316,12 @@ _emit_code(jit_state_t *_jit)
 		    temp->flag &= ~jit_flag_patch;
 		    node = undo.node;
 		    _jit->pc.w = undo.word;
+		    /* Instructions still queued in the scheduling buffer
+		     * belong to the pass being thrown away: drop them, or
+		     * they land in front of the re-emitted prolog. */
+		    _jitc->ioff = 0;
+		    _jitc->no_flag = 0;
+		    _jitc->mode_d = SH_DEFAULT_FPU_MODE;
 #if DEVEL_DISASSEMBLER
 		    prevw = undo.prevw;
 #endif
