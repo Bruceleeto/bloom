@@ -101,6 +101,29 @@ static void emu_exit(uint8_t, uint32_t)
 	psxRegs.stop = 1;
 }
 
+static int load_bench_state(const char *path)
+{
+	s8 *mapped_psxR = psxR;
+	int ret;
+
+	/*
+	 * psxR points at the guest-virtual BIOS window, which mmap.c maps
+	 * MMU_KERNEL_RDONLY - LoadState writes 512 KiB of BIOS straight into
+	 * it and takes a Data TLB protection violation on hardware.  (Flycast
+	 * does not enforce the mapping, so this only faults on real silicon.)
+	 * Aim the write at the P1 backing store instead, the same address
+	 * load_bios() writes through, then flush so the mapped view agrees.
+	 */
+	psxR = (s8 *)(_arch_mem_top + 0x10000);
+
+	ret = LoadState(path);
+
+	dcache_flush_range(_arch_mem_top + 0x10000, 0x80000);
+	psxR = mapped_psxR;
+
+	return ret;
+}
+
 bool emu_check_cd(const char *path)
 {
 	SetIsoFile(path);
@@ -226,6 +249,9 @@ int main(int argc, char **argv)
 			LoadCdrom();
 
 		mcd_fs_init();
+
+		if (WITH_BENCH_STATE[0] && load_bench_state(WITH_BENCH_STATE) == 0)
+			printf("bench: loaded state %s\n", WITH_BENCH_STATE);
 
 		psxRegs.stop = 0;
 

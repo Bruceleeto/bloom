@@ -17,6 +17,7 @@
 #include <dc/video.h>
 #include <dc/vmu_fb.h>
 
+#include <stdio.h>
 #include <stdint.h>
 #include <sys/time.h>
 
@@ -307,6 +308,14 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   (float)frames, screen_w, screen_h, screen_bpp,
 			   (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
+
+
+		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%%\n",
+		       (float)frames * 1000.0f / (float)(new_timer - timer_ms),
+		       (float)(new_timer - timer_ms) / (float)frames,
+		       (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
+		       100.0f - 100.0f * idle_diff / cpu_diff);
+		fflush(stdout);
 
 		timer_ms = new_timer;
 		frames = 0;
