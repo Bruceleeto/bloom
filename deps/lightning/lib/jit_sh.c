@@ -593,6 +593,7 @@ _emit_code(jit_state_t *_jit)
 
     _jitc->consts.data = NULL;
     _jitc->consts.offset = _jitc->consts.length = 0;
+    _jitc->pref_pool = 0;
 
     undo.word = 0;
     undo.node = NULL;
@@ -1483,6 +1484,12 @@ _emit_code(jit_state_t *_jit)
 	    case jit_code_exti_u:
 		exti_u(rn(node->u.w), node->v.w, node->w.q.l, node->w.q.h);
 		break;
+	    case jit_code_sh_pref_pool:
+		pref_pool();
+		break;
+	    case jit_code_sh_pref:
+		PREF(rn(node->u.w));
+		break;
 	    default:
 		printf("ABORT MISSION (%i)\n", node->code);
 		abort();
@@ -1495,6 +1502,18 @@ _emit_code(jit_state_t *_jit)
 	jit_reglive(node);
 
         _jitc->no_flag = !(node->flag & jit_flag_patch);
+
+	/* A pool prefetch with no literal yet after ~900 bytes can never
+	 * reach its pool: drop it. */
+	if (_jitc->pref_pool && !_jitc->consts.length &&
+		(jit_uword_t)_jit->pc.uc + _jitc->ioff * 2
+		- (jit_uword_t)_jitc->pref_pool >= 900) {
+		jit_uint16_t *pref = (jit_uint16_t *)_jitc->pref_pool;
+		pref[0] = OP_NOP;
+		pref[1] = OP_NOP;
+		_jitc->pref_pool = 0;
+		_jitc->consts.offset = 0;
+	}
 
 	if (_jitc->consts.length &&
 		(jit_uword_t)_jit->pc.uc + _jitc->ioff * 2
@@ -1675,8 +1694,17 @@ _flush_consts(jit_state_t *_jit, jit_bool_t force)
     jit_int32_t		 offset;
 
     /* if no forward constants */
-    if (!_jitc->consts.length)
+    if (!_jitc->consts.length) {
+	/* A pool prefetch with no pool to point at: two nops. */
+	if (force && _jitc->pref_pool) {
+	    jit_uint16_t *pref = (jit_uint16_t *)_jitc->pref_pool;
+	    pref[0] = OP_NOP;
+	    pref[1] = OP_NOP;
+	    _jitc->pref_pool = 0;
+	    _jitc->consts.offset = 0;
+	}
 	return;
+    }
 
     word = _jit->code.length - (_jit->pc.uc + _jitc->ioff * 2 - _jit->code.ptr)
 	    - (_jitc->consts.length << 1);
@@ -1716,6 +1744,7 @@ _flush_consts(jit_state_t *_jit, jit_bool_t force)
 	patch_const(_jitc->consts.patches[offset],
 		    word + (_jitc->consts.patches[offset + 1] << 2));
     _jitc->consts.length = _jitc->consts.offset = 0;
+    _jitc->pref_pool = 0;
 }
 
 /* to be called if needing to start over a function */
@@ -1725,6 +1754,7 @@ _invalidate_consts(jit_state_t *_jit)
     /* if no forward constants */
     if (_jitc->consts.length)
 	_jitc->consts.length = _jitc->consts.offset = 0;
+    _jitc->pref_pool = 0;
 }
 
 static void

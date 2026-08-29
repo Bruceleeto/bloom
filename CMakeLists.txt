@@ -2,6 +2,14 @@
 
 cmake_minimum_required(VERSION 3.21)
 project(bloom VERSION 0.1 LANGUAGES C CXX ASM)
+set(ABLATE 0 CACHE STRING "Renderer pricing rung: 1 drop at GP0 entry, 2 decode only, 3 no TA writes")
+add_compile_definitions(ABLATE=${ABLATE})
+# Counter experiment: map guest RAM uncached so guest data loads make no
+# dcache misses; what remains in rest dcache_miss is the emulator's own
+# (literal pools, state, LUT). Slow; attribution only.
+set(UNCACHED_GUEST_RAM 0 CACHE STRING "1: map PSX RAM uncached (perf attribution experiment)")
+add_compile_definitions(UNCACHED_GUEST_RAM=${UNCACHED_GUEST_RAM})
+add_compile_definitions(BLOOM_OIX=$<BOOL:${WITH_OIX}>)
 
 include(kallistios)
 
@@ -118,7 +126,18 @@ add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
 # Generated code stores to the COP2 control file without calling CTC2, so the
 # recompiler announces the write for the GTE's matrix cache.
+# Where generated code reaches the lightrec state (registers, code LUT):
+# 0 plain; 0x02000000 = bit 25 set, the operand cache's other half under
+# OIX (WITH_OIX); 0x20000000 = P2 uncached, a counter experiment.
+set(STATE_ALIAS 0x02000000 CACHE STRING "Address alias for the lightrec state")
+option(WITH_OIX "Split the operand cache by address bit 25 (dc/cache.h OCINDEX)" ON)
+option(WITH_POOL_PREF "Prefetch each block's literal pool at block entry (SH-4)" ON)
+option(WITH_LUT_PREF "Prefetch the code-LUT entry of a jr \$ra block's return target at entry (SH-4)" ON)
+
 target_compile_definitions(lightrec PRIVATE
+	OPT_POOL_PREF=$<BOOL:${WITH_POOL_PREF}>
+	OPT_LUT_PREF=$<BOOL:${WITH_LUT_PREF}>
+	OPT_STATE_ALIAS=${STATE_ALIAS}
 )
 
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
@@ -282,7 +301,7 @@ add_executable(bloom
 	src/plugins.c
 )
 
-target_sources(bloom PRIVATE src/gte_fpu.c)
+target_sources(bloom PRIVATE src/gte_fpu.c src/perf.c)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "SH4|sh4" OR KOS_BASE)
 	target_sources(bloom PRIVATE src/gte_rtp.S)
 endif()

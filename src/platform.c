@@ -24,6 +24,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "pvr.h"
+#include "perf.h"
 
 #define MAX_LAG_FRAMES 3
 
@@ -193,7 +194,18 @@ static inline void copy24(const uint16_t *vram, int w, int h)
 	}
 }
 
+static void dc_vout_flip_real(const void *vram, int offset, int bgr24,
+			 int x, int y, int w, int h, int dims_changed);
+
 static void dc_vout_flip(const void *vram, int offset, int bgr24,
+			 int x, int y, int w, int h, int dims_changed)
+{
+	enum perf_area pa = perf_area_switch(PERF_FLIP);
+	dc_vout_flip_real(vram, offset, bgr24, x, y, w, h, dims_changed);
+	perf_area_switch(pa);
+}
+
+static void dc_vout_flip_real(const void *vram, int offset, int bgr24,
 			 int x, int y, int w, int h, int dims_changed)
 {
 	float ymin, ymax, xmin, xmax, idle_diff, cpu_diff;
@@ -316,6 +328,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
 
 
+		perf_report(frames, (unsigned int)(new_timer - timer_ms));
 		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%%\n",
 		       (float)frames * 1000.0f / (float)(new_timer - timer_ms),
 		       (float)(new_timer - timer_ms) / (float)frames,

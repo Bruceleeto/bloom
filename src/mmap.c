@@ -5,6 +5,8 @@
  * Copyright (C) 2024 Paul Cercueil <paul@crapouillou.net>
  */
 
+#include <arch/cache.h>
+#include <dc/cache.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -36,6 +38,15 @@ int lightrec_init_mmap(void)
 
 	mmu_init_basic();
 
+#if BLOOM_OIX
+	/* Operand cache in two halves by address bit 25: the lightrec state
+	 * lives on the upper one (STATE_ALIAS in CMakeLists.txt), guest RAM,
+	 * literal pools and everything else on the lower. */
+	arch_dcache_purge_all();
+	dcache_toggle_ocindex(true);
+	printf("OIX enabled\n");
+#endif
+
 	/* Verify that the stack has been moved down */
 	assert((_arch_mem_top & 0xfffff) == 0x60000);
 
@@ -55,14 +66,16 @@ int lightrec_init_mmap(void)
 	for (i = 0; i < 4; i++) {
 		/* Map first 1 MiB page of RAM mirror */
 		err = mmu_page_map_static(OFFSET + 0x200000 * i, (uintptr_t)psxM,
-					  PAGE_SIZE_1M, MMU_KERNEL_RDWR, true);
+					  PAGE_SIZE_1M, MMU_KERNEL_RDWR,
+					  !UNCACHED_GUEST_RAM);
 		if (err)
 			goto handle_err;
 
 		/* Map second 1 MiB page of RAM mirror */
 		err = mmu_page_map_static(OFFSET + 0x200000 * i + 0x100000,
 					  (uintptr_t)psxM + 0x100000,
-					  PAGE_SIZE_1M, MMU_KERNEL_RDWR, true);
+					  PAGE_SIZE_1M, MMU_KERNEL_RDWR,
+					  !UNCACHED_GUEST_RAM);
 		if (err)
 			goto handle_err;
 	}

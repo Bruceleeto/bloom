@@ -14,6 +14,7 @@
 #include <stdlib.h> /* for calloc */
 
 #include "gpu.h"
+#include "perf.h"
 #include "gpu_timing.h"
 #include "../../libpcsxcore/gpu.h" // meh
 #include "../../frontend/plugin_lib.h"
@@ -307,7 +308,16 @@ long GPUshutdown(void)
   return ret;
 }
 
+static void GPUwriteStatus_real(uint32_t data);
+
 void GPUwriteStatus(uint32_t data)
+{
+  enum perf_area pa = perf_area_switch(PERF_GP1);
+  GPUwriteStatus_real(data);
+  perf_area_switch(pa);
+}
+
+static void GPUwriteStatus_real(uint32_t data)
 {
   uint32_t cmd = data >> 24;
   uint32_t fb_dirty = 1;
@@ -767,8 +777,13 @@ static noinline void flush_cmd_buffer(struct psx_gpu *gpu)
 void GPUwriteDataMem(uint32_t *mem, int count)
 {
   int dummy = 0, left;
+  enum perf_area pa = perf_area_switch(PERF_GPU);
 
   log_io(&gpu, "gpu_dma_write %p %d\n", mem, count);
+#if ABLATE == 1
+  perf_area_switch(pa);
+  return;
+#endif
 
   if (unlikely(gpu.cmd_len > 0))
     flush_cmd_buffer(&gpu);
@@ -776,11 +791,15 @@ void GPUwriteDataMem(uint32_t *mem, int count)
   left = do_cmd_buffer(&gpu, mem, count, &dummy, &dummy);
   if (left)
     log_anomaly(&gpu, "GPUwriteDataMem: discarded %d/%d words\n", left, count);
+  perf_area_switch(pa);
 }
 
 void GPUwriteData(uint32_t data)
 {
   log_io(&gpu, "gpu_write %08x\n", data);
+#if ABLATE == 1
+  return;
+#endif
   gpu.cmd_buffer[gpu.cmd_len++] = HTOLE32(data);
   if (gpu.cmd_len >= CMD_BUFFER_LEN)
     flush_cmd_buffer(&gpu);
@@ -793,7 +812,15 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
   int len, left, count, ld_count = 32;
   int cpu_cycles_sum = 0;
   int cpu_cycles_last = 0;
+  enum perf_area pa = perf_area_switch(PERF_GPU);
 
+#if ABLATE == 1
+  if (progress_addr)
+    *progress_addr = 0xffffff;
+  *cycles_last_cmd = 0;
+  perf_area_switch(pa);
+  return 0;
+#endif
   preload(rambase + (start_addr & 0x1fffff) / 4);
 
   if (unlikely(gpu.cmd_len > 0))
@@ -860,6 +887,7 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
   if (progress_addr)
     *progress_addr = addr;
   *cycles_last_cmd = cpu_cycles_last;
+  perf_area_switch(pa);
   return cpu_cycles_sum;
 }
 
@@ -936,7 +964,16 @@ long GPUfreeze(uint32_t type, GPUFreeze_t *freeze)
   return 1;
 }
 
+static void GPUupdateLace_real(void);
+
 void GPUupdateLace(void)
+{
+  enum perf_area pa = perf_area_switch(PERF_GPU);
+  GPUupdateLace_real();
+  perf_area_switch(pa);
+}
+
+static void GPUupdateLace_real(void)
 {
   int updated = 0;
 

@@ -31,6 +31,13 @@
 #include <stddef.h>
 #include <string.h>
 
+#ifdef _arch_dreamcast
+#include <arch/cache.h>
+#endif
+
+/* For bloom's perf report (src/perf.c). */
+unsigned int lightrec_perf_nb_compile;
+
 /*
  * Bumped on every write to a COP2 control register, wherever the write comes
  * from.  Defined by the core's GTE (libpcsxcore/gte.c); declared here because
@@ -1699,6 +1706,29 @@ static void lightrec_reap_opcode_list(struct lightrec_state *state, void *data)
 	lightrec_free_opcode_list(state, data);
 }
 
+
+/* A block whose last branch is `jr $ra` with $ra untouched before it: the
+ * return target is known at block entry, so its code-LUT entry can be
+ * prefetched there (emitter.c, lightrec_emit_lut_pref). */
+static bool block_returns_through_ra(const struct block *block)
+{
+	const struct opcode *op;
+	unsigned int i;
+
+	for (i = 0; i < block->nb_ops; i++) {
+		op = &block->opcode_list[i];
+
+		if (op->c.i.op == OP_SPECIAL && op->c.r.op == OP_SPECIAL_JR
+		    && op->c.r.rs == 31)
+			return i + 2 >= block->nb_ops;
+
+		if (opcode_writes_register(op->c, 31))
+			return false;
+	}
+
+	return false;
+}
+
 int lightrec_compile_block(struct lightrec_cstate *cstate,
 			   struct block *block)
 {
@@ -1777,6 +1807,18 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	 * first instruction into the stub - which must stay exactly
 	 * LIGHTREC_PIN_STUB_BYTES, since links enter behind it. */
 	start_of_block = jit_indirect();
+
+#if defined(__sh__) && OPT_POOL_PREF
+	/* Pull this block's literal pool into the operand cache while the
+	 * body runs: every 32-bit constant, the link word and the address
+	 * mask are mov.l @(disp,pc) loads, and the pool line is otherwise
+	 * a stalled dcache miss on the first of them. */
+	jit_sh_pref_pool();
+#endif
+#if defined(__sh__) && OPT_LUT_PREF
+	if (block_returns_through_ra(block))
+		lightrec_emit_lut_pref(cstate, block);
+#endif
 
 	for (i = 0; i < block->nb_ops; i++) {
 		elm = &block->opcode_list[i];
@@ -1861,16 +1903,15 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_reaper_pause(state->reaper);
 
-	block->function = new_fn;
-	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
-
 	/* Resolve this block's static exits before anything can reach the
-	 * new code. The old generation's links stay registered until its
-	 * code is reaped, so it keeps mirroring the LUT while it runs. */
-	if (lightrec_links_register_block(state, block, cstate->links,
+	 * new code: run_first_pass() on the main thread hands out
+	 * block->function the moment it is non-NULL, so the words must be
+	 * resolved before it is published. The old generation's links stay
+	 * registered until its code is reaped, so it keeps mirroring the LUT
+	 * while it runs. */
+	if (lightrec_links_register_block(state, block, new_fn, cstate->links,
 					  cstate->nb_links)) {
 		pr_err("Unable to link block at "PC_FMT"\n", block->pc);
-		block->function = old_fn;
 		block->links = old_links;
 		block->_jit = oldjit;
 		if (ENABLE_THREADED_COMPILER)
@@ -1880,6 +1921,9 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		_jit_destroy_state(_jit);
 		return -EINVAL;
 	}
+
+	block->function = new_fn;
+	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
 
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
@@ -1999,6 +2043,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	}
 
 	pr_debug("Blocks compiled: %u\n", ++state->nb_compile);
+	lightrec_perf_nb_compile++;
 
 	return 0;
 }
@@ -2168,6 +2213,21 @@ struct lightrec_state * lightrec_init(char *argv0,
 	init_jit_with_debug(argv0, stdout);
 
 	state = calloc(1, sizeof(*state) + lut_size);
+#if defined(__sh__) && OPT_STATE_ALIAS
+	/* Reach the state (registers, LUT) through an address alias:
+	 * 0x02000000 sets bit 25, which with OIX (dc/cache.h) gives the
+	 * state the operand cache's other half, so guest data and literal
+	 * pools can never evict it; 0x20000000 is the P2 uncached window,
+	 * a counter experiment. calloc's zeros must reach memory first. */
+	if (state) {
+#ifdef _arch_dreamcast
+		arch_dcache_purge_all();
+#endif
+		state = (void *)((uintptr_t)state | OPT_STATE_ALIAS);
+	}
+#endif
+	if (state)
+		state->lut_base = state->code_lut;
 	if (!state)
 		goto err_finish_jit;
 
@@ -2274,7 +2334,7 @@ err_free_block_cache:
 err_free_state:
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
 			    lut_elm_size(state) * CODE_LUT_SIZE);
-	free(state);
+	free((void *)((uintptr_t)state & ~(uintptr_t)OPT_STATE_ALIAS));
 err_finish_jit:
 	finish_jit();
 	if (ENABLE_CODE_BUFFER && tlsf)
@@ -2307,7 +2367,7 @@ void lightrec_destroy(struct lightrec_state *state)
 
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
 			    lut_elm_size(state) * CODE_LUT_SIZE);
-	free(state);
+	free((void *)((uintptr_t)state & ~(uintptr_t)OPT_STATE_ALIAS));
 }
 
 /* An IO_HW tag records where the op's FIRST access landed (or that its

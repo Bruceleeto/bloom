@@ -781,6 +781,7 @@ struct jit_compiler {
 	jit_int32_t	  values[1024];	/* pending constants */
 	jit_word_t	  patches[2048];
     } consts;
+    jit_word_t		  pref_pool;	/* address of a pending pool prefetch, or 0 */
 #endif
 #if GET_JIT_SIZE
     /* Temporary storage to calculate instructions length */

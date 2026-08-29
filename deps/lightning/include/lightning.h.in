@@ -1327,6 +1327,15 @@ typedef enum {
     jit_code_stxbr_d,		jit_code_stxbi_d,
     jit_code_stxar_d,		jit_code_stxai_d,
 
+    /* SH-4 only: prefetch this function's first literal pool into the
+     * operand cache (mova @(pool,pc),r0; pref @r0). Patched when the pool
+     * is flushed; two nops if the function has no pool. */
+#define jit_sh_pref_pool()	jit_new_node(jit_code_sh_pref_pool)
+    jit_code_sh_pref_pool,
+    /* SH-4 only: pref @reg. */
+#define jit_sh_pref(u)		jit_new_node_w(jit_code_sh_pref, u)
+    jit_code_sh_pref,
+
     jit_code_last_code
 } jit_code_t;
 

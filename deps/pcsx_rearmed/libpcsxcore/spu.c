@@ -22,6 +22,7 @@
 */
 
 #include "spu.h"
+#include "perf.h"
 #include "psxevents.h"
 
 void CALLBACK SPUirq(int cycles_after) {
@@ -43,5 +44,7 @@ void CALLBACK SPUschedule(unsigned int cycles_after) {
 }
 
 void spuUpdate() {
+	enum perf_area pa = perf_area_switch(PERF_SPU);
 	SPU_async(psxRegs.cycle, 0);
+	perf_area_switch(pa);
 }

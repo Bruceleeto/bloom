@@ -130,9 +130,10 @@ void lightrec_links_free_list(struct lightrec_state *state,
 	links_unlock(links);
 }
 
-static u32 * find_magic_word(const struct block *block, u32 magic)
+static u32 * find_magic_word(const struct block *block, const void *function,
+			     u32 magic)
 {
-	const u32 *code = (const u32 *)block->function;
+	const u32 *code = (const u32 *)function;
 	unsigned int i, nb = block->code_size / sizeof(u32);
 	u32 *found = NULL;
 
@@ -157,7 +158,7 @@ static u32 * find_magic_word(const struct block *block, u32 magic)
 }
 
 int lightrec_links_register_block(struct lightrec_state *state,
-				  struct block *block,
+				  struct block *block, void *function,
 				  const struct lightrec_pending_link *pending,
 				  unsigned int nb_pending)
 {
@@ -174,7 +175,7 @@ int lightrec_links_register_block(struct lightrec_state *state,
 		return 0;
 
 	for (i = 0; i < nb_pending; i++) {
-		word = find_magic_word(block, pending[i].magic);
+		word = find_magic_word(block, function, pending[i].magic);
 		if (!word) {
 			lightrec_links_free_list(state, list);
 			return -EINVAL;

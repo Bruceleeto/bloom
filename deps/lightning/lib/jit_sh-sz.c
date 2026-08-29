@@ -596,3 +596,5 @@
     18, /* stxbi_d */
     8,	/* stxar_d */
     18, /* stxai_d */
+    4,	/* sh_pref_pool */
+    2,	/* sh_pref */

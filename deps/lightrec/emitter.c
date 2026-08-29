@@ -284,6 +284,37 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 	lightrec_regcache_reset(reg_cache);
 }
 
+#if defined(__sh__)
+/* Prefetch the code-LUT entry of this block's `jr $ra` target at block
+ * entry, so the lookup in lightrec_jump_to_indirect() hits. The LUT is
+ * 2 MB, one line per distinct return target, and a function return is the
+ * commonest indirect exit. No literal is involved: the RAM mask is built
+ * by shifts and lut_base is the state's first field. A BIOS or garbage $ra
+ * prefetches a wrong entry, which is harmless. */
+void lightrec_emit_lut_pref(struct lightrec_cstate *state,
+			    const struct block *block)
+{
+	struct regcache *reg_cache = state->reg_cache;
+	jit_state_t *_jit = block->_jit;
+	u8 ra, tmp, tmp2;
+
+	ra = lightrec_alloc_reg_in(reg_cache, _jit, 31, 0);
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	tmp2 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_movi(tmp, -1);
+	jit_rshi_u(tmp, tmp, 32 - __builtin_ctz(RAM_SIZE)); /* 0x1fffff */
+	jit_andr(tmp, tmp, ra);
+	jit_ldxi_i(tmp2, LIGHTREC_REG_STATE, lightrec_offset(lut_base));
+	jit_addr(tmp, tmp, tmp2);
+	jit_sh_pref(tmp);
+
+	lightrec_free_reg(reg_cache, tmp2);
+	lightrec_free_reg(reg_cache, tmp);
+	lightrec_free_reg(reg_cache, ra);
+}
+#endif
+
 void lightrec_emit_jump_to_interpreter(struct lightrec_cstate *state,
 				       const struct block *block, u16 offset)
 {

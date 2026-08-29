@@ -1,4 +1,5 @@
 #include <errno.h>
+#include "perf.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -693,8 +694,10 @@ static void lightrec_plugin_execute_internal(bool block_only)
 							      psxRegs.pc,
 							      cycles_lightrec);
 		} else {
+			enum perf_area pa = perf_area_switch(PERF_JIT);
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
+			perf_area_switch(pa);
 		}
 
 		lightrec_tansition_to_pcsx(lightrec_state);

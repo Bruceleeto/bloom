@@ -35,10 +35,13 @@ struct lightrec_links * lightrec_links_init(struct lightrec_state *state);
 void lightrec_links_destroy(struct lightrec_state *state);
 
 /* Resolve the pending exits of a freshly emitted block: find each magic
- * word in [function, function + code_size), register the edge, and write
- * the word's initial value. The list of links goes into block->links. */
+ * word in [function, function + block->code_size), register the edge, and
+ * write the word's initial value. The list of links goes into block->links.
+ * `function` is passed explicitly so this runs before block->function is
+ * published: the threaded compiler's main thread enters new code as soon
+ * as it sees the pointer (recompiler.c, run_first_pass). */
 int lightrec_links_register_block(struct lightrec_state *state,
-				  struct block *block,
+				  struct block *block, void *function,
 				  const struct lightrec_pending_link *pending,
 				  unsigned int nb_pending);
 

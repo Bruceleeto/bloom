@@ -1401,9 +1401,11 @@ _jit_classify(jit_state_t *_jit, jit_code_t code)
 	case jit_code_name:	case jit_code_label:	case jit_code_note:
 	case jit_code_prolog:	case jit_code_ellipsis:	case jit_code_va_push:
 	case jit_code_epilog:	case jit_code_ret:	case jit_code_prepare:
+	case jit_code_sh_pref_pool:
 	    mask = 0;
 	    break;
 	case jit_code_live:	case jit_code_va_end:
+	case jit_code_sh_pref:
 	case jit_code_retr_c:	case jit_code_retr_uc:
 	case jit_code_retr_s:	case jit_code_retr_us:
 	case jit_code_retr_i:	case jit_code_retr_ui:

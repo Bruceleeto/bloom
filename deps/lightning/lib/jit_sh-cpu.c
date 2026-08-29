@@ -368,6 +368,7 @@ _Static_assert(sizeof(sh4_instr_t) == 4, "Invalid size");
 
 #    define CLRT()			_cop(0x0008, SH4_GROUP_MT, 0, SH4_WRITE_T)
 #    define NOP()			_cop(0x0009, SH4_GROUP_MT, 0, 0)
+#    define PREF(rn)			_cni(0x0, rn, 0x83, SH4_GROUP_LS, SH4_READ_N, 0) /* pref @Rn */
 #    define RTS()			_cop(0x000b, SH4_GROUP_CO, 0, 0)
 #    define SETT()			_cop(0x0018, SH4_GROUP_MT, 0, SH4_WRITE_T)
 #    define DIV0U()			_cop(0x0019, SH4_GROUP_EX, 0, SH4_WRITE_T)
@@ -395,6 +396,8 @@ static void _movr(jit_state_t*,jit_uint16_t,jit_uint16_t);
 #    define movr(r0,r1)			_movr(_jit,r0,r1)
 static void _movi(jit_state_t*,jit_uint16_t,jit_word_t);
 #    define movi(r0,i0)			_movi(_jit,r0,i0)
+static void _pref_pool(jit_state_t*);
+#    define pref_pool()			_pref_pool(_jit)
 static void _movnr(jit_state_t*,jit_uint16_t,jit_uint16_t,jit_uint16_t,jit_bool_t);
 #    define movnr(r0,r1,r2)		_movnr(_jit,r0,r1,r2,1)
 #    define movzr(r0,r1,r2)		_movnr(_jit,r0,r1,r2,0)
@@ -1456,6 +1459,23 @@ movi_loop_cnt(jit_word_t i0)
 	}
 
 	return cnt;
+}
+
+/* Prefetch the function's first literal pool: the mova is registered as a
+ * patch against constant 0 exactly like a mov.l @(disp,pc) and is fixed
+ * up by flush_consts(); if the function never flushes a pool the pair is
+ * turned into nops there. r0 is lightning's scratch and dead here. */
+static void
+_pref_pool(jit_state_t *_jit)
+{
+    _jitc->idirect++;
+    flush(1);
+    _jitc->pref_pool = _jit->pc.w;
+    _jitc->consts.patches[_jitc->consts.offset++] = _jit->pc.w;
+    MOVA(0);
+    PREF(_R0);
+    _jitc->idirect--;
+    _jitc->consts.patches[_jitc->consts.offset++] = 0;
 }
 
 static void

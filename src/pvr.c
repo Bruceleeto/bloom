@@ -1223,6 +1223,10 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	pvr_vertex_part2_t *vert2;
 	unsigned int i;
 
+#if ABLATE == 3
+	return;
+#endif
+
 	if (unlikely(hdr)) {
 		sq_hdr = pvr_dr_target();
 		copy32(sq_hdr, hdr);
@@ -2552,6 +2556,10 @@ static void process_gpu_commands(void)
 	uint16_t draw_x, draw_y;
 	bool draw_updated;
 
+#if ABLATE == 2
+	pvr.cmdbuf_offt = 0;
+	return;
+#endif
 	for (cmd_offt = 0; cmd_offt < pvr.cmdbuf_offt; cmd_offt += 1 + len) {
 		pbuffer = (const union PacketBuffer *)&cmdbuf[cmd_offt];
 

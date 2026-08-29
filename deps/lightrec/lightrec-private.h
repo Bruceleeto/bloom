@@ -184,6 +184,10 @@ struct lightrec_cstate {
 };
 
 struct lightrec_state {
+	/* First, so generated code reaches it with a 4-bit displacement:
+	 * the address of code_lut, for prefetching an indirect exit's
+	 * entry at block start (emitter.c, lightrec_emit_lut_pref). */
+	void *lut_base;
 	struct lightrec_registers regs;
 	u32 temp_reg;
 	u32 curr_pc;

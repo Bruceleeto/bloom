@@ -14,6 +14,7 @@
 #include <libpcsxcore/plugins.h>
 
 #include "bloom-config.h"
+#include "perf.h"
 
 #ifdef DEBUG
 #  define cdr_printf(...) printf(__VA_ARGS__)
@@ -100,7 +101,11 @@ int rcdrom_readSector(void *stream, unsigned int lba, void *buffer)
 
 	curr_lba = lba;
 
-	ret = cdrom_read_sectors_ex(buffer, lba + 150, 1, WITH_CDROM_DMA);
+	{
+		enum perf_area pa = perf_area_switch(PERF_CD);
+		ret = cdrom_read_sectors_ex(buffer, lba + 150, 1, WITH_CDROM_DMA);
+		perf_area_switch(pa);
+	}
 	if (ret) {
 		printf("Unable to read sector: %d\n", ret);
 		return ret;

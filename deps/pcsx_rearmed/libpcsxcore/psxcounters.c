@@ -22,6 +22,7 @@
  */
 
 #include "psxcounters.h"
+#include "perf.h"
 #include "psxevents.h"
 #include "gpu.h"
 //#include "debug.h"
@@ -401,7 +402,9 @@ void psxRcntUpdate()
 
             if( SPU_async )
             {
+                enum perf_area pa = perf_area_switch(PERF_SPU);
                 SPU_async( cycle, 1 );
+                perf_area_switch(pa);
             }
         }
         

@@ -22,6 +22,7 @@
 */
 
 #include "psxhw.h"
+#include "perf.h"
 #include "psxevents.h"
 #include "mdec.h"
 #include "cdrom.h"
@@ -158,7 +159,16 @@ u32 sio1ReadStat16(void)
 	return 0xa0;
 }
 
+static u8 psxHwRead8_real(u32 add);
+
 u8 psxHwRead8(u32 add) {
+	enum perf_area pa = perf_area_switch(PERF_HW);
+	u8 r = psxHwRead8_real(add);
+	perf_area_switch(pa);
+	return r;
+}
+
+static u8 psxHwRead8_real(u32 add) {
 	u8 hard;
 
 	switch (add & 0xffff) {
@@ -212,7 +222,16 @@ u8 psxHwRead8(u32 add) {
 	return hard;
 }
 
+static u16 psxHwRead16_real(u32 add);
+
 u16 psxHwRead16(u32 add) {
+	enum perf_area pa = perf_area_switch(PERF_HW);
+	u16 r = psxHwRead16_real(add);
+	perf_area_switch(pa);
+	return r;
+}
+
+static u16 psxHwRead16_real(u32 add) {
 	unsigned short hard;
 
 	switch (add & 0xffff) {
@@ -263,7 +282,16 @@ u16 psxHwRead16(u32 add) {
 	return hard;
 }
 
+static u32 psxHwRead32_real(u32 add);
+
 u32 psxHwRead32(u32 add) {
+	enum perf_area pa = perf_area_switch(PERF_HW);
+	u32 r = psxHwRead32_real(add);
+	perf_area_switch(pa);
+	return r;
+}
+
+static u32 psxHwRead32_real(u32 add) {
 	u32 hard;
 
 	switch (add & 0xffff) {
@@ -304,7 +332,16 @@ u32 psxHwRead32(u32 add) {
 	return hard;
 }
 
+static void psxHwWrite8_real(u32 add, u32 value);
+
 void psxHwWrite8(u32 add, u32 value) {
+	enum perf_area pa = perf_area_switch(PERF_HW);
+	psxHwWrite8_real(add, value);
+	perf_area_switch(pa);
+	
+}
+
+static void psxHwWrite8_real(u32 add, u32 value) {
 	switch (add & 0xffff) {
 	case 0x1040: sioWrite8(value); return;
 	case 0x10f6:
@@ -330,7 +367,16 @@ void psxHwWrite8(u32 add, u32 value) {
 	psxHu8(add) = value;
 }
 
+static void psxHwWrite16_real(u32 add, u32 value);
+
 void psxHwWrite16(u32 add, u32 value) {
+	enum perf_area pa = perf_area_switch(PERF_HW);
+	psxHwWrite16_real(add, value);
+	perf_area_switch(pa);
+	
+}
+
+static void psxHwWrite16_real(u32 add, u32 value) {
 	switch (add & 0xffff) {
 	case 0x1040: sioWrite8(value); return;
 	case 0x1044: sioWriteStat16(value); return;
@@ -403,7 +449,16 @@ void psxHwWrite16(u32 add, u32 value) {
 	psxHu16ref(add) = SWAPu16(value);
 }
 
+static void psxHwWrite32_real(u32 add, u32 value);
+
 void psxHwWrite32(u32 add, u32 value) {
+	enum perf_area pa = perf_area_switch(PERF_HW);
+	psxHwWrite32_real(add, value);
+	perf_area_switch(pa);
+	
+}
+
+static void psxHwWrite32_real(u32 add, u32 value) {
 	switch (add & 0xffff) {
 	case 0x1040: sioWrite8(value); return;
 	case 0x1070: psxHwWriteIstat(value); return;
