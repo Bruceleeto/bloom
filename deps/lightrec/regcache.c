@@ -33,7 +33,7 @@ struct native_register {
 
 struct regcache {
 	struct lightrec_state *state;
-	struct native_register lightrec_regs[NUM_REGS + NUM_TEMPS];
+	struct native_register lightrec_regs[NUM_POOL + NUM_TEMPS];
 };
 
 static const char * mips_regs[] = {
@@ -48,6 +48,32 @@ static const char * mips_regs[] = {
 	"gp", "sp", "fp", "ra",
 	"lo", "hi",
 };
+
+#if NUM_PINNED
+/* bleem's pin set: v0 v1 a0 a1 at sp. */
+const u8 lightrec_pin_guest[NUM_PINNED] = { 2, 3, 4, 5, 1, 29 };
+_Static_assert(PIN_FIRST_SLOT + NUM_PINNED <= NUM_REGS,
+	       "pins do not fit in the callee-saved pool");
+#else
+const u8 lightrec_pin_guest[1] = { 0 };
+#endif
+
+_Bool lightrec_guest_is_pinned(u16 reg)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++)
+		if (lightrec_pin_guest[i] == reg)
+			return true;
+
+	return false;
+}
+
+static inline bool slot_is_pinned(unsigned int slot)
+{
+	return NUM_PINNED && slot >= PIN_FIRST_SLOT
+		&& slot < PIN_FIRST_SLOT + NUM_PINNED;
+}
 
 /* Forward declaration(s) */
 static void clean_reg(jit_state_t *_jit,
@@ -90,13 +116,23 @@ static inline u8 lightrec_reg_to_lightning(const struct regcache *cache,
 
 	if (offset < NUM_REGS)
 		return JIT_V(FIRST_REG + offset);
-	else
-		return JIT_R(FIRST_TEMP + offset - NUM_REGS);
+#if NUM_ARGREGS
+	if (offset < NUM_POOL)
+		return FIRST_ARGREG + (offset - NUM_REGS);
+#endif
+	return JIT_R(FIRST_TEMP + offset - NUM_POOL);
 }
 
 static inline struct native_register * lightning_reg_to_lightrec(
 		struct regcache *cache, u8 reg)
 {
+#if NUM_ARGREGS
+	/* Must come first: on SH-4 the argument registers sit between the
+	 * temporaries and the callee-saved ones, so neither test below
+	 * identifies them. */
+	if (reg >= FIRST_ARGREG && reg < FIRST_ARGREG + NUM_ARGREGS)
+		return &cache->lightrec_regs[NUM_REGS + reg - FIRST_ARGREG];
+#endif
 	if ((JIT_V0 > JIT_R0 && reg >= JIT_V0) ||
 			(JIT_V0 < JIT_R0 && reg < JIT_R0)) {
 		if (JIT_V1 > JIT_V0)
@@ -105,9 +141,9 @@ static inline struct native_register * lightning_reg_to_lightrec(
 			return &cache->lightrec_regs[JIT_V(FIRST_REG) - reg];
 	} else {
 		if (JIT_R1 > JIT_R0)
-			return &cache->lightrec_regs[NUM_REGS + reg - JIT_R(FIRST_TEMP)];
+			return &cache->lightrec_regs[NUM_POOL + reg - JIT_R(FIRST_TEMP)];
 		else
-			return &cache->lightrec_regs[NUM_REGS + JIT_R(FIRST_TEMP) - reg];
+			return &cache->lightrec_regs[NUM_POOL + JIT_R(FIRST_TEMP) - reg];
 	}
 }
 
@@ -139,7 +175,7 @@ void lightrec_set_reg_out_flags(struct regcache *cache, u8 jit_reg, u8 flags)
 	}
 }
 
-static struct native_register * alloc_temp(struct regcache *cache)
+static struct native_register * alloc_temp(struct regcache *cache, bool no_arg)
 {
 	struct native_register *elm, *nreg = NULL;
 	enum reg_priority best = REG_NB_PRIORITIES;
@@ -151,6 +187,15 @@ static struct native_register * alloc_temp(struct regcache *cache)
 	 * memory. */
 	for (i = ARRAY_SIZE(cache->lightrec_regs); i; i--) {
 		elm = &cache->lightrec_regs[i - 1];
+
+		if (slot_is_pinned(i - 1))
+			continue;
+
+		/* Only a caller that must survive a call setup excludes the
+		 * argument registers - see alloc_temp_no_arg(). */
+		if (no_arg && NUM_ARGREGS
+		    && i - 1 >= NUM_REGS && i - 1 < NUM_POOL)
+			continue;
 
 		if (!elm->used && !elm->locked && elm->prio < best) {
 			nreg = elm;
@@ -197,6 +242,11 @@ static struct native_register * alloc_in_out(struct regcache *cache,
 	for (i = 0; i < ARRAY_SIZE(cache->lightrec_regs); i++) {
 		elm = &cache->lightrec_regs[i];
 
+		/* A pin owns its host register for the life of the run;
+		 * find_mapped_reg() above is the only way into one. */
+		if (slot_is_pinned(i))
+			continue;
+
 		if (!elm->used && !elm->locked && elm->prio < best) {
 			nreg = elm;
 			best = elm->prio;
@@ -209,13 +259,34 @@ static struct native_register * alloc_in_out(struct regcache *cache,
 	return nreg;
 }
 
-static void lightrec_discard_nreg(struct native_register *nreg)
+/* Drop everything the allocator knows about this host register.
+ *
+ * A pinned slot is the exception: it is the permanent home of one guest
+ * register for the whole run, so the binding must survive. Unbinding it -
+ * OPT_EARLY_UNLOAD does this after a guest register's last use in a block -
+ * hands the pin's host register to the general pool, and the next block's
+ * lightrec_regcache_reset() then re-asserts "this slot holds guest rN, no
+ * load needed" over whatever the pool left there. The block reads garbage
+ * for rN, and when rN is v0 the garbage becomes the target of a jr, which
+ * surfaces as "Unable to recompile block at PC 0xffffffff".
+ *
+ * For a pin, keep the binding and drop only the transient flags. The caller
+ * has already stored back a dirty value if it needed to (see
+ * lightrec_unload_nreg), so REG_IS_LOADED is the correct resting state. */
+static void lightrec_discard_nreg(struct regcache *cache,
+				  struct native_register *nreg)
 {
 	nreg->extended = false;
 	nreg->zero_extended = false;
 	nreg->output = false;
 	nreg->used = false;
 	nreg->locked = false;
+
+	if (slot_is_pinned(lightrec_reg_number(cache, nreg))) {
+		nreg->prio = REG_IS_LOADED;
+		return;
+	}
+
 	nreg->emulated_register = -1;
 	nreg->prio = 0;
 }
@@ -224,7 +295,7 @@ static void lightrec_unload_nreg(struct regcache *cache, jit_state_t *_jit,
 		struct native_register *nreg, u8 jit_reg)
 {
 	clean_reg(_jit, nreg, jit_reg, false);
-	lightrec_discard_nreg(nreg);
+	lightrec_discard_nreg(cache, nreg);
 }
 
 void lightrec_unload_reg(struct regcache *cache, jit_state_t *_jit, u8 jit_reg)
@@ -251,10 +322,100 @@ u8 lightrec_alloc_reg(struct regcache *cache, jit_state_t *_jit, u8 jit_reg)
 	return jit_reg;
 }
 
+u8 lightrec_peek_reg_in(struct regcache *cache, u16 reg)
+{
+	struct native_register *nreg = find_mapped_reg(cache, reg, false);
+
+	return nreg ? lightrec_reg_to_lightning(cache, nreg) : 0;
+}
+
+_Bool lightrec_reg_is_pinned_host(u8 jit_reg)
+{
+	return NUM_PINNED
+		&& jit_reg >= JIT_V(FIRST_REG + PIN_FIRST_SLOT)
+		&& jit_reg < JIT_V(FIRST_REG + PIN_FIRST_SLOT + NUM_PINNED);
+}
+
+_Bool lightrec_reg_is_argreg(u8 jit_reg)
+{
+	return NUM_ARGREGS && jit_reg >= FIRST_ARGREG
+		&& jit_reg < FIRST_ARGREG + NUM_ARGREGS;
+}
+
+u8 lightrec_alloc_reg_temp_no_arg(struct regcache *cache, jit_state_t *_jit)
+{
+	struct native_register *nreg = alloc_temp(cache, true);
+	u8 jit_reg;
+
+	if (!nreg) {
+		pr_err("No more registers! Abandon ship!\n");
+		return 0;
+	}
+
+	jit_reg = lightrec_reg_to_lightning(cache, nreg);
+	lightrec_unload_nreg(cache, _jit, nreg, jit_reg);
+
+	nreg->prio = REG_IS_TEMP;
+	nreg->used = true;
+	return jit_reg;
+}
+
+/* A register to hold a C call target across the argument setup.
+ *
+ * It has to survive from the load of the target address to the call itself,
+ * with jit_prepare() and the outgoing arguments in between, and it cannot be
+ * a live temporary. When the pins take the whole callee-saved pool nothing in
+ * the ordinary pool fits.
+ *
+ * The last argument register does, though. Call sites run
+ * lightrec_save_argregs() first, so by this point every argument register has
+ * been spilled and holds nothing; and the wrapper call passes a single
+ * argument, which lightning places in the first of them. The last one is
+ * therefore free from the spill until the call, which is exactly the window
+ * that is needed.
+ *
+ * Borrowing a pin's register was tried instead, on the reasoning that pins are
+ * clean here and reloaded afterwards. It does not work: the pin's host
+ * register is reserved from lightning and still mapped in the cache, the load
+ * of the target address does not survive, and the call jumps to whatever guest
+ * value was in it. tools/lrtest -c catches it as a fault at the block
+ * containing the call, at an address equal to the pinned guest register.
+ *
+ * Must only be called after lightrec_save_argregs().
+ */
+u8 lightrec_alloc_call_target(struct regcache *cache, jit_state_t *_jit)
+{
+	struct native_register *nreg = alloc_temp(cache, true);
+
+	if (nreg) {
+		u8 jit_reg = lightrec_reg_to_lightning(cache, nreg);
+
+		lightrec_unload_nreg(cache, _jit, nreg, jit_reg);
+		nreg->prio = REG_IS_TEMP;
+		nreg->used = true;
+		return jit_reg;
+	}
+
+#if NUM_ARGREGS
+	return FIRST_ARGREG + NUM_ARGREGS - 1;
+#else
+	pr_err("No more registers! Abandon ship!\n");
+	return 0;
+#endif
+}
+
+/* True when the register came from the borrowed-argument-register path above,
+ * and so was never allocated from the pool and must not be freed back into
+ * it. */
+_Bool lightrec_call_target_is_pin(u8 jit_reg)
+{
+	return NUM_ARGREGS && jit_reg == FIRST_ARGREG + NUM_ARGREGS - 1;
+}
+
 u8 lightrec_alloc_reg_temp(struct regcache *cache, jit_state_t *_jit)
 {
 	u8 jit_reg;
-	struct native_register *nreg = alloc_temp(cache);
+	struct native_register *nreg = alloc_temp(cache, false);
 	if (!nreg) {
 		/* No free register, no dirty register to free. */
 		pr_err("No more registers! Abandon ship!\n");
@@ -526,8 +687,17 @@ void lightrec_load_next_pc(struct regcache *cache, jit_state_t *_jit, u8 reg)
 		else
 			jit_extr_ui(JIT_V0, jit_reg);
 
-		*nreg_v0 = *nreg;
-		lightrec_discard_nreg(nreg);
+		if (slot_is_pinned(lightrec_reg_number(cache, nreg))) {
+			/* The pin keeps its mapping; JIT_V0 just carries a
+			 * copy of the value, mapped to nothing. Moving the
+			 * mapping would leave two slots claiming the same
+			 * guest register. */
+			nreg_v0->emulated_register = -1;
+			nreg_v0->prio = REG_IS_LOADED;
+		} else {
+			*nreg_v0 = *nreg;
+			lightrec_discard_nreg(cache, nreg);
+		}
 	}
 
 	if (lightrec_store_next_pc()) {
@@ -594,8 +764,14 @@ static void clean_regs(struct regcache *cache, jit_state_t *_jit, bool clean)
 		clean_reg(_jit, &cache->lightrec_regs[i],
 			  JIT_V(FIRST_REG + i), clean);
 	}
+#if NUM_ARGREGS
+	for (i = 0; i < NUM_ARGREGS; i++) {
+		clean_reg(_jit, &cache->lightrec_regs[NUM_REGS + i],
+			  FIRST_ARGREG + i, clean);
+	}
+#endif
 	for (i = 0; i < NUM_TEMPS; i++) {
-		clean_reg(_jit, &cache->lightrec_regs[i + NUM_REGS],
+		clean_reg(_jit, &cache->lightrec_regs[i + NUM_POOL],
 				JIT_R(FIRST_TEMP + i), clean);
 	}
 }
@@ -614,7 +790,7 @@ bool lightrec_has_dirty_regs(struct regcache *cache)
 {
 	unsigned int i;
 
-	for (i = 0; i < NUM_REGS + NUM_TEMPS; i++)
+	for (i = 0; i < ARRAY_SIZE(cache->lightrec_regs); i++)
 		if (cache->lightrec_regs[i].prio == REG_IS_DIRTY)
 			return true;
 
@@ -658,8 +834,10 @@ void lightrec_discard_reg_if_loaded(struct regcache *cache, u16 reg)
 	struct native_register *nreg;
 
 	nreg = find_mapped_reg(cache, reg, false);
-	if (nreg)
-		lightrec_discard_nreg(nreg);
+	if (!nreg)
+		return;
+
+	lightrec_discard_nreg(cache, nreg);
 }
 
 struct native_register * lightrec_regcache_enter_branch(struct regcache *cache)
@@ -683,7 +861,22 @@ void lightrec_regcache_leave_branch(struct regcache *cache,
 
 void lightrec_regcache_reset(struct regcache *cache)
 {
+	unsigned int i;
+
 	memset(&cache->lightrec_regs, 0, sizeof(cache->lightrec_regs));
+
+	/* Pins are not reset with the rest: their host register still holds
+	 * the guest value at this point at run time, so the next block must
+	 * not emit a load for it. This is the whole win - it removes the
+	 * per-boundary reload that a per-block allocator pays ~144k times a
+	 * frame. */
+	for (i = 0; i < NUM_PINNED; i++) {
+		struct native_register *nreg =
+			&cache->lightrec_regs[PIN_FIRST_SLOT + i];
+
+		nreg->emulated_register = lightrec_pin_guest[i];
+		nreg->prio = REG_IS_LOADED;
+	}
 }
 
 void lightrec_preload_pc(struct regcache *cache, jit_state_t *_jit)
@@ -747,8 +940,20 @@ void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit)
 	}
 #endif
 
-	for (i = 0; i < NUM_TEMPS; i++) {
+#if NUM_ARGREGS
+	/* Not conditional on _WIN32 like the block above: lightning really
+	 * does use r4-r7 for outgoing arguments and as scratch, so a guest
+	 * value parked in one has to be declared live every time. */
+	for (i = 0; i < NUM_ARGREGS; i++) {
 		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP)
+			jit_live(FIRST_ARGREG + i);
+	}
+#endif
+
+	for (i = 0; i < NUM_TEMPS; i++) {
+		nreg = &cache->lightrec_regs[NUM_POOL + i];
 
 		if (nreg->used || nreg->prio > REG_IS_TEMP)
 			jit_live(JIT_R(FIRST_TEMP + i));
@@ -756,4 +961,128 @@ void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit)
 
 	jit_live(LIGHTREC_REG_STATE);
 	jit_live(LIGHTREC_REG_CYCLE);
+}
+
+void lightrec_clean_pins(struct regcache *cache, jit_state_t *_jit)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++) {
+		clean_reg(_jit, &cache->lightrec_regs[PIN_FIRST_SLOT + i],
+			  JIT_V(FIRST_REG + PIN_FIRST_SLOT + i), true);
+	}
+}
+
+void lightrec_emit_pin_tripwire(struct regcache *cache, jit_state_t *_jit,
+				u32 pc)
+{
+#if OPT_PIN_TRIPWIRE
+	jit_node_t *ok;
+	u8 tmp, tmp2;
+	unsigned int i;
+
+	if (!NUM_PINNED)
+		return;
+
+	tmp = lightrec_alloc_reg_temp(cache, _jit);
+	tmp2 = lightrec_alloc_reg_temp(cache, _jit);
+
+	for (i = 0; i < NUM_PINNED; i++) {
+		jit_ldxi_i(tmp, LIGHTREC_REG_STATE,
+			   lightrec_offset(regs.gpr)
+			   + (lightrec_pin_guest[i] << 2));
+
+		ok = jit_beqr(tmp, JIT_V(FIRST_REG + PIN_FIRST_SLOT + i));
+
+		jit_movi(tmp2, pc);
+		jit_stxi_i(lightrec_offset(dbg_pin_pc), LIGHTREC_REG_STATE, tmp2);
+		jit_movi(tmp2, i);
+		jit_stxi_i(lightrec_offset(dbg_pin_idx), LIGHTREC_REG_STATE, tmp2);
+
+		jit_patch(ok);
+	}
+
+	lightrec_free_reg(cache, tmp);
+	lightrec_free_reg(cache, tmp2);
+#endif
+}
+
+void lightrec_regcache_load_pins(jit_state_t *_jit)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++) {
+		jit_ldxi_i(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i),
+			   LIGHTREC_REG_STATE,
+			   lightrec_offset(regs.gpr)
+			   + (lightrec_pin_guest[i] << 2));
+	}
+}
+
+void lightrec_regcache_store_pins(jit_state_t *_jit)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++) {
+		jit_stxi_i(lightrec_offset(regs.gpr)
+			   + (lightrec_pin_guest[i] << 2),
+			   LIGHTREC_REG_STATE,
+			   JIT_V(FIRST_REG + PIN_FIRST_SLOT + i));
+	}
+}
+
+void lightrec_regcache_reserve_pins(jit_state_t *_jit)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++)
+		jit_reserve_reg(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i));
+}
+
+void lightrec_regcache_reserve(jit_state_t *_jit)
+{
+	lightrec_regcache_reserve_pins(_jit);
+
+#if NUM_ARGREGS
+	unsigned int i;
+
+	/* lightning picks the lowest-numbered free register for its own
+	 * scratch, which reaches r4-r7 as soon as r1-r3 are busy - and r1-r3
+	 * always are here (cycle counter plus two temporaries). Without this
+	 * the allocator silently clobbers guest values. */
+	for (i = 0; i < NUM_ARGREGS; i++)
+		jit_reserve_reg(FIRST_ARGREG + i);
+#endif
+}
+
+void lightrec_save_argregs(struct regcache *cache, jit_state_t *_jit)
+{
+#if NUM_ARGREGS
+	const struct native_register *nreg;
+	unsigned int i;
+
+	for (i = 0; i < NUM_ARGREGS; i++) {
+		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP)
+			jit_stxi(lightrec_offset(wrapper_regs[NUM_TEMPS + i]),
+				 LIGHTREC_REG_STATE, FIRST_ARGREG + i);
+	}
+#endif
+}
+
+void lightrec_restore_argregs(struct regcache *cache, jit_state_t *_jit)
+{
+#if NUM_ARGREGS
+	const struct native_register *nreg;
+	unsigned int i;
+
+	for (i = 0; i < NUM_ARGREGS; i++) {
+		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP)
+			jit_ldxi(FIRST_ARGREG + i, LIGHTREC_REG_STATE,
+				 lightrec_offset(wrapper_regs[NUM_TEMPS + i]));
+	}
+#endif
 }

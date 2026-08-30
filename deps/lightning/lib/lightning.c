@@ -201,6 +201,12 @@ finish_jit(void)
     jit_finish_size();
 }
 
+void
+_jit_reserve_reg(jit_state_t *_jit, jit_int32_t reg)
+{
+    jit_regset_setbit(&_jitc->reserved, jit_regno(reg));
+}
+
 jit_int32_t
 _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 {
@@ -232,6 +238,7 @@ _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 	/* search for a free register matching spec */
 	for (regno = 0; regno < _jitc->reglen; regno++) {
 	    if ((jit_class(_rvs[regno].spec) & spec) == spec &&
+		!jit_regset_tstbit(&_jitc->reserved, regno) &&
 		!jit_regset_tstbit(&_jitc->regarg, regno) &&
 		!jit_regset_tstbit(&_jitc->reglive, regno)) {
 		if (jit_regset_tstbit(&_jitc->regmask, regno)) {
@@ -242,6 +249,7 @@ _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 		    for (regfree = regno + 1;
 			 regfree < _jitc->reglen; regfree++) {
 			if ((jit_class(_rvs[regfree].spec) & spec) == spec &&
+			    !jit_regset_tstbit(&_jitc->reserved, regfree) &&
 			    !jit_regset_tstbit(&_jitc->regarg, regfree) &&
 			    !jit_regset_tstbit(&_jitc->reglive, regfree) &&
 			    !jit_regset_tstbit(&_jitc->regmask, regfree)) {
@@ -258,6 +266,7 @@ _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 	 * for the current instruction */
 	for (regno = 0; regno < _jitc->reglen; regno++) {
 	    if ((jit_class(_rvs[regno].spec) & spec) == spec &&
+		!jit_regset_tstbit(&_jitc->reserved, regno) &&
 		!jit_regset_tstbit(&_jitc->regsav, regno) &&
 		!jit_regset_tstbit(&_jitc->regarg, regno) &&
 		!(regspec & jit_class_nospill)) {
@@ -316,6 +325,7 @@ _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 	assert(!(regspec & jit_class_nospill));
 	for (regno = 0; regno < _jitc->reglen; regno++) {
 	    if ((jit_class(_rvs[regno].spec) & spec) == spec &&
+		!jit_regset_tstbit(&_jitc->reserved, regno) &&
 		!jit_regset_tstbit(&_jitc->regsav, regno) &&
 		!jit_regset_tstbit(&_jitc->regarg, regno)) {
 		jit_regset_setbit(&_jitc->regarg, regno);
@@ -898,6 +908,7 @@ jit_new_state(void)
     jit_regset_new(&_jitc->reglive);
     jit_regset_new(&_jitc->regmask);
     jit_regset_new(&_jitc->explive);
+    jit_regset_new(&_jitc->reserved);
 
     jit_init();
 

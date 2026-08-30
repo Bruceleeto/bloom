@@ -231,6 +231,8 @@ option(WITH_BILINEAR "Enable bilinear texture filtering" OFF)
 option(WITH_480P "Enable high-resolution 480p mode" ON)
 option(WITH_HYBRID_RENDERING "Enable hybrid rendering" ON)
 option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF)
+option(WITH_PROF "Enable the PC sampling profiler (writes to /pc/)" OFF)
+set(WITH_PROF_HZ 2000 CACHE STRING "PC sampler frequency in Hz")
 option(WITH_CLIPPING "Enable pixel clipping" ON)
 
 if (WITH_HYBRID_RENDERING)
@@ -272,6 +274,8 @@ add_executable(bloom
 	src/mmap.c
 	src/platform.c
 	src/plugins.c
+	src/guestdump.c
+	src/prof.c
 )
 target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#lightning lightrec libpcsxcore gpu spu

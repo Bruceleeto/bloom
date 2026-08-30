@@ -15,6 +15,9 @@
 #define WITH_MCD2_PATH "@WITH_MCD2_PATH@"
 #define WITH_CDROM_CACHE_SIZE @WITH_CDROM_CACHE_SIZE@
 
+#cmakedefine01 WITH_PROF
+#define WITH_PROF_HZ @WITH_PROF_HZ@
+
 #cmakedefine01 WITH_CDROM_DMA
 #cmakedefine01 WITH_CHD
 #cmakedefine01 WITH_IDE

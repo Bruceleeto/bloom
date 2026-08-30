@@ -21,6 +21,7 @@
 #endif
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define X32_FMT "0x%08"PRIx32
@@ -168,9 +169,11 @@ struct lightrec_cstate {
 struct lightrec_state {
 	struct lightrec_registers regs;
 	u32 temp_reg;
+	u32 dbg_pin_pc;		/* pin tripwire: block whose entry saw a stale pin */
+	s32 dbg_pin_idx;	/* pin tripwire: which pin, -1 when clean */
 	u32 curr_pc;
 	u32 next_pc;
-	uintptr_t wrapper_regs[NUM_TEMPS];
+	uintptr_t wrapper_regs[NUM_TEMPS + NUM_ARGREGS];
 	u8 in_delay_slot_n;
 	u32 current_cycle;
 	u32 target_cycle;
@@ -202,6 +205,19 @@ struct lightrec_state {
 	void *code_lut[];
 };
 
+#if defined(__sh__) && OPT_SH4_USE_GBR
+/* Generated code reaches state fields with mov.l @(disp,gbr),r0, whose
+ * displacement is 8 bits scaled by 4 - 1020 bytes. A field past that falls
+ * back to staging GBR into a GPR plus an indexed access, which is worse than
+ * the state-in-r13 path it replaced, and does so silently. code_lut is the
+ * flexible array at the end and is always reached by a computed address, so
+ * bounding its offset bounds every scalar field ahead of it.
+ * Measured 2026-08-30: code_lut at 696, sizeof 695. */
+_Static_assert(offsetof(struct lightrec_state, code_lut) <= 1020,
+	       "lightrec_state grew past the GBR displacement reach - reorder "
+	       "the hot fields ahead of code_lut");
+#endif
+
 #define lightrec_offset(ptr) \
 	offsetof(struct lightrec_state, ptr)
 
@@ -222,6 +238,44 @@ static inline u32 kunseg(u32 addr)
 	else
 		return addr &~ 0x80000000;
 }
+
+/* The dispatcher's own working registers: the next guest PC, scratch for the
+ * KUSEG masking and code-LUT lookup, and the block address it jumps through.
+ *
+ * These are JIT_V0 and JIT_V1 by default, which is fine as long as no guest
+ * register is pinned there. Six pins need the whole callee-saved bank, so in
+ * that configuration the dispatcher has to move out of the way.
+ *
+ * It can, because neither value needs to survive a call. The PC is written to
+ * state->curr_pc before every call out of the dispatcher and read back after;
+ * the block address is produced after the last call and consumed by the jump.
+ * Both are live only across straight-line stretches, which is what
+ * caller-saved registers are for. The argument registers are free here:
+ * lightrec_regcache_reset() drops every non-pinned mapping at the start of a
+ * block, so nothing in the pool is expected to survive a block boundary.
+ *
+ * DISPATCH_TGT is separate from DISPATCH_TMP so that the pin reload, which
+ * happens between the LUT load and the jump, cannot overwrite the address
+ * being jumped to.
+ *
+ * Getting this wrong is quiet rather than loud: the dispatcher overwrites a
+ * pin, a block then reads a guest register holding a LUT address, and it
+ * surfaces as a data address error seconds later and nowhere near the cause. */
+#if NUM_PINNED && NUM_ARGREGS && PIN_FIRST_SLOT == 0
+/* Numbered downwards from the top of the argument registers. The dispatcher
+ * pushes at most three outgoing arguments, which lightning places in the
+ * first three (r4-r6), and jit_pushargr() writes them one at a time - so the
+ * PC must not live in a slot that an earlier argument is about to occupy.
+ * Putting it in r4 does exactly that: pushing the state pointer as argument
+ * one overwrites the PC before it is pushed as argument two. */
+#  define DISPATCH_PC	(FIRST_ARGREG + 3)
+#  define DISPATCH_TMP	(FIRST_ARGREG + 2)
+#  define DISPATCH_TGT	(FIRST_ARGREG + 1)
+#else
+#  define DISPATCH_PC	JIT_V0
+#  define DISPATCH_TMP	JIT_V1
+#  define DISPATCH_TGT	JIT_V1
+#endif
 
 static inline u32 lut_offset(u32 pc)
 {
@@ -390,6 +444,13 @@ get_delay_slot(const struct opcode *list, u16 i)
 
 static inline _Bool lightrec_store_next_pc(void)
 {
+	/* With pins, JIT_V0 must stop being the block->dispatcher PC carrier:
+	 * the pins take the rest of the callee-saved pool, so temporaries land
+	 * in JIT_V0/JIT_V1 and are still live when the exit overwrites them
+	 * with the next PC. Routing the PC through state->next_pc frees both. */
+	if (NUM_PINNED)
+		return 1;
+
 	return NUM_REGS + NUM_TEMPS <= 4;
 }
 

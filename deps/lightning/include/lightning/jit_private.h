@@ -654,6 +654,7 @@ struct jit_compiler {
     jit_regset_t	  reglive;	/* known live registers at some point */
     jit_regset_t	  regmask;	/* register mask to update reglive */
     jit_regset_t	  explive;	/* explicitly marked as live */
+    jit_regset_t	  reserved;	/* owned by the caller, never allocate */
     struct {
 	jit_uint8_t	 *end;
     } code;

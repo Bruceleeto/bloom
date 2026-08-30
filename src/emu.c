@@ -11,6 +11,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "prof.h"
+
 #include <libpcsxcore/misc.h>
 #include <libpcsxcore/plugins.h>
 #include <libpcsxcore/psxcommon.h>
@@ -255,8 +257,16 @@ int main(int argc, char **argv)
 
 		psxRegs.stop = 0;
 
+		/* Started only once the game is actually running: sampling the
+		 * boot and the CD load would swamp the histogram with code
+		 * that runs once. */
+		prof_init();
+
 		while (!psxRegs.stop)
 			psxCpu->Execute(&psxRegs);
+
+		prof_shutdown();
+		prof_dump("run");
 
 		ClosePlugins();
 

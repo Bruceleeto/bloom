@@ -113,8 +113,10 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 		 * will be written after the first opcode of the target is
 		 * executed. Handle this by jumping to a special section of
 		 * the dispatcher. It expects the loaded value to be in
-		 * REG_TEMP, and the target register number to be in JIT_V1.*/
-		jit_movi(JIT_V1, ds->c.i.rt);
+		 * REG_TEMP, and the target register number in DISPATCH_TMP -
+		 * this is the block half of that hand-off, so it has to name
+		 * the same register the dispatcher reads. */
+		jit_movi(DISPATCH_TMP, ds->c.i.rt);
 
 		lightrec_jump_to_ds_check(state, _jit);
 	} else {
@@ -132,15 +134,16 @@ void lightrec_emit_jump_to_interpreter(struct lightrec_cstate *state,
 
 	lightrec_clean_regs(reg_cache, _jit);
 
-	/* Call the interpreter with the block's address in JIT_V1 and the
-	 * PC (which might have an offset) in JIT_V0. */
-	lightrec_load_imm(reg_cache, _jit, JIT_V0, block->pc,
+	/* Call the interpreter with the block's address in DISPATCH_TMP and
+	 * the PC (which might have an offset) in DISPATCH_PC. */
+	lightrec_load_imm(reg_cache, _jit, DISPATCH_PC, block->pc,
 			  block->pc + (offset << 2));
 	if (lightrec_store_next_pc()) {
-	      jit_stxi_i(lightrec_offset(next_pc), LIGHTREC_REG_STATE, JIT_V0);
+	      jit_stxi_i(lightrec_offset(next_pc), LIGHTREC_REG_STATE,
+			 DISPATCH_PC);
 	}
 
-	jit_movi(JIT_V1, (uintptr_t)block);
+	jit_movi(DISPATCH_TMP, (uintptr_t)block);
 
 	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 	lightrec_jump_to_fn(_jit, state->state->interpreter_func);
@@ -154,10 +157,11 @@ static void lightrec_emit_eob(struct lightrec_cstate *state,
 
 	lightrec_clean_regs(reg_cache, _jit);
 
-	lightrec_load_imm(reg_cache, _jit, JIT_V0, block->pc,
+	lightrec_load_imm(reg_cache, _jit, DISPATCH_PC, block->pc,
 			  block->pc + (offset << 2));
 	if (lightrec_store_next_pc()) {
-	      jit_stxi_i(lightrec_offset(next_pc), LIGHTREC_REG_STATE, JIT_V0);
+	      jit_stxi_i(lightrec_offset(next_pc), LIGHTREC_REG_STATE,
+			 DISPATCH_PC);
 	}
 
 	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
@@ -439,7 +443,10 @@ static void rec_alloc_rs_rd(struct regcache *reg_cache,
 		discard = unload_flags == LIGHTREC_REG_DISCARD;
 	}
 
-	if (OPT_EARLY_UNLOAD && rs && rd != rs && (unload || discard)) {
+	if (OPT_EARLY_UNLOAD && rs && rd != rs && (unload || discard)
+	    && !lightrec_guest_is_pinned(rd)
+	    && !lightrec_reg_is_pinned_host(
+			lightrec_peek_reg_in(reg_cache, rs))) {
 		rs = lightrec_alloc_reg_in(reg_cache, _jit, rs, in_flags);
 		lightrec_remap_reg(reg_cache, _jit, rs, rd, discard);
 		lightrec_set_reg_out_flags(reg_cache, rs, out_flags);
@@ -1176,16 +1183,29 @@ static void call_to_c_wrapper(struct lightrec_cstate *state,
 
 	jit_movi(tmp2, (unsigned int)wrapper << (1 + __WORDSIZE / 32));
 
-	tmp = lightrec_get_reg_with_value(reg_cache,
-					  (intptr_t) state->state->c_wrapper);
-	if (tmp < 0) {
-		tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
-		jit_ldxi(tmp, LIGHTREC_REG_STATE, lightrec_offset(c_wrapper));
+	/* Guest values in the caller-saved argument registers do not survive
+	 * the outgoing arguments below, let alone the call itself. */
+	lightrec_save_argregs(reg_cache, _jit);
 
-		lightrec_temp_set_value(reg_cache, tmp,
-					(intptr_t) state->state->c_wrapper);
-	}
+	/* The C side reads guest registers out of memory, and pcsx can write
+	 * them back (interrupts, exceptions, HLE) while we are in there. Hand
+	 * the pins over and re-read them afterwards. */
+	lightrec_clean_pins(reg_cache, _jit);
 
+	/* The call target is fetched only now, after the pins have been
+	 * cleaned: from here to the reload below, a pin's host register is
+	 * spare, which is what lightrec_alloc_call_target() relies on when the
+	 * pins have taken the whole callee-saved pool. Reusing a cached copy
+	 * is not worth it here - the value would have to be cached somewhere
+	 * that survives both the argument setup and the call, which is the
+	 * exact register class that is scarce. */
+	tmp = lightrec_alloc_call_target(reg_cache, _jit);
+	jit_ldxi(tmp, LIGHTREC_REG_STATE, lightrec_offset(c_wrapper));
+
+	/* Only now: tmp2 carries the wrapper index into the call, so it must
+	 * stay allocated until the target register has been handed out -
+	 * otherwise the allocator picks it and the load above destroys the
+	 * argument. */
 	lightrec_free_reg(reg_cache, tmp2);
 
 #ifdef __mips__
@@ -1200,9 +1220,20 @@ static void call_to_c_wrapper(struct lightrec_cstate *state,
 	jit_pushargi(arg);
 
 	lightrec_regcache_mark_live(reg_cache, _jit);
+
+	/* The target register may have been borrowed rather than allocated -
+	 * see lightrec_alloc_call_target() - in which case nothing in the
+	 * register cache marks it live and lightning is free to treat it as
+	 * dead across the argument setup. Say otherwise explicitly. */
+	jit_live(tmp);
+
 	jit_callr(tmp);
 
-	lightrec_free_reg(reg_cache, tmp);
+	lightrec_regcache_load_pins(_jit);
+	lightrec_restore_argregs(reg_cache, _jit);
+
+	if (!lightrec_call_target_is_pin(tmp))
+		lightrec_free_reg(reg_cache, tmp);
 	lightrec_regcache_mark_live(reg_cache, _jit);
 }
 
@@ -2655,17 +2686,28 @@ static void rec_meta_MOV(struct lightrec_cstate *state,
 			 lightrec_reg_name(c.m.rs), lightrec_reg_name(c.m.rd),
 			 offset << 2);
 		rs = lightrec_alloc_reg_in(reg_cache, _jit, c.m.rs, 0);
-		lightrec_remap_reg(reg_cache, _jit, rs, c.m.rd, discard_rs);
+		if (!lightrec_reg_is_pinned_host(rs)
+		    && !lightrec_guest_is_pinned(c.m.rd)) {
+			lightrec_remap_reg(reg_cache, _jit, rs, c.m.rd,
+					   discard_rs);
+			lightrec_free_reg(reg_cache, rs);
+			return;
+		}
 		lightrec_free_reg(reg_cache, rs);
-		return;
 	}
 
+	/* A pinned destination is never really "unloaded": it keeps its host
+	 * register for the whole run, and every later read of it takes that
+	 * register rather than memory. Storing straight to the register cache
+	 * would leave the pin holding the previous value, so a pinned rd has
+	 * to go through the normal allocate-and-write path below. */
 	unload_rd = OPT_EARLY_UNLOAD
-		&& LIGHTREC_FLAGS_GET_RD(op->flags) == LIGHTREC_REG_UNLOAD;
+		&& LIGHTREC_FLAGS_GET_RD(op->flags) == LIGHTREC_REG_UNLOAD
+		&& !lightrec_guest_is_pinned(c.m.rd);
 
 	if (unload_rd) {
 		/* If the destination register will be unloaded right after the
-		 * MOV meta-opcode, we don't actually need to write any host
+		 * MOV meta-opcode, we do not actually need to write any host
 		 * register - we can just store the source register directly to
 		 * the register cache, at the offset corresponding to the
 		 * destination register. */

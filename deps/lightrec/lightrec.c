@@ -16,6 +16,7 @@
 #include "reaper.h"
 #include "recompiler.h"
 #include "regcache.h"
+#include "regcache.h"
 #include "optimizer.h"
 #include "tlsf/tlsf.h"
 
@@ -728,8 +729,78 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
 	return block;
 }
 
+#if defined(__sh__) && OPT_SH4_USE_GBR
+
+/* lightrec parks the state pointer in GBR while generated code runs. The C
+ * world uses GBR for the thread pointer, and errno lives in thread-local
+ * storage - so any C function reached *from* generated code runs with GBR
+ * pointing at the lightrec state, and the first errno write lands in the
+ * emulated register file.
+ *
+ * Calls made from lightrec_execute() itself are fine, because GBR still
+ * belongs to the C world there. It is the calls made from inside the
+ * dispatcher that are not: chaining to a block that has not been compiled yet
+ * reaches the compiler, and the compiler allocates.
+ *
+ * These shims put GBR back for the duration of the call. They touch no
+ * thread-local state themselves, so they are safe to enter with GBR wrong.
+ *
+ * Found by tools/lrtest -c, which faulted loading regs.cp0[8] from a base of
+ * zero in the second block of a chain. */
+static unsigned long lightrec_host_gbr;
+
+static inline unsigned long sh4_read_gbr(void)
+{
+	unsigned long v;
+
+	__asm__ __volatile__("stc gbr, %0" : "=r"(v));
+	return v;
+}
+
+static inline void sh4_write_gbr(unsigned long v)
+{
+	__asm__ __volatile__("ldc %0, gbr" : : "r"(v));
+}
+
+#define GBR_SHIM(ret_type, name, proto, args)				\
+static __attribute__((noinline)) ret_type name##_gbr proto		\
+{									\
+	unsigned long jit_gbr = sh4_read_gbr();				\
+	ret_type ret;							\
+									\
+	sh4_write_gbr(lightrec_host_gbr);				\
+	ret = name args;						\
+	sh4_write_gbr(jit_gbr);						\
+	return ret;							\
+}
+
+#define GBR_SHIM_VOID(name, proto, args)				\
+static __attribute__((noinline)) void name##_gbr proto			\
+{									\
+	unsigned long jit_gbr = sh4_read_gbr();				\
+									\
+	sh4_write_gbr(lightrec_host_gbr);				\
+	name args;							\
+	sh4_write_gbr(jit_gbr);						\
+}
+
+#define LIGHTREC_C_CALL(name)	(name##_gbr)
+#else
+#define LIGHTREC_C_CALL(name)	(name)
+#endif
+
 static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 {
+#if OPT_PIN_TRIPWIRE
+	if (state->dbg_pin_idx >= 0) {
+		pr_err("PIN STALE: pin %d (guest r%u) diverged at block pc %08x\n",
+		       (int)state->dbg_pin_idx,
+		       lightrec_pin_guest[state->dbg_pin_idx],
+		       state->dbg_pin_pc);
+		state->dbg_pin_idx = -1;
+	}
+#endif
+
 	struct block *block;
 	bool should_recompile;
 	void *func;
@@ -1091,13 +1162,25 @@ static void update_cycle_counter_after_c(jit_state_t *_jit)
 	jit_subr(LIGHTREC_REG_CYCLE, JIT_R2, JIT_R1);
 }
 
+
 static void sync_next_pc(jit_state_t *_jit)
 {
 	if (lightrec_store_next_pc()) {
-		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE,
+		jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE,
 			    lightrec_offset(next_pc));
 	}
 }
+
+#if defined(__sh__) && OPT_SH4_USE_GBR
+GBR_SHIM(void *, get_next_block_func,
+	 (struct lightrec_state *state, u32 pc), (state, pc))
+GBR_SHIM(u32, lightrec_memset, (struct lightrec_state *state), (state))
+GBR_SHIM(u32, lightrec_check_load_delay,
+	 (struct lightrec_state *state, u32 pc, u8 reg), (state, pc, reg))
+GBR_SHIM(u32, lightrec_emulate_block,
+	 (struct lightrec_state *state, struct block *block, u32 pc),
+	 (state, block, pc))
+#endif
 
 static struct block * generate_dispatcher(struct lightrec_state *state)
 {
@@ -1122,22 +1205,67 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	jit_prolog();
 	jit_frame(256);
 
-	jit_getarg(LIGHTREC_REG_STATE, jit_arg());
-	jit_getarg(JIT_V0, jit_arg());
-	jit_getarg(JIT_V1, jit_arg());
-	jit_getarg_i(LIGHTREC_REG_CYCLE, jit_arg());
+	/* The four incoming arguments arrive in the argument registers, and
+	 * DISPATCH_PC and DISPATCH_TMP may themselves be argument registers -
+	 * so fetching them in declaration order would overwrite a later
+	 * argument before it has been read. Declare in order, fetch in
+	 * reverse: each destination is then either the register it is reading
+	 * from, or one whose incoming argument has already been consumed. */
+	{
+		jit_node_t *a_state = jit_arg();
+		jit_node_t *a_pc = jit_arg();
+		jit_node_t *a_block = jit_arg();
+		jit_node_t *a_cycles = jit_arg();
+
+		jit_getarg_i(LIGHTREC_REG_CYCLE, a_cycles);
+		jit_getarg(DISPATCH_TMP, a_block);
+		jit_getarg(DISPATCH_PC, a_pc);
+		jit_getarg(LIGHTREC_REG_STATE, a_state);
+	}
 
 	/* Force all callee-saved registers to be pushed on the stack */
 	for (i = 0; i < NUM_REGS; i++)
 		jit_movr(JIT_V(i + FIRST_REG), JIT_V(i + FIRST_REG));
 
+	lightrec_regcache_reserve_pins(_jit);
+
+	/* The dispatcher's own working registers have to be reserved from
+	 * lightning as well. Blocks get this from lightrec_regcache_reserve();
+	 * the dispatcher never needed it while those registers were JIT_V0 and
+	 * JIT_V1, which lightning's allocator leaves alone anyway. Once they
+	 * became argument registers it does matter: jit_jmpi() asks lightning
+	 * for a scratch register to hold the target address, and without this
+	 * it can pick the very register holding the PC. The existing
+	 * jit_live(LIGHTREC_REG_CYCLE) in lightrec_jump_to_fn() is the same
+	 * hazard, found earlier and patched one register at a time. */
+	if (DISPATCH_PC != JIT_V0) {
+		jit_reserve_reg(DISPATCH_PC);
+		jit_reserve_reg(DISPATCH_TMP);
+		jit_reserve_reg(DISPATCH_TGT);
+	}
+
+	/* No pin load here: `loop` follows immediately and loads them itself.
+	 * Loading them twice would also clobber the block address that was
+	 * just read out of the incoming arguments. */
+
 	loop = jit_label();
+
+	/* Re-read the pins before entering a block. Without direct block
+	 * linking every transition comes through here, so this is currently
+	 * per block; once links.c lands, linked edges bypass the dispatcher
+	 * entirely and the pins genuinely persist - which is where the win
+	 * is. Dropping this needs the full audit of every C path that writes
+	 * guest registers (see pins_parked.md). */
+	/* Move the target out of DISPATCH_TMP before the reload can overwrite it. */
+	jit_movr(DISPATCH_TGT, DISPATCH_TMP);
+
+	lightrec_regcache_load_pins(_jit);
 
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
 
 	/* Call the block's code */
-	jit_jmpr(JIT_V1);
+	jit_jmpr(DISPATCH_TGT);
 
 	/* The block will jump here, with the number of cycles remaining in
 	 * LIGHTREC_REG_CYCLE */
@@ -1151,28 +1279,28 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	to_end = jit_blei(LIGHTREC_REG_CYCLE, 0);
 
 	/* Convert next PC to KUNSEG and avoid mirrors */
-	jit_andi(JIT_V1, JIT_V0, RAM_SIZE - 1);
-	jit_andi(JIT_R2, JIT_V0, BIOS_SIZE - 1);
-	jit_andi(JIT_R1, JIT_V0, BIT(28));
+	jit_andi(DISPATCH_TMP, DISPATCH_PC, RAM_SIZE - 1);
+	jit_andi(JIT_R2, DISPATCH_PC, BIOS_SIZE - 1);
+	jit_andi(JIT_R1, DISPATCH_PC, BIT(28));
 	jit_addi(JIT_R2, JIT_R2, RAM_SIZE);
-	jit_movnr(JIT_V1, JIT_R2, JIT_R1);
+	jit_movnr(DISPATCH_TMP, JIT_R2, JIT_R1);
 
 	/* If possible, use the code LUT */
 	if (!lut_is_32bit(state))
-		jit_lshi(JIT_V1, JIT_V1, 1);
-	jit_add_state(JIT_V1, JIT_V1);
+		jit_lshi(DISPATCH_TMP, DISPATCH_TMP, 1);
+	jit_add_state(DISPATCH_TMP, DISPATCH_TMP);
 
 	offset = lightrec_offset(code_lut);
 	if (lut_is_32bit(state))
-		jit_ldxi_ui(JIT_V1, JIT_V1, offset);
+		jit_ldxi_ui(DISPATCH_TMP, DISPATCH_TMP, offset);
 	else
-		jit_ldxi(JIT_V1, JIT_V1, offset);
+		jit_ldxi(DISPATCH_TMP, DISPATCH_TMP, offset);
 
 	/* Store back the current PC to the lightrec_state structure */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, DISPATCH_PC);
 
 	/* If we get non-NULL, loop */
-	jit_patch_at(jit_bnei(JIT_V1, 0), loop);
+	jit_patch_at(jit_bnei(DISPATCH_TMP, 0), loop);
 
 	/* The code LUT will be set to this address when the block at the target
 	 * PC has been preprocessed but not yet compiled by the threaded
@@ -1188,36 +1316,55 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 	jit_prepare();
 	jit_pushargr(LIGHTREC_REG_STATE);
-	jit_pushargr(JIT_V0);
+	jit_pushargr(DISPATCH_PC);
 
 	/* Save the cycles register if needed */
 	if (!(ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES))
-		jit_movr(JIT_V0, LIGHTREC_REG_CYCLE);
+		jit_movr(DISPATCH_PC, LIGHTREC_REG_CYCLE);
 
 	/* Get the next block */
-	jit_finishi(&get_next_block_func);
-	jit_retval(JIT_V1);
+	jit_finishi(LIGHTREC_C_CALL(&get_next_block_func));
+	jit_retval(DISPATCH_TMP);
+
+	/* get_next_block_func() runs C - block compilation, the reaper, and
+	 * anything pcsx does on the way through - which can write guest
+	 * registers in memory. Re-read the pins. This is off the hot path:
+	 * the dispatcher's inline LUT lookup only falls through to here when
+	 * the target block has not been compiled yet. */
+	lightrec_regcache_load_pins(_jit);
 
 	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
 		/* The interpreter may have updated state->current_cycle and
 		 * state->target_cycle - recalc the delta */
 		update_cycle_counter_after_c(_jit);
 	} else {
-		jit_movr(LIGHTREC_REG_CYCLE, JIT_V0);
+		jit_movr(LIGHTREC_REG_CYCLE, DISPATCH_PC);
 	}
 
-	/* Reset JIT_V0 to the next PC */
-	jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(curr_pc));
+	/* Reset DISPATCH_PC to the next PC */
+	jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE, lightrec_offset(curr_pc));
 
 	/* If we get non-NULL, loop */
-	jit_patch_at(jit_bnei(JIT_V1, 0), loop);
+	jit_patch_at(jit_bnei(DISPATCH_TMP, 0), loop);
 
 	/* When exiting, the recompiled code will jump to that address */
 	jit_note(__FILE__, __LINE__);
 	jit_patch(to_end);
 
 	/* Store back the current PC to the lightrec_state structure */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, DISPATCH_PC);
+
+	/* No store_pins here, deliberately. It looks like the counterpart of
+	 * the load at `loop`, but the dispatcher uses DISPATCH_PC and DISPATCH_TMP as its
+	 * own scratch - next PC and block address - so when PIN_FIRST_SLOT is
+	 * 0 those registers hold dispatcher values at this point, not guest
+	 * ones, and storing them corrupts guest state that was already correct
+	 * in memory. Measured: it moved the failure earlier, not later.
+	 *
+	 * Correctness does not need it anyway: every block cleans its dirty
+	 * registers before exiting. A store here only becomes right once the
+	 * dispatcher stops using DISPATCH_PC/DISPATCH_TMP, which is the same change that
+	 * six pins needs on real hardware. See pins_parked.md. */
 
 	jit_retr(LIGHTREC_REG_CYCLE);
 
@@ -1226,17 +1373,30 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		 * lightrec_memset() */
 		addr3 = jit_indirect();
 
-		jit_movr(JIT_V1, LIGHTREC_REG_CYCLE);
+		/* The cycle count has to survive the call so the cycles the
+		 * helper consumed can be subtracted afterwards. It used to be
+		 * parked in DISPATCH_TMP, which was callee-saved; once the
+		 * dispatcher moved to caller-saved registers that no longer
+		 * holds, so it goes through the state instead. This is the
+		 * only place in the dispatcher that needed a value to live
+		 * across a call - everything else is either stored to
+		 * state->curr_pc and read back, or produced by the call. */
+		update_cycle_counter_before_c(_jit);
 
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
 
-		jit_finishi(lightrec_memset);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_memset));
 		jit_retval(LIGHTREC_REG_CYCLE);
 
-		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(regs.gpr[31]));
+		/* This C helper can write guest registers in memory. */
+		lightrec_regcache_load_pins(_jit);
 
-		jit_subr(LIGHTREC_REG_CYCLE, JIT_V1, LIGHTREC_REG_CYCLE);
+		jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE, lightrec_offset(regs.gpr[31]));
+
+		jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE,
+			   LIGHTREC_REG_CYCLE);
+		update_cycle_counter_after_c(_jit);
 
 		jit_patch_at(jit_b(), loop2);
 	}
@@ -1244,7 +1404,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	if (OPT_DETECT_IMPOSSIBLE_BRANCHES) {
 		/* Blocks will jump here when they reach a branch that should
 		 * be executed with the interpreter, passing the branch's PC
-		 * in JIT_V0 and the address of the block in JIT_V1. */
+		 * in DISPATCH_PC and the address of the block in DISPATCH_TMP. */
 		addr4 = jit_indirect();
 
 		sync_next_pc(_jit);
@@ -1252,11 +1412,14 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(JIT_V1);
-		jit_pushargr(JIT_V0);
-		jit_finishi(lightrec_emulate_block);
+		jit_pushargr(DISPATCH_TMP);
+		jit_pushargr(DISPATCH_PC);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_emulate_block));
 
-		jit_retval(JIT_V0);
+		jit_retval(DISPATCH_PC);
+
+		/* This C helper can write guest registers in memory. */
+		lightrec_regcache_load_pins(_jit);
 
 		update_cycle_counter_after_c(_jit);
 
@@ -1268,7 +1431,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		/* Blocks will jump here when they reach a branch with a load
 		 * opcode in its delay slot. The delay slot has already been
 		 * executed; the load value is in (state->temp_reg), and the
-		 * register number is in JIT_V1.
+		 * register number is in DISPATCH_TMP.
 		 * Jump to a C function which will evaluate the branch target's
 		 * first opcode, to make sure that it does not read the register
 		 * in question; and if it does, handle it accordingly. */
@@ -1279,11 +1442,14 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(JIT_V0);
-		jit_pushargr(JIT_V1);
-		jit_finishi(lightrec_check_load_delay);
+		jit_pushargr(DISPATCH_PC);
+		jit_pushargr(DISPATCH_TMP);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_check_load_delay));
 
-		jit_retval(JIT_V0);
+		jit_retval(DISPATCH_PC);
+
+		/* This C helper can write guest registers in memory. */
+		lightrec_regcache_load_pins(_jit);
 
 		update_cycle_counter_after_c(_jit);
 
@@ -1580,7 +1746,11 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 	lightrec_regcache_reset(cstate->reg_cache);
 
-	if (OPT_PRELOAD_PC && (block->flags & BLOCK_PRELOAD_PC))
+	/* Preloading the PC claims JIT_V0 for it. When JIT_V0 is a pin's
+	 * permanent home that claim would evict the pin, and the block would
+	 * read the PC where it expects a guest register. */
+	if (OPT_PRELOAD_PC && (block->flags & BLOCK_PRELOAD_PC)
+	    && !lightrec_reg_is_pinned_host(JIT_V0))
 		lightrec_preload_pc(cstate->reg_cache, _jit);
 
 	if (!arch_has_fast_mask())
@@ -1593,6 +1763,8 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 	jit_prolog();
 	jit_tramp(256);
+	lightrec_regcache_reserve(_jit);
+	lightrec_emit_pin_tripwire(cstate->reg_cache, _jit, block->pc);
 
 	start_of_block = jit_label();
 
@@ -1808,6 +1980,12 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 
 	state->exit_flags = LIGHTREC_EXIT_NORMAL;
 
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	/* Remember the C world's GBR so the shims above can restore it around
+	 * calls made from inside the dispatcher. */
+	lightrec_host_gbr = sh4_read_gbr();
+#endif
+
 	/* Handle the cycle counter overflowing */
 	if (unlikely(target_cycle < state->current_cycle))
 		target_cycle = UINT_MAX;
@@ -1982,6 +2160,7 @@ struct lightrec_state * lightrec_init(char *argv0,
 
 	memcpy(&state->ops, ops, sizeof(*ops));
 
+	state->dbg_pin_idx = -1;
 	state->dispatcher = generate_dispatcher(state);
 	if (!state->dispatcher)
 		goto err_free_reaper;

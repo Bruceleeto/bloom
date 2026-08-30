@@ -3,3 +3,4 @@ romdisk.img
 build
 *.o
 states/
+tools/

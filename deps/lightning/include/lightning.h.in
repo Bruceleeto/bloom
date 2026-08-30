@@ -190,6 +190,12 @@ typedef struct jit_state	jit_state_t;
 typedef enum {
     jit_code_data,
 #define jit_live(u)		jit_new_node_w(jit_code_live, u)
+/* Declare a register as owned by the caller: jit_get_reg() will never hand it
+ * out as a scratch register, at any phase. Unlike jit_live(), which marks
+ * liveness at one node, this holds for the life of the jit_state. Named
+ * requests (jit_class_named) are unaffected - the caller can still ask for its
+ * own registers explicitly. */
+#define jit_reserve_reg(u)	_jit_reserve_reg(_jit,u)
 #define jit_align(u)		jit_new_node_w(jit_code_align, u)
     jit_code_live,		jit_code_align,
     jit_code_save,		jit_code_load,
@@ -1348,6 +1354,7 @@ extern void _jit_destroy_state(jit_state_t*);
 
 #define jit_address(node)	_jit_address(_jit, node)
 extern jit_pointer_t _jit_address(jit_state_t*, jit_node_t*);
+extern void _jit_reserve_reg(jit_state_t*, jit_int32_t);
 extern jit_node_t *_jit_name(jit_state_t*, const char*);
 extern jit_node_t *_jit_note(jit_state_t*, const char*, int);
 extern jit_node_t *_jit_label(jit_state_t*);

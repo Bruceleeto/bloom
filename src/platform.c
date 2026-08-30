@@ -22,6 +22,7 @@
 #include <sys/time.h>
 
 #include "bloom-config.h"
+#include "prof.h"
 #include "emu.h"
 #include "pvr.h"
 
@@ -309,6 +310,8 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
 
+
+		prof_window();
 
 		printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%%\n",
 		       (float)frames * 1000.0f / (float)(new_timer - timer_ms),
