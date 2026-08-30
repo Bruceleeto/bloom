@@ -1663,6 +1663,30 @@ _casx(jit_state_t *_jit, jit_int32_t r0, jit_int32_t r1,
 static void
 _addr(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_uint16_t r2)
 {
+	/* GBR is register 16 and ADD encodes its operands in 4 bits, so
+	 * ADD(rn, _GBR) silently assembles as ADD(rn, _R0) - wrong code, no
+	 * diagnostic. movr() reads GBR properly with `stc gbr,Rn`, so stage
+	 * it into a GPR first. Reachable whenever the lightrec state pointer
+	 * lives in GBR (OPT_SH4_USE_GBR). */
+	if (r1 == _GBR || r2 == _GBR) {
+		jit_uint16_t gpr;
+
+		if (r1 == _GBR && r2 == _GBR) {
+			movr(r0, _GBR);
+			ADD(r0, r0);
+			return;
+		}
+		gpr = (r1 == _GBR) ? r2 : r1;
+		if (r0 != gpr) {
+			movr(r0, _GBR);
+			ADD(r0, gpr);
+		} else {
+			assert(r0 != _R0);
+			movr(_R0, _GBR);
+			ADD(r0, _R0);
+		}
+		return;
+	}
 	if (r0 == r2) {
 		ADD(r0, r1);
 	} else {
@@ -1692,6 +1716,14 @@ _addxr(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_uint16_t r2)
 static void
 _addi(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 {
+	/* Same trap as _addr: with a displacement past 127 this falls into
+	 * addr(r0, _GBR, r0), which cannot encode GBR. Read GBR into the
+	 * destination first and do the arithmetic in a GPR. */
+	if (r1 == _GBR) {
+		movr(r0, r1);
+		addi(r0, r0, i0);
+		return;
+	}
 	if (i0 >= -128 && i0 < 127) {
 		movr(r0, r1);
 		ADDI(r0, i0);

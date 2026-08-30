@@ -1493,6 +1493,11 @@ extern void _jit_fnmsi_d(jit_state_t*,
 #define jit_get_reg(s)		_jit_get_reg(_jit,s)
 extern jit_int32_t _jit_get_reg(jit_state_t*, jit_int32_t);
 
+/* Mark a register as owned by the caller: lightning's own scratch allocation
+ * will never hand it out. Used by lightrec for its pinned guest registers. */
+#define jit_reserve_reg(u)	_jit_reserve_reg(_jit,u)
+extern void _jit_reserve_reg(jit_state_t*, jit_int32_t);
+
 #define jit_unget_reg(r)	_jit_unget_reg(_jit,r)
 extern void _jit_unget_reg(jit_state_t*, jit_int32_t);
 

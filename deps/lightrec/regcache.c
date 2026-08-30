@@ -70,10 +70,10 @@ struct regcache {
  * a1 8, at 3.4); every one sits below offset 60 in regs.gpr so its entry
  * load is a single 2-byte `mov.l @(disp,Rm),Rn`, which the fixed-size
  * stub depends on (s0/sp would not be). */
-#if defined(__sh__) && OPT_SH4_USE_GBR
-static const u8 pin_guest[NUM_PINNED] = { 2, 3, 4, 5, 1, 6 };
-#else
+#if NUM_PINNED
 static const u8 pin_guest[NUM_PINNED] = { 2, 3, 4, 5 };
+#else
+static const u8 pin_guest[1] = { 0 };   /* NUM_PINNED 0: never indexed */
 #endif
 _Static_assert(PIN_FIRST_SLOT + NUM_PINNED <= NUM_VREGS, "pins exceed V pool");
 _Static_assert(NUM_PINNED == LIGHTREC_NUM_PINNED, "regcache.h disagrees");
@@ -860,8 +860,9 @@ void lightrec_regcache_sync_target(struct regcache *cache, jit_state_t *_jit)
 }
 
 /* The code-LUT entry stub: NUM_PINNED loads, exactly LIGHTREC_PIN_STUB_BYTES
- * of code (each is one `mov.l @(disp,Rm),Rn`), so a direct link can enter
- * right behind it with the pins already in their registers. */
+ * of code, so a direct link can enter right behind it with the pins already
+ * in their registers. One instruction per pin, or two when the state is in
+ * GBR - see LIGHTREC_PIN_STUB_BYTES. */
 void lightrec_regcache_entry_loads(struct regcache *cache, jit_state_t *_jit)
 {
 	unsigned int i;

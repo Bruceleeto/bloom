@@ -4,3 +4,4 @@ build
 *.o
 states/
 romdisk/bench.sav.gz
+tools/

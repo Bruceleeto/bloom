@@ -112,14 +112,24 @@ _Bool lightrec_has_dirty_regs(struct regcache *cache);
 
 /* Pinned guest registers - see the contract in regcache.c. */
 #if defined(__sh__) && OPT_SH4_USE_GBR
-#  define LIGHTREC_NUM_PINNED 6
+#  define LIGHTREC_NUM_PINNED 4
 #elif defined(__sh__)
 #  define LIGHTREC_NUM_PINNED 4
 #else
 #  define LIGHTREC_NUM_PINNED 0
 #endif
-/* Size of the code-LUT entry stub in front of every block / target. */
-#define LIGHTREC_PIN_STUB_BYTES (2 * LIGHTREC_NUM_PINNED)
+/* Size of the code-LUT entry stub in front of every block / target.
+ *
+ * One `mov.l @(disp,Rm),Rn` per pin, 2 bytes each - except with the state in
+ * GBR, where SH-4 hard-wires R0 as the data register of the displacement
+ * form: lightning emits `mov.l @(disp,gbr),r0` plus `mov r0,Rn`, so each pin
+ * costs 4. Getting this wrong puts a direct link's entry point inside the
+ * stub instead of behind it, and execution runs off into whatever follows. */
+#if defined(__sh__) && OPT_SH4_USE_GBR
+#  define LIGHTREC_PIN_STUB_BYTES (4 * LIGHTREC_NUM_PINNED)
+#else
+#  define LIGHTREC_PIN_STUB_BYTES (2 * LIGHTREC_NUM_PINNED)
+#endif
 _Bool lightrec_reg_is_pinned(u16 reg);
 void lightrec_regcache_pin_block(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_local_edge(struct regcache *cache, jit_state_t *_jit);

@@ -756,6 +756,67 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
 	return block;
 }
 
+#if defined(__sh__) && OPT_SH4_USE_GBR
+
+/* lightrec parks the state pointer in GBR while generated code runs. The C
+ * world uses GBR for the thread pointer, and errno lives in thread-local
+ * storage - so any C function reached *from* generated code runs with GBR
+ * pointing at the lightrec state, and the first errno write lands in the
+ * emulated register file.
+ *
+ * Calls made from lightrec_execute() itself are fine, because GBR still
+ * belongs to the C world there. It is the calls made from inside the
+ * dispatcher that are not: chaining to a block that has not been compiled yet
+ * reaches the compiler, and the compiler allocates.
+ *
+ * These shims put GBR back for the duration of the call. They touch no
+ * thread-local state themselves, so they are safe to enter with GBR wrong.
+ *
+ * Ported from testing9, where tools/lrtest -c found it: a fault loading
+ * regs.cp0[8] from a base of zero in the second block of a chain. */
+static unsigned long lightrec_host_gbr;
+
+static inline unsigned long sh4_read_gbr(void)
+{
+	unsigned long v;
+
+	__asm__ __volatile__("stc gbr, %0" : "=r"(v));
+	return v;
+}
+
+static inline void sh4_write_gbr(unsigned long v)
+{
+	__asm__ __volatile__("ldc %0, gbr" : : "r"(v));
+}
+
+#define GBR_SHIM(ret_type, name, proto, args)				\
+static __attribute__((noinline)) ret_type name##_gbr proto		\
+{									\
+	unsigned long jit_gbr = sh4_read_gbr();				\
+	ret_type ret;							\
+									\
+	sh4_write_gbr(lightrec_host_gbr);				\
+	ret = name args;						\
+	sh4_write_gbr(jit_gbr);						\
+	return ret;							\
+}
+
+#define GBR_SHIM_VOID(name, proto, args)				\
+static __attribute__((noinline)) void name##_gbr proto			\
+{									\
+	unsigned long jit_gbr = sh4_read_gbr();				\
+									\
+	sh4_write_gbr(lightrec_host_gbr);				\
+	name args;							\
+	sh4_write_gbr(jit_gbr);						\
+}
+
+#define LIGHTREC_C_CALL(name)	(name##_gbr)
+
+#else
+#define LIGHTREC_C_CALL(name)	(name)
+#endif
+
 static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 {
 	struct block *block;
@@ -1144,6 +1205,19 @@ void lightrec_link_inv_cb(u32 arg, struct lightrec_state *state)
 		lut_write(state, offset + 1, NULL);
 }
 
+#if defined(__sh__) && OPT_SH4_USE_GBR
+GBR_SHIM(void *, get_next_block_func,
+	 (struct lightrec_state *state, u32 pc), (state, pc))
+GBR_SHIM(u32, lightrec_memset, (struct lightrec_state *state), (state))
+GBR_SHIM(u32, lightrec_check_load_delay,
+	 (struct lightrec_state *state, u32 pc, u8 reg), (state, pc, reg))
+GBR_SHIM(u32, lightrec_emulate_block,
+	 (struct lightrec_state *state, struct block *block, u32 pc),
+	 (state, block, pc))
+GBR_SHIM_VOID(lightrec_link_inv_cb,
+	      (u32 arg, struct lightrec_state *state), (arg, state))
+#endif
+
 /* Out-of-line stub for the store-invalidate rare path (emitter.c,
  * rec_store_invalidate_lut). The call site only stores the LUT entry's
  * address to state->link_inv_arg and jsr's here, so it stays a few bytes
@@ -1186,7 +1260,7 @@ static struct block * generate_link_inv_stub(struct lightrec_state *state)
 	jit_prepare();
 	jit_pushargr(JIT_R2);
 	jit_pushargr(LIGHTREC_REG_STATE);
-	jit_finishi(lightrec_link_inv_cb);
+	jit_finishi(LIGHTREC_C_CALL(lightrec_link_inv_cb));
 
 	for (i = 0; i < 4; i++) {
 		jit_ldxi(_R4 + i, LIGHTREC_REG_STATE,
@@ -1258,6 +1332,16 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	/* Force all callee-saved registers to be pushed on the stack */
 	for (i = 0; i < NUM_VREGS; i++)
 		jit_movr(JIT_V(i + FIRST_REG), JIT_V(i + FIRST_REG));
+
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	/* Blocks arrive over a direct link with the pins live in their
+	 * registers, so nothing on this path may hand one to lightning as
+	 * scratch - jit_jmpi() and the wide-displacement addressing helpers
+	 * both ask for one. Blocks get the same treatment where they are
+	 * compiled; the dispatcher needs it in its own jit_state. */
+	for (i = 0; i < LIGHTREC_NUM_PINNED; i++)
+		jit_reserve_reg(JIT_V(FIRST_REG + i));
+#endif
 
 	to_loop = jit_jmpi();
 
@@ -1342,7 +1426,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_movr(JIT_V0, LIGHTREC_REG_CYCLE);
 
 	/* Get the next block */
-	jit_finishi(&get_next_block_func);
+	jit_finishi(LIGHTREC_C_CALL(&get_next_block_func));
 	jit_retval(JIT_V1);
 
 	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
@@ -1378,7 +1462,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
 
-		jit_finishi(lightrec_memset);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_memset));
 		jit_retval(LIGHTREC_REG_CYCLE);
 
 		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(regs.gpr[31]));
@@ -1403,7 +1487,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_pushargr(LIGHTREC_REG_STATE);
 		jit_pushargr(JIT_V1);
 		jit_pushargr(JIT_V0);
-		jit_finishi(lightrec_emulate_block);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_emulate_block));
 
 		jit_retval(JIT_V0);
 
@@ -1432,7 +1516,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_pushargr(LIGHTREC_REG_STATE);
 		jit_pushargr(JIT_V0);
 		jit_pushargr(JIT_V1);
-		jit_finishi(lightrec_check_load_delay);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_check_load_delay));
 
 		jit_retval(JIT_V0);
 
@@ -1796,6 +1880,22 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	jit_prolog();
 	jit_tramp(256);
 
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	{
+		/* With the state pointer in GBR, lightning's addressing
+		 * fallbacks (jit_sh-cpu.c _stxi_i / _ldxi_i, offsets past the
+		 * 1020-byte GBR displacement) allocate their own scratch with
+		 * jit_get_reg(). Lightning knows nothing about the pins, so
+		 * without this it can hand one out and clobber a guest
+		 * register. The non-GBR paths stage through R0 and never
+		 * allocate, which is why this only bites here. */
+		unsigned int pin;
+
+		for (pin = 0; pin < LIGHTREC_NUM_PINNED; pin++)
+			jit_reserve_reg(JIT_V(pin));  /* pins live at slot 0.. */
+	}
+#endif
+
 	/* Pinned registers (regcache.c): the code-LUT entry is this fixed
 	 * stub of loads; a direct link enters just behind it with the pins
 	 * already in their registers. */
@@ -1859,6 +1959,15 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 		target->label = jit_indirect();
 		lightrec_regcache_entry_loads(cstate->reg_cache, _jit);
+
+		/* Barrier, exactly as for start_of_block above: a link enters
+		 * at target->label + LIGHTREC_PIN_STUB_BYTES, so the stub has
+		 * to end there. Without an address-taken label the SH-4
+		 * scheduler pairs the jmpi's literal load into the stub, the
+		 * link enters past it, and the jmp goes through whatever the
+		 * previous block left in that register. */
+		jit_indirect();
+
 		jit_patch_at(jit_jmpi(), target->local_label);
 	}
 
@@ -1966,18 +2075,34 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		if (!target->offset)
 			continue;
 
-		/* We know from now on that block2 (if present) isn't going to
-		 * be compiled. We can override the LUT entry with our new
-		 * block's entry point. */
-		offset = lut_offset(block->pc) + target->offset;
-		lut_write(state, offset, jit_address(target->label));
-
 		if (ENABLE_THREADED_COMPILER) {
 			block2 = dead_blocks[i];
 		} else {
 			offset = block->pc + target->offset * sizeof(u32);
 			block2 = lightrec_find_block(state->block_cache, offset);
 		}
+
+		/* Drop block2's LUT range before publishing ours. Every other
+		 * site that frees a block does this (see lightrec.c's outdated
+		 * -block path and blockcache.c); this one did not, and neither
+		 * does lightrec_reap_block, which relies on its caller. The
+		 * range still points at code we are about to free, and only
+		 * remove_from_code_lut() tells links.c to repoint the inbound
+		 * links at the dispatcher. Leave it out and a link keeps
+		 * jumping into the freed region - which the code allocator has
+		 * by then handed to another block.
+		 *
+		 * It has to come before the lut_write below: it memsets
+		 * block2's whole nb_ops range, which can cover our entry. */
+		if (block2)
+			remove_from_code_lut(state->block_cache, block2);
+
+		/* We know from now on that block2 (if present) isn't going to
+		 * be compiled. We can override the LUT entry with our new
+		 * block's entry point. */
+		offset = lut_offset(block->pc) + target->offset;
+		lut_write(state, offset, jit_address(target->label));
+
 		if (block2) {
 			pr_debug("Reap block "X32_FMT" as it's covered by block "
 				 X32_FMT"\n", block2->pc, block->pc);
@@ -2069,6 +2194,12 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 	s32 cycles_delta;
 
 	state->exit_flags = LIGHTREC_EXIT_NORMAL;
+
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	/* Remember the C world's GBR so the shims can restore it around calls
+	 * made from inside the dispatcher. */
+	lightrec_host_gbr = sh4_read_gbr();
+#endif
 
 	/* Handle the cycle counter overflowing */
 	if (unlikely(target_cycle < state->current_cycle))
