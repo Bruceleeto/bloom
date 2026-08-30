@@ -12,6 +12,7 @@
 #include <dc/maple/mouse.h>
 #include <dc/maple/purupuru.h>
 #include <kos/regfield.h>
+#include <kos/thread.h>
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -76,6 +77,70 @@ static void emu_attach_mouse_cb(maple_device_t *dev, void *)
 	in_type[dev->port] = PSE_PAD_TYPE_MOUSE;
 }
 
+static bool any_controller(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 4; i++) {
+		if (maple_enum_type(i, MAPLE_FUNC_CONTROLLER))
+			return true;
+	}
+
+	return false;
+}
+
+/* input_init() used to enumerate the bus with no synchronisation against the
+ * initial maple scan. If it ran while that scan was still in flight, a device
+ * could be latched before it had answered the device-info request and end up
+ * registered with an empty function mask - it shows up in the KOS banner as
+ * "A0: (00000000: LightGun)", with the A1 VMU missing too. The port is then
+ * occupied, so KOS never re-detects it and no MAPLE_FUNC_CONTROLLER attach
+ * callback ever fires: in_type[] stays PSE_PAD_TYPE_NONE, the emulated PSX has
+ * no pad plugged in, and in-game input is dead. The exit combo still works,
+ * because that reads KOS maple state directly rather than in_type[] - which is
+ * what makes this look like an emulation bug rather than an init-order one.
+ * Only a physical unplug/replug cleared it.
+ *
+ * The race has always been here; it only started firing when the build stopped
+ * compiling recompiler.c/reaper.c (ENABLE_THREADED_COMPILER=OFF, forced by
+ * ENABLE_FIRST_PASS=OFF). That took ~5.8 KiB off .text, so boot reached
+ * input_init() slightly sooner and began losing the race - deterministically
+ * for a given binary, which is why it reproduced on every run. Nothing to do
+ * with the JIT: any change that shifts binary size could have exposed it.
+ *
+ * maple_wait_scan() in input_init() removes the race itself. This function
+ * handles the leftover case where the scan completed but a device did register
+ * with a bogus mask: detach it so the periodic autodetect re-attaches it
+ * properly - a replug in software. */
+static void redetect_bogus_devices(void)
+{
+	unsigned int tries, i;
+	bool detached;
+
+	for (tries = 0; tries < 3 && !any_controller(); tries++) {
+		detached = false;
+
+		for (i = 0; i < 4; i++) {
+			/* A port with no device, or one that legitimately
+			 * enumerated as something else, is left alone. */
+			if (!maple_dev_valid(i, 0)
+			    || maple_enum_type(i, MAPLE_FUNC_MOUSE))
+				continue;
+
+			printf("input: port %u enumerated with no controller"
+			       " function - forcing re-detect\n", i);
+			maple_driver_detach(i, 0);
+			detached = true;
+		}
+
+		if (!detached)
+			break;
+
+		/* Let the periodic autodetect re-attach the device. */
+		thd_sleep(200);
+	}
+}
+
 void input_init(void) {
         maple_device_t *dev;
 	unsigned int i;
@@ -86,7 +151,14 @@ void input_init(void) {
 	maple_detach_callback(MAPLE_FUNC_CONTROLLER, emu_detach_cb, NULL);
 	maple_detach_callback(MAPLE_FUNC_MOUSE, emu_detach_cb, NULL);
 
+	maple_wait_scan();
+	redetect_bogus_devices();
+
 	for (i = 0; i < 4; i++) {
+		/* A re-attach above already ran the callback for this port. */
+		if (in_type[i] != PSE_PAD_TYPE_NONE)
+			continue;
+
 		dev = maple_enum_type(i, MAPLE_FUNC_CONTROLLER);
 		if (dev)
 			emu_attach_cont_cb(dev, NULL);

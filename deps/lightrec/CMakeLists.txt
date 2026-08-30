@@ -62,9 +62,9 @@ endif()
 
 set(HAS_DEFAULT_ELM ${CMAKE_COMPILER_IS_GNUCC})
 
-option(ENABLE_FIRST_PASS "Run the interpreter as first-pass optimization" ON)
+option(ENABLE_FIRST_PASS "Run the interpreter as first-pass optimization" OFF)
 
-option(ENABLE_THREADED_COMPILER "Enable threaded compiler" ON)
+option(ENABLE_THREADED_COMPILER "Enable threaded compiler" OFF)
 if (ENABLE_THREADED_COMPILER)
 	target_sources(lightrec PRIVATE recompiler.c reaper.c)
 
@@ -86,7 +86,7 @@ option(OPT_EARLY_UNLOAD "(optimization) Unload registers early" ON)
 option(OPT_PRELOAD_PC "(optimization) Preload PC value into register" ON)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "SH4|sh4")
-	option(OPT_SH4_USE_GBR "(SH4 optimization) Use GBR register for the state pointer" OFF)
+	option(OPT_SH4_USE_GBR "(SH4 optimization) Use GBR register for the state pointer" ON)
 endif()
 
 target_include_directories(lightrec PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
