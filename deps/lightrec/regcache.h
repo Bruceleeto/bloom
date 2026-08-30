@@ -126,10 +126,23 @@ _Bool lightrec_has_dirty_regs(struct regcache *cache);
  * costs 4. Getting this wrong puts a direct link's entry point inside the
  * stub instead of behind it, and execution runs off into whatever follows. */
 #if defined(__sh__) && OPT_SH4_USE_GBR
-#  define LIGHTREC_PIN_STUB_BYTES (4 * LIGHTREC_NUM_PINNED)
+#  define LIGHTREC_PIN_STUB_BYTES 0
 #else
-#  define LIGHTREC_PIN_STUB_BYTES (2 * LIGHTREC_NUM_PINNED)
+#  define LIGHTREC_PIN_STUB_BYTES 0
 #endif
+/* The dispatcher's own working registers. They must not be JIT_V0/JIT_V1
+ * when guest registers are pinned there: every dispatcher round trip would
+ * destroy two pins, which is exactly what forces the per-block entry reload.
+ * r6/r7 are caller-saved, so nothing may be held in them across a C call -
+ * the cycle counter goes through the state struct instead. */
+#if defined(__sh__) && LIGHTREC_NUM_PINNED > 0
+#  define DISPATCH_PC  _R7
+#  define DISPATCH_TMP _R6
+#else
+#  define DISPATCH_PC  JIT_V0
+#  define DISPATCH_TMP JIT_V1
+#endif
+
 _Bool lightrec_reg_is_pinned(u16 reg);
 void lightrec_regcache_pin_block(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_local_edge(struct regcache *cache, jit_state_t *_jit);
@@ -138,6 +151,7 @@ void lightrec_regcache_clean_unpinned(struct regcache *cache, jit_state_t *_jit)
 void lightrec_regcache_store_pins(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_entry_loads(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_pin_stores_raw(jit_state_t *_jit);
+void lightrec_regcache_pin_loads_raw(jit_state_t *_jit);
 
 _Bool lightrec_reg_is_loaded(struct regcache *cache, u16 reg);
 void lightrec_clean_reg_if_loaded(struct regcache *cache, jit_state_t *_jit,

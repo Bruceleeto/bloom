@@ -100,7 +100,6 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 
 	if (lightrec_store_next_pc()
 	    || state->nb_links >= ARRAY_SIZE(state->links)) {
-		lightrec_regcache_store_pins(state->reg_cache, _jit);
 		lightrec_jump_to_fast_eob(state, _jit, offset);
 		return;
 	}
@@ -128,7 +127,6 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	state->nb_links++;
 
 	jit_patch(to_eob);
-	lightrec_regcache_store_pins(state->reg_cache, _jit);
 	lightrec_jump_to_fast_eob(state, _jit, offset);
 }
 
@@ -186,14 +184,12 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 	jit_patch(to_slow3);
 
 	/* Dispatcher route: pins written back, LUT entry address in AUX. */
-	lightrec_regcache_store_pins(state->reg_cache, _jit);
 	lightrec_jump_to_fn(_jit, ls->fast_eob);
 }
 #else
 static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 				      jit_state_t *_jit)
 {
-	lightrec_regcache_store_pins(state->reg_cache, _jit);
 	lightrec_jump_to_eob(state, _jit);
 }
 #endif
@@ -269,7 +265,6 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 		 * REG_TEMP, and the target register number to be in LIGHTREC_REG_AUX.*/
 		jit_movi(LIGHTREC_REG_AUX, ds->c.i.rt);
 
-		lightrec_regcache_store_pins(reg_cache, _jit);
 		lightrec_jump_to_ds_check(state, _jit);
 	} else if (reg_new_pc < 0) {
 		/* We already know the target: we can try to load it directly
@@ -1387,6 +1382,12 @@ static void call_to_c_wrapper(struct lightrec_cstate *state,
 	 * argument push below overwrites (r4-r7 are allocator slots). */
 	jit_prepare();
 	jit_pushargi(arg);
+
+	/* The wrapper reaches C that reads the guest register file from
+	 * memory (MTC) and writes it (the RW loads, MFC), so the pins go back
+	 * before the call and come back after. Blocks no longer spill them at
+	 * every exit, so this is where the obligation lives now. */
+	lightrec_regcache_store_pins(reg_cache, _jit);
 
 	lightrec_regcache_mark_live(reg_cache, _jit);
 	jit_finishi((jit_pointer_t)state->state->c_wrapper);

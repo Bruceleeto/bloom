@@ -1304,6 +1304,7 @@ err_no_mem:
 static struct block * generate_dispatcher(struct lightrec_state *state)
 {
 	struct block *block;
+	jit_node_t *arg_state, *arg_pc, *arg_trace, *arg_cycles;
 	jit_state_t *_jit;
 	jit_node_t *to_end, *to_loop, *to_slow_path, *loop, *loop2,
 		   *addr, *addr2, *addr3, *addr4, *addr5, *addr6, *addr7,
@@ -1324,10 +1325,18 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	jit_prolog();
 	jit_frame(256);
 
-	jit_getarg(LIGHTREC_REG_STATE, jit_arg());
-	jit_getarg(JIT_V0, jit_arg());
-	jit_getarg(JIT_V1, jit_arg());
-	jit_getarg_i(LIGHTREC_REG_CYCLE, jit_arg());
+	arg_state = jit_arg();
+	arg_pc = jit_arg();
+	arg_trace = jit_arg();
+	arg_cycles = jit_arg();
+
+	/* Fetch in reverse. The arguments arrive in r4..r7 and DISPATCH_PC is
+	 * r7: reading arg 1 into it first would destroy arg 3, which is still
+	 * sitting there. */
+	jit_getarg_i(LIGHTREC_REG_CYCLE, arg_cycles);
+	jit_getarg(DISPATCH_TMP, arg_trace);
+	jit_getarg(DISPATCH_PC, arg_pc);
+	jit_getarg(LIGHTREC_REG_STATE, arg_state);
 
 	/* Force all callee-saved registers to be pushed on the stack */
 	for (i = 0; i < NUM_VREGS; i++)
@@ -1343,6 +1352,9 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_reserve_reg(JIT_V(FIRST_REG + i));
 #endif
 
+	/* First entry from lightrec_execute(): the pins hold nothing yet. */
+	lightrec_regcache_pin_loads_raw(_jit);
+
 	to_loop = jit_jmpi();
 
 	/* A direct link whose target has no code yet lands here: the pinned
@@ -1353,45 +1365,45 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	/* The block will jump here, with the number of cycles remaining in
 	 * LIGHTREC_REG_CYCLE */
 	addr2 = jit_indirect();
-	jit_movr(JIT_V0, LIGHTREC_REG_PC);
+	jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
 
 	sync_next_pc(_jit);
 
 	loop2 = jit_label();
 
 	/* Convert next PC to KUNSEG and avoid mirrors */
-	jit_andi(JIT_V1, JIT_V0, RAM_SIZE - 1);
-	jit_andi(JIT_R2, JIT_V0, BIOS_SIZE - 1);
-	jit_andi(JIT_R1, JIT_V0, BIT(28));
+	jit_andi(DISPATCH_TMP, DISPATCH_PC, RAM_SIZE - 1);
+	jit_andi(JIT_R2, DISPATCH_PC, BIOS_SIZE - 1);
+	jit_andi(JIT_R1, DISPATCH_PC, BIT(28));
 	jit_addi(JIT_R2, JIT_R2, RAM_SIZE);
-	jit_movnr(JIT_V1, JIT_R2, JIT_R1);
+	jit_movnr(DISPATCH_TMP, JIT_R2, JIT_R1);
 
 	/* If possible, use the code LUT */
 	if (!lut_is_32bit(state))
-		jit_lshi(JIT_V1, JIT_V1, 1);
-	jit_add_state(JIT_V1, JIT_V1);
-	jit_addi(JIT_V1, JIT_V1, lightrec_offset(code_lut));
+		jit_lshi(DISPATCH_TMP, DISPATCH_TMP, 1);
+	jit_add_state(DISPATCH_TMP, DISPATCH_TMP);
+	jit_addi(DISPATCH_TMP, DISPATCH_TMP, lightrec_offset(code_lut));
 
 	/* The block will jump here if it already knows the code LUT entry */
 	to_addr6 = jit_jmpi();
 	addr6 = jit_indirect();
-	jit_movr(JIT_V0, LIGHTREC_REG_PC);
-	jit_movr(JIT_V1, LIGHTREC_REG_AUX);
+	jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
+	jit_movr(DISPATCH_TMP, LIGHTREC_REG_AUX);
 	jit_patch(to_addr6);
 
 	if (lut_is_32bit(state))
-		jit_ldr_ui(JIT_V1, JIT_V1);
+		jit_ldr_ui(DISPATCH_TMP, DISPATCH_TMP);
 	else
-		jit_ldr(JIT_V1, JIT_V1);
+		jit_ldr(DISPATCH_TMP, DISPATCH_TMP);
 
 	/* Jump to end if state->target_cycle < state->current_cycle */
 	to_end = jit_blei(LIGHTREC_REG_CYCLE, 0);
 
 	/* Store back the current PC to the lightrec_state structure */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, DISPATCH_PC);
 
 	/* If we get NULL, jump to the slow path */
-	to_slow_path = jit_beqi(JIT_V1, 0);
+	to_slow_path = jit_beqi(DISPATCH_TMP, 0);
 
 	jit_patch(to_loop);
 	loop = jit_label();
@@ -1400,8 +1412,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_movi(JIT_R1, 0x1fffffff);
 
 	/* Call the block's code */
-	jit_movr(LIGHTREC_REG_PC, JIT_V0);
-	jit_jmpr(JIT_V1);
+	jit_movr(LIGHTREC_REG_PC, DISPATCH_PC);
+	jit_jmpr(DISPATCH_TMP);
 
 	jit_patch(to_slow_path);
 
@@ -1417,38 +1429,50 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		update_cycle_counter_before_c(_jit);
 	}
 
+	lightrec_regcache_pin_stores_raw(_jit);
+
 	jit_prepare();
 	jit_pushargr(LIGHTREC_REG_STATE);
-	jit_pushargr(JIT_V0);
+	jit_pushargr(DISPATCH_PC);
 
-	/* Save the cycles register if needed */
+	/* Save the cycles register if needed. DISPATCH_* are caller-saved, so
+	 * this cannot be parked in a register across the call. */
 	if (!(ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES))
-		jit_movr(JIT_V0, LIGHTREC_REG_CYCLE);
+		update_cycle_counter_before_c(_jit);
 
 	/* Get the next block */
 	jit_finishi(LIGHTREC_C_CALL(&get_next_block_func));
-	jit_retval(JIT_V1);
+	jit_retval(DISPATCH_TMP);
+
+	/* This call can reach the interpreter, the one C path that rewrites
+	 * arbitrary guest registers - so the pins are reloaded here, and only
+	 * here, instead of in a stub at the head of every block. */
+	lightrec_regcache_pin_loads_raw(_jit);
 
 	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
 		/* The interpreter may have updated state->current_cycle and
 		 * state->target_cycle - recalc the delta */
 		update_cycle_counter_after_c(_jit);
 	} else {
-		jit_movr(LIGHTREC_REG_CYCLE, JIT_V0);
+		update_cycle_counter_after_c(_jit);
 	}
 
-	/* Reset JIT_V0 to the next PC */
-	jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(curr_pc));
+	/* Reset DISPATCH_PC to the next PC */
+	jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE, lightrec_offset(curr_pc));
 
 	/* If we get non-NULL, loop */
-	jit_patch_at(jit_bnei(JIT_V1, 0), loop);
+	jit_patch_at(jit_bnei(DISPATCH_TMP, 0), loop);
 
 	/* When exiting, the recompiled code will jump to that address */
 	jit_note(__FILE__, __LINE__);
 	jit_patch(to_end);
 
 	/* Store back the current PC to the lightrec_state structure */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
+	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, DISPATCH_PC);
+
+	/* Leaving JIT land for good: the pins hold values the state block has
+	 * never seen, and our caller reads the register file from memory. */
+	lightrec_regcache_pin_stores_raw(_jit);
 
 	jit_retr(LIGHTREC_REG_CYCLE);
 
@@ -1457,17 +1481,23 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		 * lightrec_memset() */
 		addr3 = jit_indirect();
 
-		jit_movr(JIT_V1, LIGHTREC_REG_CYCLE);
+		update_cycle_counter_before_c(_jit);
+
+		lightrec_regcache_pin_stores_raw(_jit);
 
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
 
 		jit_finishi(LIGHTREC_C_CALL(lightrec_memset));
-		jit_retval(LIGHTREC_REG_CYCLE);
+		jit_retval(DISPATCH_TMP);
 
-		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(regs.gpr[31]));
+		lightrec_regcache_pin_loads_raw(_jit);
 
-		jit_subr(LIGHTREC_REG_CYCLE, JIT_V1, LIGHTREC_REG_CYCLE);
+		jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE,
+			    lightrec_offset(regs.gpr[31]));
+
+		update_cycle_counter_after_c(_jit);
+		jit_subr(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, DISPATCH_TMP);
 
 		jit_patch_at(jit_b(), loop2);
 	}
@@ -1475,21 +1505,26 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	if (OPT_DETECT_IMPOSSIBLE_BRANCHES) {
 		/* Blocks will jump here when they reach a branch that should
 		 * be executed with the interpreter, passing the branch's PC
-		 * in JIT_V0 and the address of the block in JIT_V1. */
+		 * in DISPATCH_PC and the address of the block in DISPATCH_TMP. */
 		addr4 = jit_indirect();
-		jit_movr(JIT_V0, LIGHTREC_REG_PC);
-		jit_movr(JIT_V1, LIGHTREC_REG_AUX);
+		jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
+		jit_movr(DISPATCH_TMP, LIGHTREC_REG_AUX);
 
 		sync_next_pc(_jit);
 		update_cycle_counter_before_c(_jit);
 
+		lightrec_regcache_pin_stores_raw(_jit);
+
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(JIT_V1);
-		jit_pushargr(JIT_V0);
+		jit_pushargr(DISPATCH_TMP);
+		jit_pushargr(DISPATCH_PC);
 		jit_finishi(LIGHTREC_C_CALL(lightrec_emulate_block));
 
-		jit_retval(JIT_V0);
+		jit_retval(DISPATCH_PC);
+
+		/* The interpreter rewrites arbitrary guest registers. */
+		lightrec_regcache_pin_loads_raw(_jit);
 
 		update_cycle_counter_after_c(_jit);
 
@@ -1501,24 +1536,28 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		/* Blocks will jump here when they reach a branch with a load
 		 * opcode in its delay slot. The delay slot has already been
 		 * executed; the load value is in (state->temp_reg), and the
-		 * register number is in JIT_V1.
+		 * register number is in DISPATCH_TMP.
 		 * Jump to a C function which will evaluate the branch target's
 		 * first opcode, to make sure that it does not read the register
 		 * in question; and if it does, handle it accordingly. */
 		addr5 = jit_indirect();
-		jit_movr(JIT_V0, LIGHTREC_REG_PC);
-		jit_movr(JIT_V1, LIGHTREC_REG_AUX);
+		jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
+		jit_movr(DISPATCH_TMP, LIGHTREC_REG_AUX);
 
 		sync_next_pc(_jit);
 		update_cycle_counter_before_c(_jit);
 
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(JIT_V0);
-		jit_pushargr(JIT_V1);
+		jit_pushargr(DISPATCH_PC);
+		jit_pushargr(DISPATCH_TMP);
+		lightrec_regcache_pin_stores_raw(_jit);
 		jit_finishi(LIGHTREC_C_CALL(lightrec_check_load_delay));
 
-		jit_retval(JIT_V0);
+		/* Writes the delay slot's destination register. */
+		lightrec_regcache_pin_loads_raw(_jit);
+
+		jit_retval(DISPATCH_PC);
 
 		update_cycle_counter_after_c(_jit);
 
@@ -1899,7 +1938,10 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	/* Pinned registers (regcache.c): the code-LUT entry is this fixed
 	 * stub of loads; a direct link enters just behind it with the pins
 	 * already in their registers. */
-	lightrec_regcache_entry_loads(cstate->reg_cache, _jit);
+	/* No entry stub: the dispatcher reloads the pins after the only C
+	 * path that can rewrite them (the interpreter, via
+	 * get_next_block_func), and it no longer uses JIT_V0/JIT_V1 itself,
+	 * so a round trip through it preserves them. */
 	lightrec_regcache_pin_block(cstate->reg_cache, _jit);
 
 	/* An address-taken label: a plain one that nothing branches to is
@@ -1958,7 +2000,6 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		target = &cstate->targets[i];
 
 		target->label = jit_indirect();
-		lightrec_regcache_entry_loads(cstate->reg_cache, _jit);
 
 		/* Barrier, exactly as for start_of_block above: a link enters
 		 * at target->label + LIGHTREC_PIN_STUB_BYTES, so the stub has

@@ -71,7 +71,11 @@ struct regcache {
  * load is a single 2-byte `mov.l @(disp,Rm),Rn`, which the fixed-size
  * stub depends on (s0/sp would not be). */
 #if NUM_PINNED
+#if NUM_PINNED == 6
+static const u8 pin_guest[NUM_PINNED] = { 2, 3, 4, 5, 1, 6 };
+#else
 static const u8 pin_guest[NUM_PINNED] = { 2, 3, 4, 5 };
+#endif
 #else
 static const u8 pin_guest[1] = { 0 };   /* NUM_PINNED 0: never indexed */
 #endif
@@ -883,6 +887,20 @@ void lightrec_regcache_pin_stores_raw(jit_state_t *_jit)
 		jit_stxi_i(lightrec_offset(regs.gpr) + (pin_guest[i] << 2),
 			   LIGHTREC_REG_STATE,
 			   JIT_V(FIRST_REG + PIN_FIRST_SLOT + i));
+	}
+}
+
+/* Same loads, for the dispatcher (no cache state). Used where C may have
+ * rewritten the guest register file underneath us - the interpreter, which
+ * get_next_block_func() can reach - rather than at every block entry. */
+void lightrec_regcache_pin_loads_raw(jit_state_t *_jit)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++) {
+		jit_ldxi_i(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i),
+			   LIGHTREC_REG_STATE,
+			   lightrec_offset(regs.gpr) + (pin_guest[i] << 2));
 	}
 }
 
