@@ -71,11 +71,11 @@ struct regcache {
  * load is a single 2-byte `mov.l @(disp,Rm),Rn`, which the fixed-size
  * stub depends on (s0/sp would not be). */
 #if NUM_PINNED
-#if NUM_PINNED == 6
-static const u8 pin_guest[NUM_PINNED] = { 2, 3, 4, 5, 1, 6 };
-#else
-static const u8 pin_guest[NUM_PINNED] = { 2, 3, 4, 5 };
-#endif
+/* Ordered by how often the guest register is touched, so any prefix of this
+ * table is the right set for that pin count and NUM_PINNED can be swept. */
+static const u8 pin_guest_all[6] = { 2, 3, 4, 5, 1, 6 };
+#define pin_guest pin_guest_all
+_Static_assert(NUM_PINNED <= 6, "pin_guest_all is too short");
 #else
 static const u8 pin_guest[1] = { 0 };   /* NUM_PINNED 0: never indexed */
 #endif

@@ -109,9 +109,10 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	 * the dispatcher writes them back. */
 	to_eob = jit_blei(LIGHTREC_REG_CYCLE, 0);
 
-	/* What the dispatcher provides on block entry: curr_pc synced, and
-	 * the address mask blocks are compiled to expect. */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, LIGHTREC_REG_PC);
+	/* What the dispatcher provides on block entry: the address mask
+	 * blocks are compiled to expect. curr_pc is not synced here - see
+	 * the C_WRAPPER_RW_GENERIC site in rec_io(), the one C path reached
+	 * from inside a block that reads it. */
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
 
@@ -166,9 +167,10 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 	to_slow2 = jit_beqi(_R6, 0);
 	to_slow3 = jit_beqi(_R6, (uintptr_t)ls->get_next_block);
 
-	/* What the dispatcher provides on block entry: curr_pc synced, and
-	 * the address mask blocks are compiled to expect. */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, LIGHTREC_REG_PC);
+	/* What the dispatcher provides on block entry: the address mask
+	 * blocks are compiled to expect. curr_pc is not synced here - see
+	 * the C_WRAPPER_RW_GENERIC site in rec_io(), the one C path reached
+	 * from inside a block that reads it. */
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
 
@@ -1444,7 +1446,20 @@ static void rec_io(struct lightrec_cstate *state,
 	if (is_tagged) {
 		call_to_c_wrapper(state, block, c.opcode, C_WRAPPER_RW);
 	} else {
+		u8 pc_reg;
+
 		lut_entry = lightrec_get_lut_entry(block);
+
+		/* lightrec_rw_generic_cb() identifies the executing block by
+		 * state->curr_pc. Direct links no longer sync it on the way
+		 * out - that store sat at every linked exit and was read by
+		 * nothing else - so it is synced here, from the block's own
+		 * compile-time PC, on the one path that needs it. */
+		pc_reg = lightrec_alloc_reg_temp(reg_cache, _jit);
+		jit_movi(pc_reg, block->pc);
+		jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, pc_reg);
+		lightrec_free_reg(reg_cache, pc_reg);
+
 		call_to_c_wrapper(state, block, (lut_entry << 16) | offset,
 				  C_WRAPPER_RW_GENERIC);
 	}
