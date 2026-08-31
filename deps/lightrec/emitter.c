@@ -71,10 +71,36 @@ lightrec_jump_to_fn(jit_state_t *_jit, void (*fn)(void))
 	jit_patch_abs(jit_jmpi(), fn);
 }
 
+/* Jump to one of the dispatcher entry points, naming it by its offset in
+ * the state struct rather than by its address.
+ *
+ * The absolute form costs a literal: the dispatcher is nowhere near the
+ * code buffer, so jit_jmpi() falls back to `mov.l @(disp,pc),rN; jmp @rN`
+ * and the block carries a pool word for it. With the state pointer in GBR
+ * the same jump reads the pointer straight out of the struct instead, and
+ * the pool word goes away. SH-4 hard-wires r0 as the data register of the
+ * @(disp,GBR) form, which is why this goes through r0 - lightning keeps it
+ * as its own scratch, so it is never holding anything here, and the
+ * dispatcher takes its arguments in the cycle counter, PC and AUX. */
+#if defined(__sh__) && OPT_SH4_USE_GBR
+static void lightrec_jump_to_state_fn(jit_state_t *_jit, u32 offset)
+{
+	jit_live(LIGHTREC_REG_CYCLE);
+	jit_live(LIGHTREC_REG_PC);
+	jit_live(LIGHTREC_REG_AUX);
+
+	jit_ldxi_i(_R0, LIGHTREC_REG_STATE, offset);
+	jit_jmpr(_R0);
+}
+#else
+#define lightrec_jump_to_state_fn(_jit, offset) \
+	lightrec_jump_to_fn(_jit, *(void (**)(void))((char *)state->state + (offset)))
+#endif
+
 static void
 lightrec_jump_to_eob(struct lightrec_cstate *state, jit_state_t *_jit)
 {
-	lightrec_jump_to_fn(_jit, state->state->eob_wrapper_func);
+	lightrec_jump_to_state_fn(_jit, lightrec_offset(eob_wrapper_func));
 }
 
 static void lightrec_jump_to_fast_eob(struct lightrec_cstate *state,
@@ -83,15 +109,27 @@ static void lightrec_jump_to_fast_eob(struct lightrec_cstate *state,
 	/* Load the LUT entry address to LIGHTREC_REG_AUX where the dispatcher expects it */
 	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)lut_address(state->state, offset));
 
-	lightrec_jump_to_fn(_jit, state->state->fast_eob);
+	lightrec_jump_to_state_fn(_jit, lightrec_offset(fast_eob));
 }
 
-/* Direct block link (links.h): the target is known, so jump through a
- * literal word that holds its code address - or the dispatcher's eob
- * wrapper while it has none. The word starts out as a per-exit magic that
- * lightrec_links_register_block() locates and resolves once the block is
- * emitted. Only the cycle check stays in line; a spent counter takes the
- * usual fast_eob route. */
+/* Direct block link (links.h): the target is known, so jump straight to it.
+ *
+ * Generic form: jump through a literal word that holds the target's code
+ * address - or the dispatcher's eob wrapper while it has none. The word
+ * starts out as a per-exit magic that lightrec_links_register_block()
+ * locates and resolves once the block is emitted.
+ *
+ * SH-4 form: a plain BRA, whose displacement links.c rewrites in place.
+ * That saves the literal (an instruction and a pool word), and - the
+ * larger win - a BRA has a delay slot the backend can fill, which a
+ * PC-relative literal load cannot be put in. An exit with no target code
+ * yet points its BRA at the block's own far stub, emitted at the tail by
+ * lightrec_emit_link_stub(); since the stub is inside the same block it is
+ * always within BRA range, so every repoint has a legal displacement and
+ * there is no unreachable case to recover from.
+ *
+ * Only the cycle check stays in line; a spent counter takes the usual
+ * fast_eob route. */
 static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 				       jit_state_t *_jit, u32 imm)
 {
@@ -103,6 +141,11 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 		lightrec_jump_to_fast_eob(state, _jit, offset);
 		return;
 	}
+
+#if defined(__sh__) && SH4_BRA_LINKS
+	if (!state->link_stub)
+		state->link_stub = jit_forward();
+#endif
 
 	/* Pinned registers cross the link in their registers (the target
 	 * is entered behind its load stub, links.c); only the fallback to
@@ -116,12 +159,25 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
 
+#if !defined(__sh__) || !SH4_BRA_LINKS
 	jit_movi(LIGHTREC_REG_AUX, LINK_MAGIC(state->nb_links));
+#endif
 
 	jit_live(LIGHTREC_REG_CYCLE);
 	jit_live(LIGHTREC_REG_PC);
 	jit_live(JIT_R1);
+
+#if defined(__sh__) && SH4_BRA_LINKS
+	state->links[state->nb_links].node = jit_jmpi();
+	state->links[state->nb_links].insn = NULL;
+	jit_patch_at(state->links[state->nb_links].node, state->link_stub);
+#else
+#if defined(__sh__)
+	state->links[state->nb_links].node = NULL;
+	state->links[state->nb_links].insn = NULL;
+#endif
 	jit_jmpr(LIGHTREC_REG_AUX);
+#endif
 
 	state->links[state->nb_links].offset = offset;
 	state->links[state->nb_links].magic = LINK_MAGIC(state->nb_links);
@@ -130,6 +186,29 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	jit_patch(to_eob);
 	lightrec_jump_to_fast_eob(state, _jit, offset);
 }
+
+#if defined(__sh__)
+/* The tail stub every unresolved direct link of this block branches to: it
+ * hands the exit to the dispatcher exactly as an unresolved literal word
+ * used to. One per block, so its cost is amortised over every exit, and it
+ * is only reached by a BRA - nothing falls into it. */
+void lightrec_emit_link_stub(struct lightrec_cstate *state, jit_state_t *_jit)
+{
+	if (!state->link_stub)
+		return;
+
+	jit_link(state->link_stub);
+	state->link_stub = NULL;
+
+	jit_movi(LIGHTREC_REG_AUX,
+		 (uintptr_t)state->state->eob_wrapper_pins_func);
+
+	jit_live(LIGHTREC_REG_CYCLE);
+	jit_live(LIGHTREC_REG_PC);
+	jit_live(JIT_R1);
+	jit_jmpr(LIGHTREC_REG_AUX);
+}
+#endif
 
 #if defined(__sh__) && LIGHTREC_NUM_PINNED > 0
 /* Indirect exit (jr / jalr with an unknown target): look the target up in
@@ -174,7 +253,11 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
 
-	jit_addi(_R6, _R6, LIGHTREC_PIN_STUB_BYTES);
+	/* Links enter behind the per-block load stub. There is no stub any
+	 * more, so this is an `add #0` that also writes the register the jmp
+	 * below reads - dead weight, and it blocks the delay slot. */
+	if (LIGHTREC_PIN_STUB_BYTES)
+		jit_addi(_R6, _R6, LIGHTREC_PIN_STUB_BYTES);
 
 	jit_live(LIGHTREC_REG_CYCLE);
 	jit_live(LIGHTREC_REG_PC);
@@ -186,7 +269,7 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 	jit_patch(to_slow3);
 
 	/* Dispatcher route: pins written back, LUT entry address in AUX. */
-	lightrec_jump_to_fn(_jit, ls->fast_eob);
+	lightrec_jump_to_state_fn(_jit, lightrec_offset(fast_eob));
 }
 #else
 static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
@@ -199,7 +282,7 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 static void
 lightrec_jump_to_ds_check(struct lightrec_cstate *state, jit_state_t *_jit)
 {
-	lightrec_jump_to_fn(_jit, state->state->ds_check_func);
+	lightrec_jump_to_state_fn(_jit, lightrec_offset(ds_check_func));
 }
 
 static void update_ra_register(struct regcache *reg_cache, jit_state_t *_jit,
@@ -328,7 +411,7 @@ void lightrec_emit_jump_to_interpreter(struct lightrec_cstate *state,
 	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)block);
 
 	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
-	lightrec_jump_to_fn(_jit, state->state->interpreter_func);
+	lightrec_jump_to_state_fn(_jit, lightrec_offset(interpreter_func));
 }
 
 static void lightrec_emit_eob(struct lightrec_cstate *state,

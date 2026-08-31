@@ -381,6 +381,8 @@ static void _flush(jit_state_t*, jit_bool_t);
 static void _ii(jit_state_t*,sh4_instr_t);
 #    define ii(i)			_ii(_jit, i)
 
+
+
 #    define do_idirect(fn) \
     do { _jitc->idirect++; flush(1); fn; _jitc->idirect--; } while(0)
 
@@ -1382,6 +1384,7 @@ _flush(jit_state_t *_jit, jit_bool_t all)
         _jitc->ibuf[i] = codebuf[nb_written + i].raw;
 }
 
+
 static void
 _ii(jit_state_t *_jit, sh4_instr_t instr)
 {
@@ -1402,6 +1405,222 @@ _nop(jit_state_t *_jit, jit_word_t i0)
 		NOP();
 	assert(i0 == 0);
 }
+
+/* --- delay-slot filling -------------------------------------------------
+ *
+ * Every SH-4 branch has a delay slot and this backend has always filled it
+ * with a NOP. Measured against bleem on the same scene, we wasted 90.0% of
+ * our slots where bleem wastes 39.1%: 16,076 NOPs, 4.8% of all emitted code.
+ *
+ * The instruction that is about to precede the branch is already sitting at
+ * the end of the instruction buffer, so the cheapest correct fill is to move
+ * that one into the slot. Execution order is preserved exactly - it still
+ * runs after everything before it and before the branch target - so the only
+ * hazards are the branch's own operands and the opcodes the ISA forbids in a
+ * slot.
+ *
+ * This is done here rather than in flush() because of addresses. Taking the
+ * buffer's last entry and appending after it leaves every earlier index
+ * untouched, so nothing already predicted as pc.w + ioff * 2 (branch
+ * displacements, notes) moves. flush() cannot do the same: deleting a NOP
+ * from the middle of the window shifts every later instruction, and the
+ * branches among them have already recorded their addresses. jit_code_label
+ * flushes the buffer, so a candidate can never be a branch target either,
+ * and find_instr() never schedules across a BR, so the candidate really is
+ * the last instruction that will precede the branch.
+ */
+
+/* PR is not modelled by sh4_read_mask/sh4_write_mask - JSR and BSR are
+ * declared with write == 0 - so the four opcodes that touch it are matched
+ * by hand. Only the call forms care. */
+static jit_bool_t sh4_touches_pr(jit_uint16_t op)
+{
+	return (op & 0xf0ff) == 0x002a	/* sts   pr,Rn      */
+	    || (op & 0xf0ff) == 0x4022	/* sts.l pr,@-Rn    */
+	    || (op & 0xf0ff) == 0x402a	/* lds   Rm,pr      */
+	    || (op & 0xf0ff) == 0x4026;	/* lds.l @Rm+,pr    */
+}
+
+static jit_bool_t sh4_slot_legal(sh4_instr_t x)
+{
+	jit_uint16_t op = x.op.op;
+
+	/* No branch may sit in a delay slot. */
+	if (x.group == SH4_GROUP_BR)
+		return 0;
+	if (x.group == SH4_GROUP_CO && (op & 0x000f) == 0x000b && x.write == 0)
+		return 0;			/* jmp / jsr / rts / rte */
+
+	/* PC-relative forms would read the branch target's PC, not their own.
+	 * These are also the only opcodes carrying a literal-pool patch keyed
+	 * on their address, so excluding them keeps consts.patches valid. */
+	if ((op >> 12) == 0xd || (op >> 12) == 0x9)
+		return 0;			/* mov.l/mov.w @(disp,pc) */
+	if ((op & 0xff00) == 0xc700)
+		return 0;			/* mova */
+	if ((op & 0xff00) == 0xc300)
+		return 0;			/* trapa */
+
+	return 1;
+}
+
+/* Lift the buffered instruction preceding a branch into *slot if it may
+ * legally run in the branch's delay slot. 'reads' is the branch's own
+ * register mask (the target register of jmp/jsr); 'call' marks the forms
+ * that write PR before the slot executes. Returns 1 if *slot was filled. */
+
+/* A lifted instruction leaves a two-byte hole, so every buffered literal-pool
+ * load behind it moves two bytes earlier. _load_const() records the address as
+ * pc.w + ioff * 2 and the odd entries of consts.patches are constant indices
+ * rather than addresses, so only even entries past the hole are touched. */
+static void sh4_slot_shift_consts(jit_state_t *_jit, unsigned int k)
+{
+	jit_word_t cut = _jit->pc.w + (jit_word_t)k * 2;
+	unsigned int i;
+
+	for (i = 0; i < _jitc->consts.offset; i += 2) {
+		if (_jitc->consts.patches[i] > cut)
+			_jitc->consts.patches[i] -= 2;
+	}
+}
+
+/* Every form that has a delay slot: the BR group, plus the CO-group
+ * jmp/jsr/rts/rte (which share the low nibble 0xb and declare no write). */
+static jit_bool_t sh4_is_branch(sh4_instr_t x)
+{
+	return x.group == SH4_GROUP_BR
+		|| (x.group == SH4_GROUP_CO
+		    && (x.op.op & 0x000f) == 0x000b && x.write == 0);
+}
+
+/* Can x be sunk past everything still between it and the branch, and then
+ * legally execute in the delay slot? cross_* accumulate the instructions it would
+ * have to cross. */
+static jit_bool_t
+sh4_slot_ok(sh4_instr_t x, jit_uint64_t reads, jit_bool_t call,
+	    jit_uint64_t cross_read, jit_uint64_t cross_write,
+	    jit_bool_t cross_ls, jit_bool_t cross_memw)
+{
+	jit_uint64_t xr, xw;
+
+	if (!sh4_slot_legal(x))
+		return 0;
+
+	xr = sh4_read_mask(x);
+	xw = sh4_write_mask(x);
+
+	/* The branch must not read a register its own slot writes. */
+	if (xw & reads)
+		return 0;
+
+	/* jsr/bsr set PR before the slot runs: the slot may neither read the
+	 * new value nor clobber the return address. */
+	if (call && sh4_touches_pr(x.op.op))
+		return 0;
+
+	/* Sinking past the crossed instructions: none of them may read what x
+	 * writes, write what x reads, or write what x writes. */
+	if ((xw & cross_read) || (xr & cross_write) || (xw & cross_write))
+		return 0;
+
+	/* Only memory writes set RWMASK_MEM, so loads are ordered by hand:
+	 * a store may not cross any other memory op, and a load may not cross
+	 * a store. */
+	if ((xw & RWMASK_MEM) && cross_ls)
+		return 0;
+	if (x.group == SH4_GROUP_LS && cross_memw)
+		return 0;
+
+	return 1;
+}
+
+/* Lift an instruction out of the buffer to fill a branch's delay slot.
+ *
+ * Scans back from the end, because the instruction immediately before a
+ * branch is usually the literal-pool load that produced the branch target -
+ * illegal in a slot and depended on by the branch. Anything further back can
+ * still be used if it can be sunk past what lies between.
+ *
+ * 'reads' is the branch's own register mask (the target register of
+ * jmp/jsr); 'call' marks the forms that write PR before the slot runs.
+ */
+static jit_bool_t
+_sh4_take_slot(jit_state_t *_jit, sh4_instr_t *slot,
+	       jit_uint64_t reads, jit_bool_t call)
+{
+	jit_uint64_t cross_read = 0, cross_write = 0;
+	jit_bool_t cross_ls = 0, cross_memw = 0;
+	sh4_instr_t x;
+	unsigned int i, k;
+	int j;
+
+
+	/* In direct mode instructions bypass the buffer entirely. */
+	if (_jitc->idirect || _jitc->ioff == 0)
+		return 0;
+
+	for (j = (int)_jitc->ioff - 1; j >= 0; j--) {
+		x.raw = _jitc->ibuf[j];
+
+		/* A buffered branch has already handed lightning the address
+		 * it will be patched at, and that address cannot be corrected
+		 * from here - so nothing may be lifted from behind one. */
+		if (sh4_is_branch(x))
+			break;
+
+		/* The entry behind a buffered branch is that branch's own
+		 * delay slot. Lifting it does not leave a hole: everything
+		 * after shifts up, so the branch would silently acquire the
+		 * next instruction as its slot - a branch, more often than
+		 * not. Stop here; the barrier above covers the rest. */
+		if (j > 0) {
+			sh4_instr_t p;
+
+			p.raw = _jitc->ibuf[j - 1];
+			if (sh4_is_branch(p))
+				break;
+		}
+
+		if (sh4_slot_ok(x, reads, call, cross_read, cross_write,
+				cross_ls, cross_memw))
+			goto take;
+
+		cross_read |= sh4_read_mask(x);
+		cross_write |= sh4_write_mask(x);
+		if (x.group == SH4_GROUP_LS) {
+			cross_ls = 1;
+			if (sh4_write_mask(x) & RWMASK_MEM)
+				cross_memw = 1;
+		}
+	}
+
+	return 0;
+
+take:
+	k = (unsigned int)j;
+	*slot = x;
+
+	sh4_slot_shift_consts(_jit, k);
+
+	for (i = k; i + 1 < _jitc->ioff; i++)
+		_jitc->ibuf[i] = _jitc->ibuf[i + 1];
+	_jitc->ioff--;
+
+	return 1;
+}
+#define sh4_take_slot(s, r, c)		_sh4_take_slot(_jit, s, r, c)
+
+/* Emit a branch's delay slot: whatever sh4_take_slot() lifted, or the NOP
+ * that used to be unconditional. */
+static void
+_sh4_put_slot(jit_state_t *_jit, jit_bool_t got, sh4_instr_t slot)
+{
+	if (got)
+		ii(slot);
+	else
+		NOP();
+}
+#define sh4_put_slot(g, s)		_sh4_put_slot(_jit, g, s)
 
 static void
 _movr(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1)
@@ -1515,22 +1734,56 @@ _movi(jit_state_t *_jit, jit_uint16_t r0, jit_word_t i0)
 	}
 }
 
-static void
+/* Returns the address the branch was emitted at, which is not always the
+ * predicted `w` the caller passed in: filling a delay slot below shortens
+ * the instruction buffer, so the branch lands earlier. Callers must patch
+ * at the returned address. */
+static jit_word_t
 emit_branch_opcode(jit_state_t *_jit, jit_word_t i0, jit_word_t w,
 		   int t_set, int force_patchable)
 {
 	jit_int32_t disp = (i0 - w >> 1) - 2;
 	jit_uint16_t reg;
+	sh4_instr_t slot;
+	jit_bool_t got;
 
 	if (!force_patchable && i0 == 0) {
+		/* A conditional branch has no delay slot until it is given
+		 * one: BT/S and BF/S run their slot whether or not the branch
+		 * is taken, so an instruction from in front of the branch
+		 * keeps its meaning there. Worth doing only when there is
+		 * something to lift - BT/S with a NOP is a byte larger than a
+		 * bare BT, for nothing.
+		 *
+		 * Not in the far form: patch_at() writes the out-of-range BRA
+		 * into the word right behind the branch, which is exactly
+		 * where the slot would be.
+		 *
+		 * The branch reads T, so the slot may not write it - passing
+		 * RWMASK_T as the branch's read mask is what stops that. The
+		 * lift must happen before the flush below, which empties the
+		 * buffer it draws from. */
+		got = _jitc->far ? 0 : sh4_take_slot(&slot, RWMASK_T, 0);
+
 		_jitc->idirect++;
 		flush(1);
 
+		/* Exact now that the buffer is empty, whether or not the lift
+		 * above shortened it. */
+		w = _jit->pc.w;
+
 		/* Positive displacement - we don't know the target yet. */
-		if (t_set)
+		if (got) {
+			if (t_set)
+				BTS(0);
+			else
+				BFS(0);
+			ii(slot);
+		} else if (t_set) {
 			BT(0);
-		else
+		} else {
 			BF(0);
+		}
 
 		/* Only a branch that a previous pass of this function found
 		 * out of 8-bit range keeps the two words behind it, where
@@ -1567,6 +1820,8 @@ emit_branch_opcode(jit_state_t *_jit, jit_word_t i0, jit_word_t w,
 		_jitc->idirect--;
 		jit_unget_reg(reg);
 	}
+
+	return (w);
 }
 
 static jit_uint16_t _last_instr(jit_state_t *_jit)
@@ -1724,7 +1979,11 @@ _addi(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 		addi(r0, r0, i0);
 		return;
 	}
-	if (i0 >= -128 && i0 < 127) {
+	if (i0 == 0) {
+		/* add #0 is a no-op that still occupies an issue slot, and a
+		 * write to r0 that blocks it as a delay-slot candidate. */
+		movr(r0, r1);
+	} else if (i0 >= -128 && i0 < 127) {
 		movr(r0, r1);
 		ADDI(r0, i0);
 	} else if (r0 != r1) {
@@ -3266,7 +3525,7 @@ _bger(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 
 	CMPGE(r0, r1);
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, t, p);
+	w = emit_branch_opcode(_jit, i0, w, t, p);
 
 	return (w);
 }
@@ -3281,7 +3540,7 @@ _bger_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 
 	CMPHS(r0, r1);
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, t, p);
+	w = emit_branch_opcode(_jit, i0, w, t, p);
 
 	return (w);
 }
@@ -3302,7 +3561,7 @@ _beqr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	} else {
 		CMPEQ(r0, r1);
 		w = _jit->pc.w + _jitc->ioff * 2;
-		emit_branch_opcode(_jit, i0, w, 1, p);
+		w = emit_branch_opcode(_jit, i0, w, 1, p);
 	}
 
 	return (w);
@@ -3318,7 +3577,7 @@ _bner(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 
 	CMPEQ(r0, r1);
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, 0, p);
+	w = emit_branch_opcode(_jit, i0, w, 0, p);
 
 	return (w);
 }
@@ -3338,7 +3597,7 @@ _bmsr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		maybe_emit_tst(_jit, r0, &set);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3358,7 +3617,7 @@ _bmcr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		maybe_emit_tst(_jit, r0, &set);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3380,7 +3639,7 @@ _bgti(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPGT(r0, _R0);
 	}
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3402,7 +3661,7 @@ _bgei(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPGE(r0, _R0);
 	}
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3424,7 +3683,7 @@ _bgti_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPHI(r0, _R0);
 	}
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3442,7 +3701,7 @@ _bgei_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	movi(_R0, i1);
 	CMPHS(r0, _R0);
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3466,7 +3725,7 @@ static jit_word_t _beqi(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 		CMPEQ(_R0, r0);
 	}
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3483,7 +3742,7 @@ static jit_word_t _bmsi(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	movi(_R0, i1);
 	TST(_R0, r0);
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3498,7 +3757,7 @@ static jit_word_t _boaddr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	ADDV(r0, r1);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3514,7 +3773,7 @@ static jit_word_t _boaddr_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	ADDC(r0, r1);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3562,7 +3821,7 @@ static jit_word_t _bosubr(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	ADDV(r0, _R0);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3578,7 +3837,7 @@ static jit_word_t _bosubr_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 	SUBC(r0, r1);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
-	emit_branch_opcode(_jit, i0, w, set, p);
+	w = emit_branch_opcode(_jit, i0, w, set, p);
 
 	return (w);
 }
@@ -3612,9 +3871,13 @@ static jit_word_t _bosubi_u(jit_state_t *_jit, jit_word_t i0, jit_uint16_t r0,
 static void
 _jmpr(jit_state_t *_jit, jit_int16_t r0)
 {
+	sh4_instr_t slot;
+	jit_bool_t got;
+
 	set_fmode(_jit, SH_DEFAULT_FPU_MODE);
+	got = sh4_take_slot(&slot, BITLL(r0), 0);
 	JMP(r0);
-	NOP();
+	sh4_put_slot(got, slot);
 }
 
 static jit_word_t
@@ -3623,27 +3886,50 @@ _jmpi(jit_state_t *_jit, jit_word_t i0, jit_bool_t force)
 	jit_uint16_t reg;
 	jit_int32_t disp;
 	jit_word_t w;
+	sh4_instr_t slot;
+	jit_bool_t got;
 
 	set_fmode(_jit, SH_DEFAULT_FPU_MODE);
+
+	/* Lift the delay-slot candidate before predicting this branch's own
+	 * address: taking it shortens the buffer by one instruction. */
+	got = sh4_take_slot(&slot, 0, 0);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
 	disp = (i0 - w >> 1) - 2;
 
 	if (force || (disp >= -2048 && disp <= 2046)) {
+		/* Only a directly emitted BRA has a known address: a buffered
+		 * one is merely predicted at pc + ioff * 2, and the scheduler
+		 * in flush() may still move what surrounds it. */
+		_jitc->bra_addr = _jitc->idirect ? w : 0;
 		BRA(disp);
-		NOP();
+		sh4_put_slot(got, slot);
 	} else if (0) {
 		/* TODO: BRAF */
 		reg = jit_get_reg(jit_class_gpr);
 
+		_jitc->bra_addr = 0;
 		movi_p(rn(reg), disp - 7);
 		BRAF(rn(reg));
-		NOP();
+		sh4_put_slot(got, slot);
 
 		jit_unget_reg(reg);
 	} else {
 		reg = jit_get_reg(jit_class_gpr);
 
+		/* This path builds the target in a register first, so the
+		 * candidate goes back before anything else is emitted - jmpr()
+		 * below will take it again if it still fits. Putting it back
+		 * lengthens the buffer, so the address this function returns
+		 * as the patch point has to be recomputed. */
+		if (got) {
+			ii(slot);
+			got = 0;
+			w = _jit->pc.w + _jitc->ioff * 2;
+		}
+
+		_jitc->bra_addr = 0;
 		movi(rn(reg), i0);
 		jmpr(rn(reg));
 
@@ -3656,10 +3942,14 @@ _jmpi(jit_state_t *_jit, jit_word_t i0, jit_bool_t force)
 static void
 _callr(jit_state_t *_jit, jit_int16_t r0)
 {
+	sh4_instr_t slot;
+	jit_bool_t got;
+
 	reset_fpu(_jit, r0 == _R0);
 
+	got = sh4_take_slot(&slot, BITLL(r0), 1);
 	JSR(r0);
-	NOP();
+	sh4_put_slot(got, slot);
 
 	reset_fpu(_jit, 1);
 }
@@ -3670,8 +3960,13 @@ _calli(jit_state_t *_jit, jit_word_t i0)
 	jit_int32_t disp;
 	jit_uint16_t reg;
 	jit_word_t w;
+	sh4_instr_t slot;
+	jit_bool_t got;
 
 	reset_fpu(_jit, 0);
+
+	/* Lift before predicting this branch's address, as in jmpi(). */
+	got = sh4_take_slot(&slot, 0, 1);
 
 	w = _jit->pc.w + _jitc->ioff * 2;
 	disp = (i0 - w >> 1) - 2;
@@ -3679,11 +3974,19 @@ _calli(jit_state_t *_jit, jit_word_t i0)
 	if (disp >= -2048 && disp <= 2046) {
 		BSR(disp);
 	} else {
+		/* movi() clobbers _R0 and jsr reads it, so the candidate goes
+		 * back in front of both; it may still write some other
+		 * register, but it can no longer be the slot. */
+		if (got) {
+			ii(slot);
+			got = 0;
+		}
+
 		movi(_R0, i0);
 		JSR(_R0);
 	}
 
-	NOP();
+	sh4_put_slot(got, slot);
 	reset_fpu(_jit, 1);
 }
 
@@ -3709,7 +4012,13 @@ _jmpi_p(jit_state_t *_jit, jit_word_t i0)
     jit_uint16_t reg;
     jit_word_t w;
 
+    sh4_instr_t slot;
+    jit_bool_t got;
+
     set_fmode(_jit, SH_DEFAULT_FPU_MODE);
+
+    /* Lift the slot candidate before the flush empties the buffer. */
+    got = sh4_take_slot(&slot, 0, 0);
 
     _jitc->idirect++;
     flush(1);
@@ -3719,12 +4028,19 @@ _jmpi_p(jit_state_t *_jit, jit_word_t i0)
      * targets a previous pass found out of range. */
     if (!_jitc->far) {
 	w = _jit->pc.w + _jitc->ioff * 2;
+	_jitc->bra_addr = w;
 	BRA(0);
-	NOP();
+	sh4_put_slot(got, slot);
 	_jitc->idirect--;
 	return (w);
     }
 
+    /* The far form builds the target in a register, so the candidate goes
+     * back in front of it and this jump keeps its NOP. */
+    if (got)
+	ii(slot);
+
+    _jitc->bra_addr = 0;
     reg = jit_get_reg(jit_class_gpr);
     w = movi_p(rn(reg), i0);
     jmpr(rn(reg));
@@ -3740,16 +4056,32 @@ _calli_p(jit_state_t *_jit, jit_word_t i0)
 {
     jit_uint16_t reg;
     jit_word_t w;
+    sh4_instr_t slot;
+    jit_bool_t got;
 
     reset_fpu(_jit, 0);
+
+    /* Lift the slot candidate before the flush empties the buffer. The
+     * target register is not known until after it, so the check against it
+     * happens below and the candidate goes back if it loses. */
+    got = sh4_take_slot(&slot, 0, 1);
 
     _jitc->idirect++;
     flush(1);
 
     reg = jit_get_reg(jit_class_gpr);
+
+    /* movi_p writes the register jsr then reads, so the slot may not touch
+     * it. Putting the candidate back here is still in program order: the
+     * flush has drained everything that preceded it. */
+    if (got && ((sh4_read_mask(slot) | sh4_write_mask(slot)) & BITLL(rn(reg)))) {
+	ii(slot);
+	got = 0;
+    }
+
     w = movi_p(rn(reg), i0);
     JSR(rn(reg));
-    NOP();
+    sh4_put_slot(got, slot);
     jit_unget_reg(reg);
 
     _jitc->idirect--;

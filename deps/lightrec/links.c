@@ -130,6 +130,60 @@ void lightrec_links_free_list(struct lightrec_state *state,
 	links_unlock(links);
 }
 
+#if defined(__sh__) && SH4_BRA_LINKS
+
+/* BRA disp12: PC-relative from the instruction after the delay slot. */
+#define SH4_BRA_OP	0xa000
+#define SH4_BRA_MIN	(-2048)
+#define SH4_BRA_MAX	2046
+
+static inline uintptr_t bra_target(const u16 *insn)
+{
+	/* Sign-extend the 12-bit displacement. */
+	s32 disp = ((s32)(*insn << 20)) >> 20;
+
+	return (uintptr_t)insn + 4 + (uintptr_t)(disp * 2);
+}
+
+/* Point a BRA link at `value`, falling back to the owner's own far stub
+ * when the target is the dispatcher, or simply too far to encode. The stub
+ * is in the owner's block, so the fallback can never fail. */
+static void link_write(struct lightrec_state *state,
+		       struct lightrec_link *link, u32 value)
+{
+	uintptr_t target = value;
+	u16 insn;
+	s32 disp;
+
+	if (target == (uintptr_t)state->eob_wrapper_pins_func)
+		target = link->stub;
+
+	disp = (s32)((intptr_t)target - (intptr_t)link->insn - 4) / 2;
+
+	if (disp < SH4_BRA_MIN || disp > SH4_BRA_MAX) {
+		target = link->stub;
+		disp = (s32)((intptr_t)target - (intptr_t)link->insn - 4) / 2;
+	}
+
+	insn = SH4_BRA_OP | (u16)(disp & 0x0fff);
+	if (*link->insn == insn)
+		return;
+
+	*link->insn = insn;
+
+	if (state->ops.code_inv)
+		state->ops.code_inv(link->insn, sizeof(*link->insn));
+}
+
+#define LINK_WRITE(state, link, value) link_write(state, link, value)
+
+#else
+
+#define LINK_WRITE(state, link, value) (*(link)->word = (value))
+
+#endif
+
+#if !defined(__sh__) || !SH4_BRA_LINKS
 static u32 * find_magic_word(const struct block *block, const void *function,
 			     u32 magic)
 {
@@ -156,6 +210,7 @@ static u32 * find_magic_word(const struct block *block, const void *function,
 
 	return found;
 }
+#endif
 
 int lightrec_links_register_block(struct lightrec_state *state,
 				  struct block *block, void *function,
@@ -165,7 +220,9 @@ int lightrec_links_register_block(struct lightrec_state *state,
 	struct lightrec_links *links = state->links;
 	struct lightrec_link *link, *list = NULL;
 	unsigned int i, h;
+#if !defined(__sh__) || !SH4_BRA_LINKS
 	u32 *word;
+#endif
 
 	/* The block's previous code generation gave its links away before
 	 * we got here. */
@@ -175,11 +232,19 @@ int lightrec_links_register_block(struct lightrec_state *state,
 		return 0;
 
 	for (i = 0; i < nb_pending; i++) {
+#if defined(__sh__) && SH4_BRA_LINKS
+		/* No BRA was emitted for this exit, so there is no
+		 * displacement to rewrite. The jump still reaches the stub,
+		 * which is correct - the edge just never gets linked. */
+		if (!pending[i].insn)
+			continue;
+#else
 		word = find_magic_word(block, function, pending[i].magic);
 		if (!word) {
 			lightrec_links_free_list(state, list);
 			return -EINVAL;
 		}
+#endif
 
 		link = lightrec_malloc(state, MEM_FOR_LIGHTREC, sizeof(*link));
 		if (!link) {
@@ -188,7 +253,15 @@ int lightrec_links_register_block(struct lightrec_state *state,
 		}
 
 		link->offset = pending[i].offset;
+#if defined(__sh__) && SH4_BRA_LINKS
+		link->insn = pending[i].insn;
+		/* The BRA still holds the displacement the backend emitted,
+		 * which aims at this block's stub - so the stub's address is
+		 * simply what it currently points at. */
+		link->stub = bra_target(pending[i].insn);
+#else
 		link->word = word;
+#endif
 		link->next_owner = list;
 		list = link;
 
@@ -196,7 +269,8 @@ int lightrec_links_register_block(struct lightrec_state *state,
 
 		/* Resolve now, under the lock, so a LUT change racing with
 		 * us is ordered against this write. */
-		*word = link_value(state, lut_read(state, link->offset));
+		LINK_WRITE(state, link,
+			   link_value(state, lut_read(state, link->offset)));
 
 		h = links_hash(link->offset);
 		link->next_target = links->heads[h];
@@ -227,7 +301,7 @@ void lightrec_links_lut_changed(struct lightrec_state *state,
 	for (link = links->heads[links_hash(offset)]; link;
 	     link = link->next_target) {
 		if (link->offset == offset)
-			*link->word = value;
+			LINK_WRITE(state, link, value);
 	}
 
 	links_unlock(links);
@@ -262,7 +336,7 @@ void lightrec_links_lut_cleared(struct lightrec_state *state,
 			for (link = links->heads[links_hash(offset + i)]; link;
 			     link = link->next_target) {
 				if (link->offset == offset + i)
-					*link->word = value;
+					LINK_WRITE(state, link, value);
 			}
 		}
 	} else {
@@ -270,7 +344,7 @@ void lightrec_links_lut_cleared(struct lightrec_state *state,
 			for (link = links->heads[h]; link;
 			     link = link->next_target) {
 				if (link->offset - offset < count)
-					*link->word = value;
+					LINK_WRITE(state, link, value);
 			}
 		}
 	}

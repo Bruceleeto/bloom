@@ -164,6 +164,8 @@ typedef jit_int32_t		jit_fpr_t;
 #define jit_flag_use		0x0008	/* do not remove marker label */
 #define jit_flag_synth		0x0010	/* synthesized instruction */
 #define jit_flag_far		0x0800	/* SH: branch/jump needs its long form */
+#define jit_flag_bra		0x4000	/* SH: jmpi emitted a real BRA, and
+					 * jit_branch_address() has its address */
 #define jit_flag_head		0x1000	/* label reached by normal flow */
 #define jit_flag_varargs	0x2000	/* call{r,i} to varargs function */
 
@@ -1358,6 +1360,12 @@ extern void _jit_destroy_state(jit_state_t*);
 
 #define jit_address(node)	_jit_address(_jit, node)
 extern jit_pointer_t _jit_address(jit_state_t*, jit_node_t*);
+/* Address of the branch instruction a jmpi node emitted, valid after
+ * jit_emit() and only while the state is alive. NULL unless the node
+ * carries jit_flag_bra, i.e. unless a directly patchable branch was
+ * emitted; the far forms have no displacement field to rewrite. */
+#define jit_branch_address(node) _jit_branch_address(_jit, node)
+extern jit_pointer_t _jit_branch_address(jit_state_t*, jit_node_t*);
 extern jit_node_t *_jit_name(jit_state_t*, const char*);
 extern jit_node_t *_jit_note(jit_state_t*, const char*, int);
 extern jit_node_t *_jit_label(jit_state_t*);

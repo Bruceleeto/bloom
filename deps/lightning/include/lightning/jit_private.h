@@ -620,6 +620,10 @@ struct jit_compiler {
     jit_uint16_t          ioff;
     jit_uint16_t          idirect;
     jit_uint64_t          reg_mask[3]; /* past, present, future */
+    /* Address of the BRA emitted by the last jmpi/jmpi_p, or 0 when the
+     * far form (literal load + jmpr) was used instead. Read by the
+     * jit_code_jmpi emitter to stamp the node - see jit_branch_address(). */
+    jit_word_t            bra_addr;
 #endif
 #if __mips__
     struct {

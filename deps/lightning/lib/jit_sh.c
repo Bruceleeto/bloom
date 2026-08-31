@@ -1223,6 +1223,7 @@ _emit_code(jit_state_t *_jit)
 		flush_consts(0);
 		break;
 	    case jit_code_jmpi:
+		_jitc->bra_addr = 0;
 		if (node->flag & jit_flag_node) {
 		    temp = node->u.n;
 		    assert(temp->code == jit_code_label ||
@@ -1236,6 +1237,16 @@ _emit_code(jit_state_t *_jit)
 		}
 		else
 		    jmpi(node->u.w);
+		/* Record where the BRA landed, if one was emitted at all, so
+		 * the caller can rewrite its displacement later - see
+		 * jit_branch_address(). node->u holds the target, so w is
+		 * free on this node. */
+		if (_jitc->bra_addr) {
+		    node->flag |= jit_flag_bra;
+		    node->w.w = _jitc->bra_addr;
+		} else {
+		    node->flag &= ~jit_flag_bra;
+		}
 		flush_consts(0);
 		break;
 	    case jit_code_callr:

@@ -1902,6 +1902,9 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	cstate->nb_targets = 0;
 	cstate->nb_links = 0;
 	cstate->no_load_delay = false;
+#if defined(__sh__)
+	cstate->link_stub = NULL;
+#endif
 
 	/*
 	 * Only $zero is known at block entry; every other register holds
@@ -2035,6 +2038,10 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 			pr_err("Unable to find branch target\n");
 	}
 
+#if defined(__sh__) && SH4_BRA_LINKS
+	lightrec_emit_link_stub(cstate, _jit);
+#endif
+
 	jit_ret();
 	jit_epilog();
 
@@ -2059,6 +2066,19 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	 * resolved before it is published. The old generation's links stay
 	 * registered until its code is reaped, so it keeps mirroring the LUT
 	 * while it runs. */
+#if defined(__sh__) && SH4_BRA_LINKS
+	/* Turn each link's jmpi node into the address of the BRA it emitted.
+	 * Only valid while `_jit` is alive, so it has to happen here, before
+	 * jit_clear_state(). A node that did not get a BRA (the backend fell
+	 * back to a literal load for a target out of range) has no
+	 * displacement to rewrite; drop the link and let that exit stay on
+	 * the stub, which is correct, just slower. */
+	for (i = 0; i < cstate->nb_links; i++) {
+		cstate->links[i].insn =
+			jit_branch_address(cstate->links[i].node);
+	}
+#endif
+
 	if (lightrec_links_register_block(state, block, new_fn, cstate->links,
 					  cstate->nb_links)) {
 		pr_err("Unable to link block at "PC_FMT"\n", block->pc);

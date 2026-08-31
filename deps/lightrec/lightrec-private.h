@@ -118,10 +118,22 @@ struct lightrec_link;
 struct lightrec_links;
 
 /* A static exit recorded while emitting a block: the LUT offset of its
- * target and the placeholder written into the literal pool (links.h). */
+ * target, plus how the exit is expressed.
+ *
+ * Generic form: a placeholder written into the literal pool, which
+ * lightrec_links_register_block() finds by scanning the emitted code.
+ *
+ * SH-4 form (links.h): a real BRA whose displacement is rewritten in place.
+ * `node` is the jmpi node, and its address is only known once jit_emit()
+ * has run - lightrec_resolve_pending_links() fills `insn` in from it while
+ * the jit_state_t is still alive. */
 struct lightrec_pending_link {
 	u32 offset;
 	u32 magic;
+#if defined(__sh__)
+	jit_node_t *node;
+	u16 *insn;
+#endif
 };
 
 struct block {
@@ -177,6 +189,11 @@ struct lightrec_cstate {
 	unsigned int nb_targets;
 	unsigned int nb_links;
 	unsigned int cycles;
+#if defined(__sh__)
+	/* Forward label of this block's shared far stub, created by the
+	 * first direct link and emitted at the block's tail. */
+	jit_node_t *link_stub;
+#endif
 
 	struct regcache *reg_cache;
 

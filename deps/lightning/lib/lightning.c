@@ -712,6 +712,18 @@ _jit_address(jit_state_t *_jit, jit_node_t *node)
     return ((jit_pointer_t)node->u.w);
 }
 
+jit_pointer_t
+_jit_branch_address(jit_state_t *_jit, jit_node_t *node)
+{
+    assert(_jitc->done);
+    assert(node != NULL && node->code == jit_code_jmpi);
+
+    if (!(node->flag & jit_flag_bra))
+	return (NULL);
+
+    return ((jit_pointer_t)node->w.w);
+}
+
 jit_node_t *
 _jit_data(jit_state_t *_jit, const void *data,
 	  jit_word_t length, jit_int32_t align)
