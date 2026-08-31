@@ -112,7 +112,7 @@ _Bool lightrec_has_dirty_regs(struct regcache *cache);
 
 /* Pinned guest registers - see the contract in regcache.c. */
 #if defined(__sh__) && OPT_SH4_USE_GBR
-#  define LIGHTREC_NUM_PINNED 4
+#  define LIGHTREC_NUM_PINNED 6
 #elif defined(__sh__)
 #  define LIGHTREC_NUM_PINNED 4
 #else

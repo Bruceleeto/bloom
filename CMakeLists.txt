@@ -15,8 +15,13 @@ include(kallistios)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
+# Release, not RelWithDebInfo: the KOS toolchain gates its flags on the
+# config (kallistios.toolchain.cmake), and the RelWithDebInfo branch forces
+# -O2 and -fno-omit-frame-pointer over the -O3 -fomit-frame-pointer that
+# kos-cc already passes - the last -O on the line wins. Worth ~0.7 ms a
+# frame on the Spyro savestate.
 if (NOT CMAKE_BUILD_TYPE)
-	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Type of build" FORCE)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Type of build" FORCE)
 	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
 		None Debug Release RelWithDebInfo MinSizeRel
 	)
