@@ -413,6 +413,16 @@ static void lightrec_enable_ram(struct lightrec_state *state, bool enable)
 		memcpy(cache_buf, psxM, sizeof(cache_buf));
 
 	ram_disabled = !enable;
+
+	/* Isolating and then un-isolating the cache IS the R3000A's instruction
+	 * cache flush - it is how the BIOS and the kernel publish code they have
+	 * just written, and it is the hardware idiom a title uses when it does
+	 * not go through FlushCache. While stores invalidated one word at a time
+	 * this hook did not have to do anything; now that invalidation happens
+	 * only at flush points, this is one of them. Missing it means executing
+	 * the compiled form of kernel code the BIOS has since overwritten. */
+	if (enable)
+		lightrec_invalidate_all(lightrec_state);
 }
 
 static bool lightrec_can_hw_direct(u32 kaddr, bool is_write, u8 size)
@@ -754,8 +764,17 @@ static void lightrec_plugin_execute_block(psxRegisters *regs,
 
 static void lightrec_plugin_clear(u32 addr, u32 size)
 {
-	if ((addr == 0 && size == UINT32_MAX)
-	    || (lightrec_hacks & LIGHTREC_OPT_INV_DMA_ONLY))
+	/* INV_DMA_ONLY used to flush the whole code cache here, because with
+	 * stores no longer invalidating there is no other point at which stale
+	 * code gets cleared. That costs a full recompile of everything live on
+	 * every DMA, which in Spyro means a 1.1 second frame the moment new
+	 * geometry streams in - far more than the hack saves.
+	 *
+	 * lightrec_invalidate() works off the address range alone: it clears
+	 * the code LUT and the block links for those words, and never consults
+	 * the per-store stub the hack removes. So the range is enough, and it
+	 * is what actually changed. */
+	if (addr == 0 && size == UINT32_MAX)
 		lightrec_invalidate_all(lightrec_state);
 	else
 		/* size * 4: PCSX uses DMA units */
@@ -797,7 +816,39 @@ static void lightrec_plugin_apply_config()
 	cycles_per_op_old = cycles_per_op;
 	lightrec_set_cycles_per_opcode(lightrec_state, cycles_per_op);
 
-	lightrec_set_unsafe_opt_flags(lightrec_state, lightrec_hacks);
+	/* Invalidate compiled code from the kernel's flush points, never from
+	 * the store itself.
+	 *
+	 * The R3000A has an instruction cache, so a title that patches code and
+	 * does not tell the kernel does not see its own patch on real hardware
+	 * either. Checking every store for a hit on compiled code therefore buys
+	 * nothing a correct title can observe, and it is not cheap: the code-LUT
+	 * probe is 11 of a store's 17.6 host instructions, and stores are a
+	 * quarter of everything we emit.
+	 *
+	 * bleem does exactly this and pays zero instructions per store: it
+	 * reaches one flush routine from thirteen kernel call numbers and a CD
+	 * command. We already have that trigger set -- psxbios.c (memcpy, Exec,
+	 * LoadExec), misc.c (EXE load), cdrom.c and psxdma.c (transfers into
+	 * RAM), psxmem.c. This makes it the only path, for every game, rather
+	 * than a per-title entry in the hack database. */
+	/* Invalidate compiled code from the kernel's flush points, never from
+	 * the store itself.
+	 *
+	 * The R3000A has an instruction cache, so a title that patches code and
+	 * does not tell the kernel does not see its own patch on real hardware
+	 * either. Checking every store for a hit on compiled code therefore buys
+	 * nothing a correct title can observe, and it is not cheap: the code-LUT
+	 * probe is 11 of a store's 17.6 host instructions, and stores are a
+	 * quarter of everything we emit.
+	 *
+	 * bleem does exactly this and pays zero instructions per store: it
+	 * reaches one flush routine from thirteen kernel call numbers and a CD
+	 * command. We already have that trigger set -- psxbios.c (memcpy, Exec,
+	 * LoadExec), misc.c (EXE load), cdrom.c and psxdma.c (transfers into
+	 * RAM), psxmem.c, and lightrec_enable_ram() above. */
+	lightrec_set_unsafe_opt_flags(lightrec_state,
+				      lightrec_hacks | LIGHTREC_OPT_INV_DMA_ONLY);
 	intApplyConfig();
 }
 

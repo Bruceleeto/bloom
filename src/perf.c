@@ -32,7 +32,11 @@ static const char *area_names[PERF_NB_AREAS] = { "rest", "gpu", "flip", "cd", "g
 
 /* lightrec.c: blocks compiled so far, to see whether steady state is steady. */
 extern unsigned int lightrec_perf_nb_compile;
+extern unsigned int lightrec_perf_nb_execute;
+extern unsigned int lightning_perf_pairs;
+extern unsigned int lightning_perf_singles;
 static unsigned int last_nb_compile;
+static unsigned int last_nb_execute;
 
 static uint64_t cyc[PERF_NB_AREAS], ev[PERF_NB_AREAS];
 static uint64_t last_cyc, last_ev;
@@ -93,9 +97,13 @@ void perf_report(unsigned int frames, unsigned int ms)
 		frames = 1;
 
 	/* PERF <event> lap N frames F comp C | cyc/fr total (ms) <area>... | <cnt|cyc>/fr total <area>... */
-	printf("PERF %-14s lap %u fr %u comp %u | cyc/fr %7.3fM (%5.2f ms)",
+	printf("PERF %-14s lap %u fr %u comp %u exec/fr %u pair %u%% | cyc/fr %7.3fM (%5.2f ms)",
 	       events[cur_ev].name, lap, frames,
 	       lightrec_perf_nb_compile - last_nb_compile,
+	       (lightrec_perf_nb_execute - last_nb_execute) / frames,
+	       lightning_perf_pairs + lightning_perf_singles
+	       ? 200 * lightning_perf_pairs
+		 / (2 * lightning_perf_pairs + lightning_perf_singles) : 0,
 	       (double)tc / frames / 1e6, (double)tc / frames / 200e3);
 	for (i = 0; i < PERF_NB_AREAS; i++)
 		printf(" %s %6.3fM", area_names[i], (double)cyc[i] / frames / 1e6);
@@ -105,6 +113,7 @@ void perf_report(unsigned int frames, unsigned int ms)
 		printf(" %s %8.1fk", area_names[i], (double)ev[i] / frames / 1e3);
 	printf("%s\n", events[cur_ev].cycles ? " (cycles)" : "");
 	last_nb_compile = lightrec_perf_nb_compile;
+	last_nb_execute = lightrec_perf_nb_execute;
 	(void)ms;
 
 	for (i = 0; i < PERF_NB_AREAS; i++)

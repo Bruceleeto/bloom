@@ -38,6 +38,10 @@
 
 /* For bloom's perf report (src/perf.c). */
 unsigned int lightrec_perf_nb_compile;
+/* Calls into JIT land.  Each one is a full C prologue/epilogue on SH-4 --
+ * seven callee-saved registers to the stack and the pins reloaded from GBR --
+ * so the rate is what says whether that ceremony matters.  See perf.c. */
+unsigned int lightrec_perf_nb_execute;
 
 /*
  * Bumped on every write to a COP2 control register, wherever the write comes
@@ -2281,6 +2285,8 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 
 	state->target_cycle = target_cycle;
 	state->curr_pc = pc;
+
+	lightrec_perf_nb_execute++;
 
 	block_trace = get_next_block_func(state, pc);
 	if (block_trace) {

@@ -1182,6 +1182,9 @@ static void sh4_code_move(jit_state_t *_jit, sh4_instr_t *code,
     }
 }
 
+unsigned int lightning_perf_pairs;
+unsigned int lightning_perf_singles;
+
 static void
 _flush(jit_state_t *_jit, jit_bool_t all)
 {
@@ -1361,6 +1364,17 @@ _flush(jit_state_t *_jit, jit_bool_t all)
             if (code[i].group != SH4_GROUP_MT)
                 _jitc->reg_mask[2] |= sh4_write_mask(code[i]);
         }
+
+        /* The scheduler's own pairing score: nb == 2 is an issue pair, nb == 1
+         * is an instruction that found no partner.  Counted here rather than
+         * modelled from a dump, because a second model of the SH-4 issue
+         * groups would be a second source of truth and would drift from the
+         * table above.  Hardware's `dual_issued` counter is the final judge;
+         * this says what the scheduler THINKS it achieved. */
+        if (nb == 2)
+            lightning_perf_pairs++;
+        else if (nb == 1)
+            lightning_perf_singles++;
 
         code += nb;
         nb_ops -= nb;
@@ -1609,6 +1623,86 @@ take:
 	return 1;
 }
 #define sh4_take_slot(s, r, c)		_sh4_take_slot(_jit, s, r, c)
+
+/* Move the load that produces a branch's target register earlier in the
+ * buffer.
+ *
+ * lightrec ends a block with the target address materialised straight into
+ * the register the jump reads:
+ *
+ *	mov.l	@(676,gbr),r0
+ *	jmp	@r0
+ *	nop
+ *
+ * A load's result is not ready for one more cycle, so the jmp stalls; and
+ * because the load writes exactly what the branch reads, sh4_take_slot()
+ * cannot lift it into the delay slot either, so the nop stays. Sinking the
+ * load back past whatever is independent of it costs nothing, removes the
+ * stall, and leaves some other instruction adjacent to the branch for the
+ * slot to take.
+ *
+ * Only loads are worth moving: every other producer has its result ready in
+ * the next cycle.
+ */
+static void
+_sh4_hoist_target(jit_state_t *_jit, jit_uint64_t reads)
+{
+	jit_uint64_t xr, xw, yr, yw;
+	sh4_instr_t x, y;
+	unsigned int p, t;
+	int j;
+
+	if (_jitc->idirect || _jitc->ioff < 2 || !reads)
+		return;
+
+	p = _jitc->ioff - 1;
+	x.raw = _jitc->ibuf[p];
+
+	/* Only the instruction adjacent to the branch can stall it. */
+	if (x.group != SH4_GROUP_LS || !(sh4_write_mask(x) & reads))
+		return;
+
+	/* sh4_code_move() repairs the recorded patch address of a mov.l
+	 * @(disp,pc) only; the other pc-relative forms have no fixup here. */
+	if ((x.op.op >> 12) == 0x9 || (x.op.op & 0xff00) == 0xc700)
+		return;
+
+	xr = sh4_read_mask(x);
+	xw = sh4_write_mask(x);
+	t = p;
+
+	for (j = (int)p - 1; j >= 0; j--) {
+		y.raw = _jitc->ibuf[j];
+
+		if (sh4_is_branch(y)) {
+			/* Its delay slot is spoken for and nothing may come
+			 * between the two. */
+			t = (unsigned int)j + 2;
+			break;
+		}
+
+		yr = sh4_read_mask(y);
+		yw = sh4_write_mask(y);
+
+		/* Crossing y must not change what either one sees. */
+		if ((xw & yr) || (xw & yw) || (xr & yw))
+			break;
+
+		/* Only stores set RWMASK_MEM, so loads are ordered by hand. */
+		if ((xw & RWMASK_MEM) && y.group == SH4_GROUP_LS)
+			break;
+		if ((yw & RWMASK_MEM))
+			break;
+
+		t = (unsigned int)j;
+	}
+
+	if (t >= p)
+		return;
+
+	sh4_code_move(_jit, (sh4_instr_t *)_jitc->ibuf, p, t, 0);
+}
+#define sh4_hoist_target(r)		_sh4_hoist_target(_jit, r)
 
 /* Emit a branch's delay slot: whatever sh4_take_slot() lifted, or the NOP
  * that used to be unconditional. */
@@ -3875,6 +3969,7 @@ _jmpr(jit_state_t *_jit, jit_int16_t r0)
 	jit_bool_t got;
 
 	set_fmode(_jit, SH_DEFAULT_FPU_MODE);
+	sh4_hoist_target(BITLL(r0));
 	got = sh4_take_slot(&slot, BITLL(r0), 0);
 	JMP(r0);
 	sh4_put_slot(got, slot);
@@ -3947,6 +4042,7 @@ _callr(jit_state_t *_jit, jit_int16_t r0)
 
 	reset_fpu(_jit, r0 == _R0);
 
+	sh4_hoist_target(BITLL(r0));
 	got = sh4_take_slot(&slot, BITLL(r0), 1);
 	JSR(r0);
 	sh4_put_slot(got, slot);
