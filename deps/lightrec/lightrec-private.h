@@ -10,6 +10,7 @@
 #include "lightrec-config.h"
 #include "constprop.h"
 #include "disassembler.h"
+#include "attr.h"
 #include "lightrec.h"
 #include "regcache.h"
 
@@ -198,6 +199,13 @@ struct lightrec_cstate {
 	struct regcache *reg_cache;
 
 	_Bool no_load_delay;
+
+#if BLOOM_ATTR
+	/* Attribution markers for the block being compiled, resolved to host
+	 * addresses once it has one.  See attr.h. */
+	struct lightrec_attr_pending attr_pending[LIGHTREC_ATTR_MAX_OPS];
+	unsigned int attr_nb;
+#endif
 };
 
 struct lightrec_state {

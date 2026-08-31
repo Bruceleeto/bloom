@@ -7,6 +7,7 @@
 #include "blockcache.h"
 #include "debug.h"
 #include "disassembler.h"
+#include "attr.h"
 #include "emitter.h"
 #include "links.h"
 
@@ -3725,6 +3726,10 @@ void lightrec_rec_opcode(struct lightrec_cstate *state,
 		target->local_label = jit_label();
 		target->label = NULL;	/* entry stub, emitted at block end */
 	}
+
+	/* Before lowering, not after: the marker has to sit at the first host
+	 * byte this op produces. */
+	lightrec_attr_mark(state, block, offset);
 
 	if (likely(op->opcode)) {
 		f = rec_standard[op->i.op];

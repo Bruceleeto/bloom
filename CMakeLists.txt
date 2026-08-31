@@ -140,6 +140,17 @@ target_compile_definitions(lightrec PRIVATE
 	OPT_STATE_ALIAS=${STATE_ALIAS}
 )
 
+# Guest-op attribution: a MEASUREMENT build, not a shipping one.  It costs a
+# multi-megabyte static buffer and is off by default.  See deps/lightrec/attr.h.
+option(BLOOM_ATTR "Record which host bytes came from which guest op" OFF)
+# The buffer is static .bss and comes straight out of the target's heap.  On a
+# stock 16 MiB Dreamcast 2 MiB is already too much: the emulator hits "Out of
+# memory. Requested sbrk_base ... diff 1048576", block compilation stops after
+# 271 blocks, and the table looks merely small rather than broken.  8 MiB needs
+# testcast's 32 MiB RAM.  WHATEVER THE SIZE, CHECK THE RUN LOG FOR THAT LINE --
+# a truncated table reports dropped=0 and looks completely healthy.
+set(BLOOM_ATTR_MB 8 CACHE STRING "Attribution buffer size in MiB")
+
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
 math(EXPR CODEBUF_SIZE "0x100000 * ${CODE_BUFFER_SIZE_MB}")
 if (NOT CODEBUF_SIZE)
@@ -200,6 +211,8 @@ target_compile_definitions(libpcsxcore PUBLIC
 	NO_SOCKET
 	DISABLE_MEM_LUTS
 	CODE_BUFFER_SIZE=${CODEBUF_SIZE}
+	BLOOM_ATTR=$<BOOL:${BLOOM_ATTR}>
+	BLOOM_ATTR_MB=${BLOOM_ATTR_MB}
 	LIGHTREC_PROG_NAME="/rd/dummy.elf"
 	USE_ASYNC_CDROM
 	USE_C11_THREADS

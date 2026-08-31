@@ -1145,3 +1145,47 @@ void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit)
 	jit_live(LIGHTREC_REG_CYCLE);
 	lightrec_regs_live(cache, _jit);
 }
+
+/* WHICH HOST REGISTERS HOLD A LIVE VALUE, as a bitmask of SH-4 register
+ * numbers.  Recorded per guest op by `attr.c`, because a shorter sequence is
+ * only legal under the liveness that actually held when the original was
+ * emitted -- `tools/idiot/plan.md` calls a sequence without its preconditions
+ * "not a result", and today that tool has to INFER scratch registers by
+ * scanning surrounding code.  This is the same fact, exact and free.
+ *
+ * The lightning register tokens `_R0.._R15` are declared in order in
+ * `jit_sh.h`, so the token IS the SH-4 register number for the GPRs.  The
+ * assertions below fail the build if that stops being true rather than
+ * quietly attributing liveness to the wrong registers. */
+u32 lightrec_regcache_live_mask(const struct regcache *cache)
+{
+	u32 mask = 0;
+	u8 i;
+
+	_Static_assert(JIT_R0 == 1, "lightning R0 is not SH-4 r1");
+	_Static_assert(JIT_V0 == 8, "lightning V0 is not SH-4 r8");
+
+	for (i = 0; i < NUM_REGS + NUM_TEMPS; i++) {
+		const struct native_register *nreg = &cache->lightrec_regs[i];
+		u8 reg;
+
+		/* NOT `used`.  That flag means "claimed by the operation being
+		 * lowered right now" and free_reg() clears it after every op,
+		 * so at the point attr.c places its marker -- before the op is
+		 * lowered -- it is false for every register and the mask came
+		 * out zero on all 2923 records of the first run.
+		 *
+		 * What makes a register unclobberable is that it still HOLDS
+		 * something, and `prio` is what survives free_reg(): anything
+		 * above REG_IS_TEMP is a value (a known constant, zero, a
+		 * loaded guest register, or a dirty one owing a writeback). */
+		if (nreg->prio == REG_IS_TEMP && !nreg->locked)
+			continue;
+
+		reg = lightrec_reg_to_lightning(cache, nreg);
+		if (reg < 16)
+			mask |= 1u << reg;
+	}
+
+	return mask;
+}

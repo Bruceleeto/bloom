@@ -4,6 +4,7 @@
  */
 
 #include "arch.h"
+#include "attr.h"
 #include "blockcache.h"
 #include "constprop.h"
 #include "debug.h"
@@ -1965,6 +1966,8 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		lightrec_emit_lut_pref(cstate, block);
 #endif
 
+	lightrec_attr_block_start(cstate);
+
 	for (i = 0; i < block->nb_ops; i++) {
 		elm = &block->opcode_list[i];
 
@@ -1995,6 +1998,11 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 		cstate->cycles += lightrec_cycles_of_opcode(state, elm->c);
 	}
+
+	/* Everything from here on is the block's own scaffolding, not any
+	 * guest instruction -- mark it so it stops being charged to the last
+	 * op lowered. */
+	lightrec_attr_mark_epilogue(cstate, block);
 
 	/* Out-of-line entries for the code LUT: anything arriving from the
 	 * dispatcher or a direct link has the pinned registers' homes full
@@ -2046,6 +2054,11 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	jit_epilog();
 
 	new_fn = lightrec_emit_code(state, block, _jit, &block->code_size);
+
+	/* Resolve the attribution markers here, and only here: `jit_address()`
+	 * reads nodes that belong to `_jit`, which `jit_clear_state()` below
+	 * throws away.  Same constraint the BRA links resolve under. */
+	lightrec_attr_block_end(cstate, block, _jit, new_fn, block->code_size);
 	if (!new_fn) {
 		if (!ENABLE_THREADED_COMPILER)
 			pr_err("Unable to compile block!\n");
@@ -2363,6 +2376,8 @@ struct lightrec_state * lightrec_init(char *argv0,
 				      size_t nb,
 				      const struct lightrec_ops *ops)
 {
+	lightrec_attr_init();
+
 	const struct lightrec_mem_map *codebuf_map = &maps[PSX_MAP_CODE_BUFFER];
 	const struct lightrec_mem_map *map;
 	struct lightrec_state *state;
@@ -2384,6 +2399,9 @@ struct lightrec_state * lightrec_init(char *argv0,
 
 	if (ENABLE_CODE_BUFFER && nb > PSX_MAP_CODE_BUFFER
 	    && codebuf_map->address) {
+		lightrec_attr_set_code_region(codebuf_map->address,
+					      (unsigned int)codebuf_map->length);
+
 		tlsf = tlsf_create_with_pool(codebuf_map->address,
 					     codebuf_map->length);
 		if (!tlsf) {

@@ -147,6 +147,10 @@ _Bool lightrec_reg_is_pinned(u16 reg);
 void lightrec_regcache_pin_block(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_local_edge(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_sync_target(struct regcache *cache, jit_state_t *_jit);
+
+/* Bitmask of SH-4 register numbers currently holding a live value.  Used by
+ * the attribution side-table; see attr.h. */
+u32 lightrec_regcache_live_mask(const struct regcache *cache);
 void lightrec_regcache_clean_unpinned(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_store_pins(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_entry_loads(struct regcache *cache, jit_state_t *_jit);

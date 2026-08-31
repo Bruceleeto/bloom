@@ -4,6 +4,7 @@ project(lightrec LANGUAGES C VERSION 0.9)
 list(APPEND LIGHTREC_SOURCES
 	blockcache.c
 	constprop.c
+	attr.c
 	emitter.c
 	interpreter.c
 	lightrec.c
@@ -56,6 +57,15 @@ endif()
 
 string(TOUPPER ${LOG_LEVEL} LIGHTREC_LOG_LEVEL)
 target_compile_definitions(lightrec PRIVATE LOG_LEVEL=${LIGHTREC_LOG_LEVEL}_L)
+
+# Guest-op attribution.  The option is declared in the top-level CMakeLists,
+# but the definition has to be repeated on THIS target: `attr.c` compiles here,
+# and without it the file builds cleanly with every hook stubbed out -- which
+# looks exactly like a working instrumented build and records nothing.
+if (BLOOM_ATTR)
+	target_compile_definitions(lightrec PRIVATE
+		BLOOM_ATTR=1 BLOOM_ATTR_MB=${BLOOM_ATTR_MB})
+endif()
 
 if (CMAKE_COMPILER_IS_GNUCC)
 	target_compile_options(lightrec PRIVATE -fvisibility=hidden)
