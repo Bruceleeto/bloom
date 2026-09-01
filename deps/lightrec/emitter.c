@@ -156,8 +156,12 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	/* What the dispatcher provides on block entry: the address mask
 	 * blocks are compiled to expect. curr_pc is not synced here - see
 	 * the C_WRAPPER_RW_GENERIC site in rec_io(), the one C path reached
-	 * from inside a block that reads it. */
-	if (!arch_has_fast_mask())
+	 * from inside a block that reads it. Elide the movi (a pool load on
+	 * SH-4) when the allocator temp provably still holds the mask; only
+	 * JIT_R1 itself is trusted, since exit sequences write other regs
+	 * behind the regcache's back. */
+	if (!arch_has_fast_mask() &&
+	    lightrec_get_reg_with_value(state->reg_cache, 0x1fffffff) != JIT_R1)
 		jit_movi(JIT_R1, 0x1fffffff);
 
 #if !defined(__sh__) || !SH4_BRA_LINKS
@@ -250,8 +254,11 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 	/* What the dispatcher provides on block entry: the address mask
 	 * blocks are compiled to expect. curr_pc is not synced here - see
 	 * the C_WRAPPER_RW_GENERIC site in rec_io(), the one C path reached
-	 * from inside a block that reads it. */
-	if (!arch_has_fast_mask())
+	 * from inside a block that reads it. Same movi elision as
+	 * lightrec_jump_to_known_eob; r2 is untouched by the LUT lookup
+	 * above, so its value mark is still valid here. */
+	if (!arch_has_fast_mask() &&
+	    lightrec_get_reg_with_value(state->reg_cache, 0x1fffffff) != JIT_R1)
 		jit_movi(JIT_R1, 0x1fffffff);
 
 	/* Links enter behind the per-block load stub. There is no stub any
