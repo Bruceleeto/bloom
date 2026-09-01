@@ -1222,6 +1222,7 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	pvr_vertex_t *vert;
 	pvr_vertex_part2_t *vert2;
 	unsigned int i;
+	bool warm;
 
 #if ABLATE == 3
 	return;
@@ -1231,6 +1232,32 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 		sq_hdr = pvr_dr_target();
 		copy32(sq_hdr, hdr);
 		pvr_dr_commit(sq_hdr);
+	}
+
+	/* Warm both store queues with the fields that do not vary over this
+	 * primitive.  pvr_dr_target() alternates between two SQ buffers and
+	 * their contents survive a commit, so z, oargb and the vertex
+	 * command only have to be written once per queue rather than once
+	 * per vertex - three stores of the eight in the loop below.
+	 *
+	 * Not done on the clip path: the second vertex goes through the same
+	 * two queues and writes its own argb/oargb over these offsets, so
+	 * there is nothing left to reuse. */
+	warm = !(WITH_CLIPPING && textured && modified);
+	if (likely(warm)) {
+		vert = pvr_dr_target();
+		vert->flags = PVR_CMD_VERTEX;
+		vert->z = z;
+		vert->oargb = oargb;
+		if (!textured)
+			vert->argb1 = 0;
+
+		vert = pvr_dr_target();
+		vert->flags = PVR_CMD_VERTEX;
+		vert->z = z;
+		vert->oargb = oargb;
+		if (!textured)
+			vert->argb1 = 0;
 	}
 
 	for (i = 0; i < nb; i++) {
@@ -1247,10 +1274,16 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 
 		vert = pvr_dr_target();
 
-		vert->flags = (i == nb - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-		vert->z = z;
+		if (unlikely(!warm)) {
+			vert->flags = (i == nb - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+			vert->z = z;
+			vert->oargb = oargb;
+		} else if (unlikely(i == nb - 1)) {
+			/* Only the last vertex differs from the warmed value. */
+			vert->flags = PVR_CMD_VERTEX_EOL;
+		}
+
 		vert->argb = color[i];
-		vert->oargb = oargb;
 		vert->x = fr0;
 		vert->y = fr1;
 		if (textured) {
@@ -1258,7 +1291,8 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 			vert->v = fr3 + COORDS_V_OFFSET;
 		} else {
 			vert->argb0 = color[i];
-			vert->argb1 = 0;
+			if (unlikely(!warm))
+				vert->argb1 = 0;
 		}
 
 		pvr_dr_commit(vert);
