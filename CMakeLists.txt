@@ -335,7 +335,12 @@ target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 )
 
 option(WITH_CDROM_DMA "Read CD-ROM sectors using DMA" ON)
-set(WITH_CDROM_CACHE_SIZE 16 CACHE STRING "CD-ROM cache size in sectors")
+# 0 disables the async prefetch thread, and cdra_readTrack then takes its own
+# no-copy path straight to ISOreadTrack.  The thread exists to hide optical
+# drive latency; reading from IDE it only adds two memcpys of every 2352-byte
+# sector (measured: 41% of all memcpy traffic).  Raise it again for a build
+# that reads from a real disc.
+set(WITH_CDROM_CACHE_SIZE 0 CACHE STRING "CD-ROM cache size in sectors")
 
 option(WITH_SDCARD "Enable SD cards support" ON)
 if (WITH_SDCARD)
