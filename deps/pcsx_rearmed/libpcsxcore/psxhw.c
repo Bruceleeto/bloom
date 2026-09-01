@@ -162,9 +162,9 @@ u32 sio1ReadStat16(void)
 static u8 psxHwRead8_real(u32 add);
 
 u8 psxHwRead8(u32 add) {
-	enum perf_area pa = perf_area_switch(PERF_HW);
+	enum perf_area pa = perf_hw_enter();
 	u8 r = psxHwRead8_real(add);
-	perf_area_switch(pa);
+	perf_hw_exit(pa);
 	return r;
 }
 
@@ -225,9 +225,9 @@ static u8 psxHwRead8_real(u32 add) {
 static u16 psxHwRead16_real(u32 add);
 
 u16 psxHwRead16(u32 add) {
-	enum perf_area pa = perf_area_switch(PERF_HW);
+	enum perf_area pa = perf_hw_enter();
 	u16 r = psxHwRead16_real(add);
-	perf_area_switch(pa);
+	perf_hw_exit(pa);
 	return r;
 }
 
@@ -285,9 +285,9 @@ static u16 psxHwRead16_real(u32 add) {
 static u32 psxHwRead32_real(u32 add);
 
 u32 psxHwRead32(u32 add) {
-	enum perf_area pa = perf_area_switch(PERF_HW);
+	enum perf_area pa = perf_hw_enter();
 	u32 r = psxHwRead32_real(add);
-	perf_area_switch(pa);
+	perf_hw_exit(pa);
 	return r;
 }
 
@@ -335,9 +335,9 @@ static u32 psxHwRead32_real(u32 add) {
 static void psxHwWrite8_real(u32 add, u32 value);
 
 void psxHwWrite8(u32 add, u32 value) {
-	enum perf_area pa = perf_area_switch(PERF_HW);
+	enum perf_area pa = perf_hw_enter();
 	psxHwWrite8_real(add, value);
-	perf_area_switch(pa);
+	perf_hw_exit(pa);
 	
 }
 
@@ -370,9 +370,9 @@ static void psxHwWrite8_real(u32 add, u32 value) {
 static void psxHwWrite16_real(u32 add, u32 value);
 
 void psxHwWrite16(u32 add, u32 value) {
-	enum perf_area pa = perf_area_switch(PERF_HW);
+	enum perf_area pa = perf_hw_enter();
 	psxHwWrite16_real(add, value);
-	perf_area_switch(pa);
+	perf_hw_exit(pa);
 	
 }
 
@@ -452,9 +452,9 @@ static void psxHwWrite16_real(u32 add, u32 value) {
 static void psxHwWrite32_real(u32 add, u32 value);
 
 void psxHwWrite32(u32 add, u32 value) {
-	enum perf_area pa = perf_area_switch(PERF_HW);
+	enum perf_area pa = perf_hw_enter();
 	psxHwWrite32_real(add, value);
-	perf_area_switch(pa);
+	perf_hw_exit(pa);
 	
 }
 

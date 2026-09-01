@@ -19,4 +19,21 @@ enum perf_area {
 enum perf_area perf_area_switch(enum perf_area area);
 void perf_report(unsigned int frames, unsigned int ms);
 
+/* The PERF_HW bracket costs 12 uncached PMCTR reads per guest HW register
+ * access (thousands per frame), often wrapping ~3 instructions of work —
+ * and the GPUSTAT poll-skipper calls psxHwRead32 inside its fast-forward
+ * loop. Off by default: hw time folds into the caller's bucket (jit).
+ * Rebuild with WITH_PERF_HW=1 only for a run that needs the hw column. */
+#ifndef WITH_PERF_HW
+#define WITH_PERF_HW 0
+#endif
+
+#if WITH_PERF_HW
+#define perf_hw_enter()  perf_area_switch(PERF_HW)
+#define perf_hw_exit(pa) perf_area_switch(pa)
+#else
+#define perf_hw_enter()  PERF_REST
+#define perf_hw_exit(pa) ((void)(pa))
+#endif
+
 #endif
