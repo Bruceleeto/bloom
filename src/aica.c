@@ -37,37 +37,33 @@ static inline void * aram_addr_to_host(aram_addr_t addr)
 	return (void *)(addr + SPU_RAM_UNCACHED_BASE);
 }
 
-static void aram_copy(char *dst, const char *src, size_t size)
-{
-    uint32_t cnt = 0;
-    g2_ctx_t ctx;
-
-    ctx = g2_lock();
-
-    for (; size; size--) {
-        /* Fifo wait if necessary */
-        if (!(cnt % 8))
-            g2_fifo_wait();
-
-        *dst++ = *src++;
-        cnt++;
-    }
-
-    g2_unlock(ctx);
-}
-
+/* All SPU transfers are 16-bit granular (spu_addr moves in steps of 2,
+ * the DMA paths hand us u16 words), so 2-alignment is guaranteed. Move
+ * 32 bits per G2 transaction when both sides line up, 16 otherwise;
+ * G2 reads need no fifo wait (KOS issues none), only writes do, and
+ * the block ops handle those internally. */
 static void aram_read(void *dst, aram_addr_t addr, size_t size)
 {
-    const char *src = (const char *)aram_addr_to_host(addr);
+    uintptr_t src = (uintptr_t)aram_addr_to_host(addr);
 
-    aram_copy((char *)dst, src, size);
+    if (!((src | (uintptr_t)dst | size) & 3))
+        g2_read_block_32((uint32_t *)dst, src, size / 4);
+    else if (!((src | (uintptr_t)dst | size) & 1))
+        g2_read_block_16((uint16_t *)dst, src, size / 2);
+    else
+        g2_read_block_8((uint8_t *)dst, src, size);
 }
 
 static void aram_write(aram_addr_t addr, const void *src, size_t size)
 {
-    char *dst = (char *)aram_addr_to_host(addr);
+    uintptr_t dst = (uintptr_t)aram_addr_to_host(addr);
 
-    aram_copy(dst, (const char *)src, size);
+    if (!((dst | (uintptr_t)src | size) & 3))
+        g2_write_block_32((const uint32_t *)src, dst, size / 4);
+    else if (!((dst | (uintptr_t)src | size) & 1))
+        g2_write_block_16((const uint16_t *)src, dst, size / 2);
+    else
+        g2_write_block_8((const uint8_t *)src, dst, size);
 }
 
 long SPUinit(void)
