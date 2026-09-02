@@ -2,3 +2,5 @@ genmenu.elf
 romdisk.img
 build
 *.o
+tools/
+states/
