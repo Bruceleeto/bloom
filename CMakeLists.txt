@@ -313,6 +313,8 @@ add_executable(bloom
 	src/emu.c
 	src/genmenu.cpp
 	src/input.c
+	src/iofault.c
+	src/iofault.s
 	src/mcd.c
 	src/mmap.c
 	src/platform.c

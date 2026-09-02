@@ -335,7 +335,14 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 		ops = &lightrec_default_ops;
 	} else if (flags &&
 		   LIGHTREC_FLAGS_GET_IO_MODE(*flags) == LIGHTREC_IO_DIRECT_HW) {
-		ops = &lightrec_default_ops;
+		/* Fault-driven I/O overloads DIRECT_HW to tag every
+		 * HW-register access, not just host-accessible ones. In the
+		 * interpreter the guest I/O window is an unmapped identity
+		 * address, so a direct dereference would fault in C; route
+		 * through the device ops whenever the map provides them.
+		 * Only a genuinely host-accessible map (no ops) still uses
+		 * the direct path. */
+		ops = map->ops ? map->ops : &lightrec_default_ops;
 	} else {
 		if (flags && !LIGHTREC_FLAGS_GET_IO_MODE(*flags))
 			*flags |= LIGHTREC_IO_MODE(LIGHTREC_IO_HW);
@@ -2763,6 +2770,20 @@ void lightrec_set_target_cycle_count(struct lightrec_state *state, u32 cycles)
 
 		state->target_cycle = cycles;
 	}
+}
+
+/* Fault-driven I/O support: the DTLB-miss handler runs while the cycle
+ * counter lives in LIGHTREC_REG_CYCLE, not in the state block.  These two
+ * convert between them so the device access sees honest time and a
+ * shortened target (IRQ raised by the write) shortens the running slice. */
+void lightrec_fault_cycles_in(struct lightrec_state *state, u32 reg_cycle)
+{
+	state->current_cycle = state->target_cycle - reg_cycle;
+}
+
+u32 lightrec_fault_cycles_out(struct lightrec_state *state)
+{
+	return state->target_cycle - state->current_cycle;
 }
 
 struct lightrec_registers * lightrec_get_registers(struct lightrec_state *state)

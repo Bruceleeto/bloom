@@ -152,6 +152,10 @@ __api void lightrec_set_target_cycle_count(struct lightrec_state *state,
 					   u32 cycles);
 __api void lightrec_set_cycles_per_opcode(struct lightrec_state *state, u32 cycles);
 
+/* Fault-driven I/O: cycle bridge for the DTLB-miss handler (src/iofault.s). */
+__api void lightrec_fault_cycles_in(struct lightrec_state *state, u32 reg_cycle);
+__api u32 lightrec_fault_cycles_out(struct lightrec_state *state);
+
 #ifdef __cplusplus
 };
 #endif

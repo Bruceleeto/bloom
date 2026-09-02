@@ -1967,25 +1967,19 @@ static int lightrec_flag_io(struct lightrec_state *state, struct block *block)
 					list->flags |= LIGHTREC_NO_INVALIDATE;
 					break;
 				case PSX_MAP_HW_REGISTERS:
-					if (state->ops.hw_direct &&
-					    state->ops.hw_direct(kunseg_val,
-								 opcode_is_store(list->c),
-								 opcode_get_io_size(list->c))) {
-						pr_debug("Flagging opcode %u as direct I/O access\n",
-							 i);
-						list->flags |= LIGHTREC_IO_MODE(LIGHTREC_IO_DIRECT_HW);
+					/* Fault-driven I/O: every HW access
+					 * compiles to a plain masked
+					 * load/store.  The window is unmapped;
+					 * a real touch takes a DTLB miss and
+					 * src/iofault.s services it.  No C
+					 * wrappers, no runtime tagging, no
+					 * retag recompiles. */
+					pr_debug("Flagging opcode %u as direct I/O access\n",
+						 i);
+					list->flags |= LIGHTREC_IO_MODE(LIGHTREC_IO_DIRECT_HW);
 
-						if (no_mask)
-							list->flags |= LIGHTREC_NO_MASK;
-					} else {
-						pr_debug("Flagging opcode %u as I/O access\n",
-							 i);
-						list->flags |= LIGHTREC_IO_MODE(LIGHTREC_IO_HW);
-
-						if (!opcode_is_store(list->c) &&
-						    lightrec_hw_reg_event_only(kunseg_val))
-							list->flags |= LIGHTREC_IO_EVENT;
-					}
+					if (no_mask)
+						list->flags |= LIGHTREC_NO_MASK;
 					break;
 				default:
 					break;

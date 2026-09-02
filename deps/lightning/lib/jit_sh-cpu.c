@@ -1475,6 +1475,29 @@ static jit_bool_t sh4_slot_legal(sh4_instr_t x)
 	if ((op & 0xff00) == 0xc300)
 		return 0;			/* trapa */
 
+	/* Fault-driven I/O (src/iofault.s): a guest memory access may DTLB
+	 * miss, and the handler resumes by advancing SPC past the access.
+	 * In a delay slot SPC points at the BRANCH, so the skip would drop
+	 * the branch instead - ban every register-based memory form that
+	 * the emitters use for guest accesses.  GBR forms (state block) and
+	 * PC-relative loads (banned above) can never fault. */
+	if ((op & 0xf00c) == 0x2000 && (op & 0x000f) <= 0x2)
+		return 0;			/* mov.b/w/l Rm,@Rn */
+	if ((op & 0xf00c) == 0x6000 && (op & 0x000f) <= 0x2)
+		return 0;			/* mov.b/w/l @Rm,Rn */
+	if ((op >> 12) == 0x1 || (op >> 12) == 0x5)
+		return 0;			/* mov.l @(disp,Rm) forms */
+	if ((op & 0xfc00) == 0x8000 || (op & 0xfc00) == 0x8400)
+		return 0;			/* mov.b/w R0 disp forms */
+	if ((op & 0xf00f) >= 0x2004 && (op & 0xf00f) <= 0x2006 && (op >> 12) == 0x2)
+		return 0;			/* mov.x Rm,@-Rn */
+	if ((op & 0xf00f) >= 0x6004 && (op & 0xf00f) <= 0x6006 && (op >> 12) == 0x6)
+		return 0;			/* mov.x @Rm+,Rn */
+	if ((op & 0xf00f) >= 0x0004 && (op & 0xf00f) <= 0x0006 && (op >> 12) == 0x0)
+		return 0;			/* mov.x Rm,@(r0,Rn) */
+	if ((op & 0xf00f) >= 0x000c && (op & 0xf00f) <= 0x000e && (op >> 12) == 0x0)
+		return 0;			/* mov.x @(r0,Rm),Rn */
+
 	return 1;
 }
 

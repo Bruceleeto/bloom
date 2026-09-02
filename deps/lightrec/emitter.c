@@ -1984,18 +1984,13 @@ static void rec_store(struct lightrec_cstate *state,
 	union code c = block->opcode_list[offset].c;
 	bool is_swc2 = c.i.op == OP_SWC2;
 
-	if (is_swc2) {
-		switch (mode) {
-		case LIGHTREC_IO_RAM:
-		case LIGHTREC_IO_SCRATCH:
-		case LIGHTREC_IO_DIRECT:
-		case LIGHTREC_IO_DIRECT_HW:
-			rec_cp2_do_mfc2(state, block, offset, c.i.rt, REG_TEMP);
-			break;
-		default:
-			break;
-		}
-	}
+	/* Fault-driven I/O: every store compiles to a real store.  A store
+	 * whose target cannot be proven at compile time takes the DIRECT
+	 * path (mask + store + inline LUT invalidate); if it lands on the
+	 * unmapped I/O window at runtime, src/iofault.s services it.  The
+	 * rec_io C-wrapper path no longer exists for plain stores. */
+	if (is_swc2)
+		rec_cp2_do_mfc2(state, block, offset, c.i.rt, REG_TEMP);
 
 	switch (mode) {
 	case LIGHTREC_IO_RAM:
@@ -2005,7 +2000,12 @@ static void rec_store(struct lightrec_cstate *state,
 	case LIGHTREC_IO_SCRATCH:
 		rec_store_scratch(state, block, offset, code, swap_code);
 		break;
+	case LIGHTREC_IO_DIRECT_HW:
+		rec_store_io(state, block, offset, code, swap_code);
+		break;
 	case LIGHTREC_IO_DIRECT:
+	case LIGHTREC_IO_HW:
+	default:
 		if (no_invalidate) {
 			rec_store_direct_no_invalidate(state, block, offset,
 						       code, swap_code);
@@ -2013,17 +2013,6 @@ static void rec_store(struct lightrec_cstate *state,
 			rec_store_direct(state, block, offset, code, swap_code);
 		}
 		break;
-	case LIGHTREC_IO_DIRECT_HW:
-		rec_store_io(state, block, offset, code, swap_code);
-		break;
-	case LIGHTREC_IO_HW:
-		if (!is_swc2 && rec_store_hw_call(state, block, offset))
-			break;
-		rec_io(state, block, offset, true, false);
-		return;
-	default:
-		rec_io(state, block, offset, true, false);
-		return;
 	}
 
 	if (is_swc2)
@@ -2525,16 +2514,13 @@ static void rec_load(struct lightrec_cstate *state, const struct block *block,
 		rec_load_io(state, block, offset, code, swap_code, is_unsigned);
 		break;
 	case LIGHTREC_IO_DIRECT:
+	case LIGHTREC_IO_HW:
+	default:
+		/* Fault-driven I/O: unknown or HW targets compile to the
+		 * same masked direct load a RAM access gets; the unmapped
+		 * I/O window faults into src/iofault.s. */
 		rec_load_direct(state, block, offset, code, swap_code, is_unsigned);
 		break;
-	case LIGHTREC_IO_HW:
-		if (rec_load_hw_call(state, block, offset, is_unsigned))
-			break;
-		rec_io(state, block, offset, false, true);
-		return;
-	default:
-		rec_io(state, block, offset, false, true);
-		return;
 	}
 
 	if (op->i.op == OP_LWC2) {

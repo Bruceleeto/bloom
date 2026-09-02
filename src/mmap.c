@@ -82,13 +82,17 @@ int lightrec_init_mmap(void)
 
 	printf("RAM mapped\n");
 
-	/* Map Scratchpad + I/O using one 64 KiB page */
+	/* Map the scratchpad only, one 1 KiB page.  The I/O window at
+	 * 0x1f801000+ is deliberately NOT mapped: generated code compiles
+	 * every unproven load/store to a plain masked access, and a real
+	 * I/O touch takes a DTLB miss serviced by src/iofault.s.  C code
+	 * reaches the backing store through the psxH host pointer. */
 	err = mmu_page_map_static(OFFSET + 0x1f800000, (uintptr_t)psxH,
-				  PAGE_SIZE_64K, MMU_KERNEL_RDWR, true);
+				  PAGE_SIZE_1K, MMU_KERNEL_RDWR, true);
 	if (err)
 		goto handle_err;
 
-	printf("Scratchpad / IO mapped\n");
+	printf("Scratchpad mapped, IO window faults\n");
 
 	/* Map parallel port using one 64 KiB page */
 	err = mmu_page_map_static(OFFSET + 0x1f000000, (uintptr_t)psxP,
@@ -111,13 +115,22 @@ int lightrec_init_mmap(void)
 
 	psxM = (void *)OFFSET;
 	psxP = (void *)(OFFSET + 0x1f000000);
-	psxH = (void *)(OFFSET + 0x1f800000);
+	/* psxH stays the HOST pointer: C reads and writes HW registers
+	 * through it while the guest-visible window faults.  Only the first
+	 * 1 KiB (the scratchpad) is aliased at 0x1f800000 for the guest;
+	 * a C write to that 1 KiB goes through the host synonym, so any
+	 * C path that bulk-writes scratchpad must purge those lines. */
 	psxR = (void *)(OFFSET + 0x1fc00000);
 
 	/* Clear pages */
 	do_memset(psxM, 0x0, 0x200000);
 	do_memset(psxH, 0x0, 0x10000);
 	do_memset(psxP, 0xff, 0x10000);
+
+	{
+		extern void bloom_iofault_install(void);
+		bloom_iofault_install();
+	}
 
 	printf("Memory-map succeeded.\n"
 	       "RAM: 0x%x BIOS: 0x%x SCRATCH: 0x%x CODE: 0x%x\n",

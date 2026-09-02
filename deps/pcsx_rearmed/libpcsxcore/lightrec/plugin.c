@@ -341,6 +341,168 @@ static struct lightrec_mem_map_ops cache_ctrl_ops = {
 	.lw = cache_ctrl_read_word,
 };
 
+#ifdef _arch_dreamcast
+/* Fault-driven I/O dispatcher, called from src/iofault.s with BL=1.
+ *
+ * `regs` is the interrupted context's r0-r15 (r0-r7 read from bank 0);
+ * writes to it are loaded back into the real registers by the asm side,
+ * which then skips the faulting instruction.  regs[1] is LIGHTREC_REG_CYCLE:
+ * it is converted to state->current_cycle before the device access (so
+ * counters and GPUSTAT reads see honest time) and recomputed after (so an
+ * IRQ-raising write shortens the running slice, same as the old C-wrapper
+ * path did).
+ *
+ * Returns 0 when serviced, nonzero to chain the exception into KOS (a
+ * fault whose PC is not in the code buffer is a host bug, not guest I/O).
+ */
+static u32 iofault_wild;
+
+static u32 fault_read(struct lightrec_state *state, u32 addr,
+		      unsigned int size)
+{
+	if (addr - 0x1f801000 < 0x8000) {
+		switch (size) {
+		case 1:
+			return hw_read_byte(state, 0, NULL, addr);
+		case 2:
+			return hw_read_half(state, 0, NULL, addr);
+		default:
+			return hw_read_word(state, 0, NULL, addr);
+		}
+	}
+
+	if (addr == 0x1ffe0130)
+		return cache_ctrl;
+
+	/* Open bus: scratchpad gap, expansion areas, wild pointers. */
+	if (iofault_wild++ < 8)
+		printf("iofault: wild read%u at %08lx\n", size * 8,
+		       (unsigned long)addr);
+	return 0xffffffff;
+}
+
+static void fault_write(struct lightrec_state *state, u32 addr,
+			unsigned int size, u32 val)
+{
+	if (addr - 0x1f801000 < 0x8000) {
+		switch (size) {
+		case 1:
+			hw_write_byte(state, 0, NULL, addr, (u8)val);
+			return;
+		case 2:
+			hw_write_half(state, 0, NULL, addr, (u16)val);
+			return;
+		default:
+			hw_write_word(state, 0, NULL, addr, val);
+			return;
+		}
+	}
+
+	if (addr == 0x1ffe0130) {
+		cache_ctrl = val;
+		return;
+	}
+
+	if (iofault_wild++ < 8)
+		printf("iofault: wild write%u at %08lx = %08lx\n", size * 8,
+		       (unsigned long)addr, (unsigned long)val);
+}
+
+int bloom_io_fault(u32 *regs, u32 spc, u32 tea, u32 expevt)
+{
+	struct lightrec_state *state = lightrec_state;
+	const u16 instr = *(const u16 *)spc;
+	unsigned int n = (instr >> 8) & 0xf;
+	unsigned int m = (instr >> 4) & 0xf;
+
+	if (spc - (u32)(uintptr_t)code_buffer >= CODE_BUFFER_SIZE)
+		return 1;
+
+	lightrec_fault_cycles_in(state, regs[1]);
+
+	if (expevt == 0x60) {
+		/* Store forms the emitter produces. */
+		switch (instr & 0xf00f) {
+		case 0x2000:	/* mov.b Rm,@Rn */
+			fault_write(state, tea, 1, regs[m]);
+			goto out;
+		case 0x2001:	/* mov.w Rm,@Rn */
+			fault_write(state, tea, 2, regs[m]);
+			goto out;
+		case 0x2002:	/* mov.l Rm,@Rn */
+			fault_write(state, tea, 4, regs[m]);
+			goto out;
+		case 0x0004:	/* mov.b Rm,@(R0,Rn) */
+			fault_write(state, tea, 1, regs[m]);
+			goto out;
+		case 0x0005:	/* mov.w Rm,@(R0,Rn) */
+			fault_write(state, tea, 2, regs[m]);
+			goto out;
+		case 0x0006:	/* mov.l Rm,@(R0,Rn) */
+			fault_write(state, tea, 4, regs[m]);
+			goto out;
+		}
+		if ((instr & 0xf000) == 0x1000) {	/* mov.l Rm,@(disp,Rn) */
+			fault_write(state, tea, 4, regs[m]);
+			goto out;
+		}
+		if ((instr & 0xff00) == 0x8000) {	/* mov.b R0,@(disp,Rn) */
+			fault_write(state, tea, 1, regs[0]);
+			goto out;
+		}
+		if ((instr & 0xff00) == 0x8100) {	/* mov.w R0,@(disp,Rn) */
+			fault_write(state, tea, 2, regs[0]);
+			goto out;
+		}
+	} else {
+		/* Load forms.  Byte/half loads sign-extend, exactly like
+		 * the instruction they replace; unsigned users have a
+		 * separate extu that runs after resume. */
+		switch (instr & 0xf00f) {
+		case 0x6000:	/* mov.b @Rm,Rn */
+			regs[n] = (u32)(s32)(s8)fault_read(state, tea, 1);
+			goto out;
+		case 0x6001:	/* mov.w @Rm,Rn */
+			regs[n] = (u32)(s32)(s16)fault_read(state, tea, 2);
+			goto out;
+		case 0x6002:	/* mov.l @Rm,Rn */
+			regs[n] = fault_read(state, tea, 4);
+			goto out;
+		case 0x000c:	/* mov.b @(R0,Rm),Rn */
+			regs[n] = (u32)(s32)(s8)fault_read(state, tea, 1);
+			goto out;
+		case 0x000d:	/* mov.w @(R0,Rm),Rn */
+			regs[n] = (u32)(s32)(s16)fault_read(state, tea, 2);
+			goto out;
+		case 0x000e:	/* mov.l @(R0,Rm),Rn */
+			regs[n] = fault_read(state, tea, 4);
+			goto out;
+		}
+		if ((instr & 0xf000) == 0x5000) {	/* mov.l @(disp,Rm),Rn */
+			regs[n] = fault_read(state, tea, 4);
+			goto out;
+		}
+		if ((instr & 0xff00) == 0x8400) {	/* mov.b @(disp,Rm),R0 */
+			regs[0] = (u32)(s32)(s8)fault_read(state, tea, 1);
+			goto out;
+		}
+		if ((instr & 0xff00) == 0x8500) {	/* mov.w @(disp,Rm),R0 */
+			regs[0] = (u32)(s32)(s16)fault_read(state, tea, 2);
+			goto out;
+		}
+	}
+
+	printf("iofault: undecodable %04x at %08lx (tea %08lx expevt %03lx)\n",
+	       instr, (unsigned long)spc, (unsigned long)tea,
+	       (unsigned long)expevt);
+	return 1;
+
+out:
+	regs[1] = lightrec_fault_cycles_out(state);
+	return 0;
+}
+#endif /* _arch_dreamcast */
+
 static struct lightrec_mem_map lightrec_map[] = {
 	[PSX_MAP_KERNEL_USER_RAM] = {
 		/* Kernel and user memory */
@@ -520,8 +682,18 @@ static int lightrec_plugin_init(void)
 {
 	lightrec_map[PSX_MAP_KERNEL_USER_RAM].address = psxM;
 	lightrec_map[PSX_MAP_BIOS].address = psxR;
+#ifdef _arch_dreamcast
+	/* Identity guest addresses, NOT psxH: psxH is the host backing
+	 * pointer now.  The scratchpad page is really mapped at 0x1f800000;
+	 * the HW window is not mapped at all - accesses fault into
+	 * src/iofault.s.  Both must stay identity so offset_scratch and
+	 * offset_io are 0 and the emitted code is the bare masked access. */
+	lightrec_map[PSX_MAP_SCRATCH_PAD].address = (void *)0x1f800000;
+	lightrec_map[PSX_MAP_HW_REGISTERS].address = (void *)0x1f801000;
+#else
 	lightrec_map[PSX_MAP_SCRATCH_PAD].address = psxH;
 	lightrec_map[PSX_MAP_HW_REGISTERS].address = psxH + 0x1000;
+#endif
 	lightrec_map[PSX_MAP_PARALLEL_PORT].address = psxP;
 
 	if (!LIGHTREC_CUSTOM_MAP) {
