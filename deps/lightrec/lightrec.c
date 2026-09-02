@@ -1068,19 +1068,27 @@ static struct block * generate_wrapper(struct lightrec_state *state)
 	jit_pushargr(LIGHTREC_REG_STATE);
 	jit_pushargr(JIT_R2);
 
-	jit_ldxi_ui(JIT_R2, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
+	if (!lightrec_uses_deadline(state)) {
+		jit_ldxi_ui(JIT_R2, LIGHTREC_REG_STATE,
+			    lightrec_offset(target_cycle));
 
-	/* state->current_cycle = state->target_cycle - delta; */
-	jit_subr(LIGHTREC_REG_CYCLE, JIT_R2, LIGHTREC_REG_CYCLE);
-	jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, LIGHTREC_REG_CYCLE);
+		/* state->current_cycle = state->target_cycle - delta; */
+		jit_subr(LIGHTREC_REG_CYCLE, JIT_R2, LIGHTREC_REG_CYCLE);
+		jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE,
+			   LIGHTREC_REG_CYCLE);
+	}
 
 	/* Call the wrapper function */
 	jit_finishr(JIT_R1);
 
-	/* delta = state->target_cycle - state->current_cycle */;
-	jit_ldxi_ui(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE, lightrec_offset(current_cycle));
-	jit_ldxi_ui(JIT_R1, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-	jit_subr(LIGHTREC_REG_CYCLE, JIT_R1, LIGHTREC_REG_CYCLE);
+	if (!lightrec_uses_deadline(state)) {
+		/* delta = state->target_cycle - state->current_cycle */
+		jit_ldxi_ui(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE,
+			    lightrec_offset(current_cycle));
+		jit_ldxi_ui(JIT_R1, LIGHTREC_REG_STATE,
+			    lightrec_offset(target_cycle));
+		jit_subr(LIGHTREC_REG_CYCLE, JIT_R1, LIGHTREC_REG_CYCLE);
+	}
 
 	/* Restore temporaries from stack */
 	for (i = 0; i < NUM_TEMPS; i++) {
@@ -1186,6 +1194,37 @@ static void update_cycle_counter_after_c(jit_state_t *_jit)
 	jit_subr(LIGHTREC_REG_CYCLE, JIT_R2, JIT_R1);
 }
 
+static void publish_deadline_gate(struct lightrec_state *state,
+				  jit_state_t *_jit)
+{
+#if defined(__sh__)
+	if (lightrec_uses_deadline(state))
+		jit_sti_i((void *)state->ops.deadline_flag, _R14);
+#else
+	(void)state;
+	(void)_jit;
+#endif
+}
+
+/* Ordinary event deadlines stay inside the dispatcher.  CHECK_INTERRUPT is
+ * a request to run the same event path early (for example after I_MASK is
+ * written), not a reason to tear down the JIT ABI.  Real exits are left for
+ * lightrec_execute()'s caller to handle. */
+static s32 lightrec_run_event(struct lightrec_state *state)
+{
+	u32 flags = state->exit_flags;
+
+	/* With the resident dispatcher, hook visits are the round-trip
+	 * count worth watching; the PERF row's exec/fr shows them. */
+	lightrec_perf_nb_execute++;
+
+	if (flags & ~LIGHTREC_EXIT_CHECK_INTERRUPT)
+		return 0;
+
+	state->exit_flags = LIGHTREC_EXIT_NORMAL;
+	return state->ops.run_event(state, &state->curr_pc);
+}
+
 static void sync_next_pc(jit_state_t *_jit)
 {
 	if (lightrec_store_next_pc()) {
@@ -1219,6 +1258,8 @@ GBR_SHIM(u32, lightrec_check_load_delay,
 GBR_SHIM(u32, lightrec_emulate_block,
 	 (struct lightrec_state *state, struct block *block, u32 pc),
 	 (state, block, pc))
+GBR_SHIM(s32, lightrec_run_event,
+	 (struct lightrec_state *state), (state))
 GBR_SHIM_VOID(lightrec_link_inv_cb,
 	      (u32 arg, struct lightrec_state *state), (arg, state))
 #endif
@@ -1342,6 +1383,9 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	jit_getarg(DISPATCH_TMP, arg_trace);
 	jit_getarg(DISPATCH_PC, arg_pc);
 	jit_getarg(LIGHTREC_REG_STATE, arg_state);
+	if (lightrec_uses_deadline(state))
+		jit_stxi(lightrec_offset(dispatcher_fp), LIGHTREC_REG_STATE,
+			 _R14);
 
 	/* Force all callee-saved registers to be pushed on the stack */
 	for (i = 0; i < NUM_VREGS; i++)
@@ -1370,6 +1414,11 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	/* The block will jump here, with the number of cycles remaining in
 	 * LIGHTREC_REG_CYCLE */
 	addr2 = jit_indirect();
+	if (lightrec_uses_deadline(state)) {
+		publish_deadline_gate(state, _jit);
+		jit_ldxi(_R14, LIGHTREC_REG_STATE,
+			 lightrec_offset(dispatcher_fp));
+	}
 	jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
 
 	sync_next_pc(_jit);
@@ -1392,6 +1441,11 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	/* The block will jump here if it already knows the code LUT entry */
 	to_addr6 = jit_jmpi();
 	addr6 = jit_indirect();
+	if (lightrec_uses_deadline(state)) {
+		publish_deadline_gate(state, _jit);
+		jit_ldxi(_R14, LIGHTREC_REG_STATE,
+			 lightrec_offset(dispatcher_fp));
+	}
 	jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
 	jit_movr(DISPATCH_TMP, LIGHTREC_REG_AUX);
 	jit_patch(to_addr6);
@@ -1401,8 +1455,14 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	else
 		jit_ldr(DISPATCH_TMP, DISPATCH_TMP);
 
-	/* Jump to end if state->target_cycle < state->current_cycle */
-	to_end = jit_blei(LIGHTREC_REG_CYCLE, 0);
+	/* A deadline build tests the asynchronous gate.  The counter build
+	 * retains the old target-current contract as its off switch. */
+	if (lightrec_uses_deadline(state)) {
+		jit_ldi_i(JIT_R1, (void *)state->ops.deadline_flag);
+		to_end = jit_beqi(JIT_R1, 0);
+	} else {
+		to_end = jit_blei(LIGHTREC_REG_CYCLE, 0);
+	}
 
 	/* Store back the current PC to the lightrec_state structure */
 	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, DISPATCH_PC);
@@ -1412,6 +1472,7 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 	jit_patch(to_loop);
 	loop = jit_label();
+	lightrec_deadline_reload(state, _jit);
 
 	if (!arch_has_fast_mask())
 		jit_movi(JIT_R1, 0x1fffffff);
@@ -1429,7 +1490,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 	/* Slow path: call C function get_next_block_func() */
 
-	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
+	if (!lightrec_uses_deadline(state) &&
+	    (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES)) {
 		/* We may call the interpreter - update state->current_cycle */
 		update_cycle_counter_before_c(_jit);
 	}
@@ -1442,7 +1504,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 	/* Save the cycles register if needed. DISPATCH_* are caller-saved, so
 	 * this cannot be parked in a register across the call. */
-	if (!(ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES))
+	if (!lightrec_uses_deadline(state) &&
+	    !(ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES))
 		update_cycle_counter_before_c(_jit);
 
 	/* Get the next block */
@@ -1454,11 +1517,12 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	 * here, instead of in a stub at the head of every block. */
 	lightrec_regcache_pin_loads_raw(_jit);
 
-	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
+	if (!lightrec_uses_deadline(state) &&
+	    (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES)) {
 		/* The interpreter may have updated state->current_cycle and
 		 * state->target_cycle - recalc the delta */
 		update_cycle_counter_after_c(_jit);
-	} else {
+	} else if (!lightrec_uses_deadline(state)) {
 		update_cycle_counter_after_c(_jit);
 	}
 
@@ -1475,6 +1539,24 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	/* Store back the current PC to the lightrec_state structure */
 	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, DISPATCH_PC);
 
+	if (state->ops.run_event) {
+		/* Publish elapsed time for the device layer, but keep the pinned
+		 * guest registers in their callee-saved homes.  Device events and
+		 * psxException only touch CP0 and the PC; no full guest-register
+		 * round trip is required. */
+		if (!lightrec_uses_deadline(state))
+			update_cycle_counter_before_c(_jit);
+
+		jit_prepare();
+		jit_pushargr(LIGHTREC_REG_STATE);
+		jit_finishi(LIGHTREC_C_CALL(lightrec_run_event));
+		jit_retval_i(LIGHTREC_REG_CYCLE);
+
+		jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE,
+			    lightrec_offset(curr_pc));
+		jit_patch_at(jit_bgti(LIGHTREC_REG_CYCLE, 0), loop2);
+	}
+
 	/* Leaving JIT land for good: the pins hold values the state block has
 	 * never seen, and our caller reads the register file from memory. */
 	lightrec_regcache_pin_stores_raw(_jit);
@@ -1485,8 +1567,14 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		/* Blocks will jump here when they need to call
 		 * lightrec_memset() */
 		addr3 = jit_indirect();
+		if (lightrec_uses_deadline(state)) {
+			publish_deadline_gate(state, _jit);
+			jit_ldxi(_R14, LIGHTREC_REG_STATE,
+				 lightrec_offset(dispatcher_fp));
+		}
 
-		update_cycle_counter_before_c(_jit);
+		if (!lightrec_uses_deadline(state))
+			update_cycle_counter_before_c(_jit);
 
 		lightrec_regcache_pin_stores_raw(_jit);
 
@@ -1501,8 +1589,11 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		jit_ldxi_ui(DISPATCH_PC, LIGHTREC_REG_STATE,
 			    lightrec_offset(regs.gpr[31]));
 
-		update_cycle_counter_after_c(_jit);
-		jit_subr(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, DISPATCH_TMP);
+		if (!lightrec_uses_deadline(state)) {
+			update_cycle_counter_after_c(_jit);
+			jit_subr(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE,
+				 DISPATCH_TMP);
+		}
 
 		jit_patch_at(jit_b(), loop2);
 	}
@@ -1512,11 +1603,17 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		 * be executed with the interpreter, passing the branch's PC
 		 * in DISPATCH_PC and the address of the block in DISPATCH_TMP. */
 		addr4 = jit_indirect();
+		if (lightrec_uses_deadline(state)) {
+			publish_deadline_gate(state, _jit);
+			jit_ldxi(_R14, LIGHTREC_REG_STATE,
+				 lightrec_offset(dispatcher_fp));
+		}
 		jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
 		jit_movr(DISPATCH_TMP, LIGHTREC_REG_AUX);
 
 		sync_next_pc(_jit);
-		update_cycle_counter_before_c(_jit);
+		if (!lightrec_uses_deadline(state))
+			update_cycle_counter_before_c(_jit);
 
 		lightrec_regcache_pin_stores_raw(_jit);
 
@@ -1531,7 +1628,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		/* The interpreter rewrites arbitrary guest registers. */
 		lightrec_regcache_pin_loads_raw(_jit);
 
-		update_cycle_counter_after_c(_jit);
+		if (!lightrec_uses_deadline(state))
+			update_cycle_counter_after_c(_jit);
 
 		jit_patch_at(jit_b(), loop2);
 
@@ -1546,11 +1644,17 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		 * first opcode, to make sure that it does not read the register
 		 * in question; and if it does, handle it accordingly. */
 		addr5 = jit_indirect();
+		if (lightrec_uses_deadline(state)) {
+			publish_deadline_gate(state, _jit);
+			jit_ldxi(_R14, LIGHTREC_REG_STATE,
+				 lightrec_offset(dispatcher_fp));
+		}
 		jit_movr(DISPATCH_PC, LIGHTREC_REG_PC);
 		jit_movr(DISPATCH_TMP, LIGHTREC_REG_AUX);
 
 		sync_next_pc(_jit);
-		update_cycle_counter_before_c(_jit);
+		if (!lightrec_uses_deadline(state))
+			update_cycle_counter_before_c(_jit);
 
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
@@ -1564,7 +1668,8 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 		jit_retval(DISPATCH_PC);
 
-		update_cycle_counter_after_c(_jit);
+		if (!lightrec_uses_deadline(state))
+			update_cycle_counter_after_c(_jit);
 
 		jit_patch_at(jit_b(), loop2);
 	}
@@ -2279,23 +2384,33 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 	lightrec_host_gbr = sh4_read_gbr();
 #endif
 
-	/* Handle the cycle counter overflowing */
-	if (unlikely(target_cycle < state->current_cycle))
-		target_cycle = UINT_MAX;
+	if (lightrec_uses_deadline(state)) {
+		/* The dispatcher callback owns time.  Keep a positive sentinel only
+		 * for legacy helper loops which still use current < target as their
+		 * "may compile another block" predicate. */
+		state->current_cycle = 0;
+		state->target_cycle = 1;
+	} else {
+		/* Handle the cycle counter overflowing */
+		if (unlikely(target_cycle < state->current_cycle))
+			target_cycle = UINT_MAX;
 
-	state->target_cycle = target_cycle;
+		state->target_cycle = target_cycle;
+	}
 	state->curr_pc = pc;
 
 	lightrec_perf_nb_execute++;
 
 	block_trace = get_next_block_func(state, pc);
 	if (block_trace) {
-		cycles_delta = state->target_cycle - state->current_cycle;
+		cycles_delta = lightrec_uses_deadline(state) ? 1 :
+			state->target_cycle - state->current_cycle;
 
 		cycles_delta = (*func)(state, state->curr_pc,
 				       block_trace, cycles_delta);
 
-		state->current_cycle = state->target_cycle - cycles_delta;
+		if (!lightrec_uses_deadline(state))
+			state->current_cycle = state->target_cycle - cycles_delta;
 	}
 
 	if (ENABLE_THREADED_COMPILER)
@@ -2733,7 +2848,10 @@ void lightrec_set_exit_flags(struct lightrec_state *state, u32 flags)
 {
 	if (flags != LIGHTREC_EXIT_NORMAL) {
 		state->exit_flags |= flags;
-		state->target_cycle = state->current_cycle;
+		if (lightrec_uses_deadline(state))
+			*state->ops.deadline_flag = 0;
+		else
+			state->target_cycle = state->current_cycle;
 	}
 }
 

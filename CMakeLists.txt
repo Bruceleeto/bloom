@@ -120,6 +120,10 @@ target_compile_options(lightning PRIVATE -Wno-unused-function -Wno-unused-variab
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
 set(ENABLE_CODE_BUFFER ON CACHE INTERNAL "" FORCE)
 
+# Bloom's SH-4 runtime owns r14 and TMU2.  Keep the counter implementation
+# compiled as the off switch while the new ABI is being brought up.
+option(WITH_DEADLINE "Use the r14/TMU deadline scheduler" ON)
+
 # Point Lightrec to Lightning's lib and include directories
 set(LIBLIGHTNING lightning)
 set(LIBLIGHTNING_INCLUDE_DIR $<TARGET_PROPERTY:lightning,INTERFACE_INCLUDE_DIRECTORIES>)
@@ -143,6 +147,7 @@ target_compile_definitions(lightrec PRIVATE
 	OPT_POOL_PREF=$<BOOL:${WITH_POOL_PREF}>
 	OPT_LUT_PREF=$<BOOL:${WITH_LUT_PREF}>
 	OPT_STATE_ALIAS=${STATE_ALIAS}
+	BLOOM_DEADLINE=$<BOOL:${WITH_DEADLINE}>
 )
 
 # Guest-op attribution: a MEASUREMENT build, not a shipping one.  It costs a
@@ -223,6 +228,7 @@ target_compile_definitions(libpcsxcore PUBLIC
 	USE_C11_THREADS
 	HAVE_CDROM
 	GPUSTATUS_POLLING_THRESHOLD=${WITH_GPUSTATUS_POLLING_THRESHOLD}
+	BLOOM_DEADLINE=$<BOOL:${WITH_DEADLINE}>
 )
 target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)

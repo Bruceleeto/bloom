@@ -179,5 +179,6 @@ void lightrec_save_temps(struct regcache *cache, jit_state_t *_jit);
 void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit);
 void lightrec_save_argregs(struct regcache *cache, jit_state_t *_jit);
 void lightrec_restore_argregs(struct regcache *cache, jit_state_t *_jit);
+void lightrec_deadline_reload(struct lightrec_state *state, jit_state_t *_jit);
 
 #endif /* __REGCACHE_H__ */

@@ -114,6 +114,15 @@ struct lightrec_ops {
 	void (*enable_ram)(struct lightrec_state *state, _Bool enable);
 	_Bool (*hw_direct)(u32 kaddr, _Bool is_write, u8 size);
 	void (*code_inv)(void *addr, u32 len);
+	/* Called by the resident dispatcher when its current event budget has
+	 * expired.  The callback may update *pc (interrupt delivery does), and
+	 * returns the next lightrec-cycle budget.  Zero hands control back to
+	 * lightrec_execute(). */
+	s32 (*run_event)(struct lightrec_state *state, u32 *pc);
+	/* Non-zero while generated code may run without visiting the event
+	 * hook.  The Dreamcast timer clears it asynchronously; r14 mirrors it
+	 * throughout JIT land. */
+	volatile u32 *deadline_flag;
 };
 
 struct lightrec_registers {

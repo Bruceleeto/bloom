@@ -1115,6 +1115,21 @@ void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit)
 	}
 
 	lightrec_restore_argregs(cache, _jit);
+	lightrec_deadline_reload(cache->state, _jit);
+}
+
+/* A timer can expire while a block is inside ordinary C, where r14 belongs to
+ * the compiler.  The IRQ records the deadline in memory; reload it only after
+ * the ABI has restored the block's r14. */
+void lightrec_deadline_reload(struct lightrec_state *state, jit_state_t *_jit)
+{
+#if defined(__sh__)
+	if (lightrec_uses_deadline(state))
+		jit_ldi_i(_R14, (void *)state->ops.deadline_flag);
+#else
+	(void)state;
+	(void)_jit;
+#endif
 }
 
 void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit)

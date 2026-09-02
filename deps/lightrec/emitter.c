@@ -151,7 +151,10 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	/* Pinned registers cross the link in their registers (the target
 	 * is entered behind its load stub, links.c); only the fallback to
 	 * the dispatcher writes them back. */
-	to_eob = jit_blei(LIGHTREC_REG_CYCLE, 0);
+	if (lightrec_uses_deadline(state->state))
+		to_eob = jit_beqi(_R14, 0);
+	else
+		to_eob = jit_blei(LIGHTREC_REG_CYCLE, 0);
 
 	/* What the dispatcher provides on block entry: the address mask
 	 * blocks are compiled to expect. curr_pc is not synced here - see
@@ -247,7 +250,10 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 
 	jit_ldr_ui(_R6, LIGHTREC_REG_AUX);
 
-	to_slow1 = jit_blei(LIGHTREC_REG_CYCLE, 0);
+	if (lightrec_uses_deadline(ls))
+		to_slow1 = jit_beqi(_R14, 0);
+	else
+		to_slow1 = jit_blei(LIGHTREC_REG_CYCLE, 0);
 	to_slow2 = jit_beqi(_R6, 0);
 	to_slow3 = jit_beqi(_R6, (uintptr_t)ls->get_next_block);
 
@@ -344,7 +350,7 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 	 * for a direct link, and are stored on every other way out. */
 	lightrec_regcache_clean_unpinned(reg_cache, _jit);
 
-	if (cycles && update_cycles) {
+	if (!lightrec_uses_deadline(state->state) && cycles && update_cycles) {
 		jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, cycles);
 		pr_debug("EOB: %"PRIu32" cycles\n", cycles);
 	}
@@ -418,7 +424,8 @@ void lightrec_emit_jump_to_interpreter(struct lightrec_cstate *state,
 
 	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)block);
 
-	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
+	if (!lightrec_uses_deadline(state->state))
+		jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 	lightrec_jump_to_state_fn(_jit, lightrec_offset(interpreter_func));
 }
 
@@ -433,7 +440,8 @@ static void lightrec_emit_eob(struct lightrec_cstate *state,
 
 	lightrec_load_next_pc_imm(reg_cache, _jit, block->pc, imm);
 
-	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
+	if (!lightrec_uses_deadline(state->state))
+		jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 
 	lightrec_jump_to_known_eob(state, _jit, imm);
 }
@@ -561,7 +569,7 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 			pr_debug("Using no indirection for branch at offset 0x%hx\n", offset << 2);
 	}
 
-	if (cycles)
+	if (!lightrec_uses_deadline(state->state) && cycles)
 		jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, cycles);
 
 	if (!unconditional) {
@@ -589,9 +597,14 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 
 		if (op_flag_idle_loop(op->flags)) {
 			/* We have an idle loop that branched - we can skip
-			 * all the way to the next IRQ event. */
-			jit_lti(JIT_R2, LIGHTREC_REG_CYCLE, 0);
-			jit_movzr(LIGHTREC_REG_CYCLE, JIT_R2, JIT_R2);
+			 * all the way to the next IRQ event.  A deadline build
+			 * is already waiting on that real-time event: keep looping
+			 * until TMU2 clears r14 instead of turning the detector into
+			 * a per-block scheduler call. */
+			if (!lightrec_uses_deadline(state->state)) {
+				jit_lti(JIT_R2, LIGHTREC_REG_CYCLE, 0);
+				jit_movzr(LIGHTREC_REG_CYCLE, JIT_R2, JIT_R2);
+			}
 		} else {
 			target_offset = offset + 1 + (s16)op->i.imm
 				- !!op_flag_no_ds(op->flags);
@@ -606,6 +619,8 @@ static void rec_b(struct lightrec_cstate *state, const struct block *block, u16 
 				branch->branch = jit_new_node_pww(code2, NULL, rs, rt);
 			else if (is_forward)
 				branch->branch = jit_b();
+			else if (lightrec_uses_deadline(state->state))
+				branch->branch = jit_bnei(_R14, 0);
 			else
 				branch->branch = jit_bgti(LIGHTREC_REG_CYCLE, 0);
 		}
@@ -1489,6 +1504,7 @@ static void call_to_c_wrapper(struct lightrec_cstate *state,
 	lightrec_regcache_mark_live(reg_cache, _jit);
 
 	lightrec_restore_argregs(reg_cache, _jit);
+	lightrec_deadline_reload(state->state, _jit);
 }
 
 static void rec_io(struct lightrec_cstate *state,
@@ -1650,6 +1666,7 @@ static void rec_store_invalidate_lut(struct lightrec_cstate *cstate,
 	jit_prepare();
 	jit_callr(old);
 	lightrec_regcache_mark_live(reg_cache, _jit);
+	lightrec_deadline_reload(cstate->state, _jit);
 
 	jit_patch(to_skip);
 
@@ -2334,9 +2351,13 @@ static void rec_load_direct(struct lightrec_cstate *cstate,
  * The wrapper's cycle contract is emitted inline: current_cycle synced
  * before the call (the devices are cycle-accurate), the down-counter
  * rebuilt from a possibly updated target_cycle after it. */
-static void rec_hw_cycle_sync_in(struct regcache *reg_cache,
+static void rec_hw_cycle_sync_in(struct lightrec_state *state,
+				 struct regcache *reg_cache,
 				 jit_state_t *_jit)
 {
+	if (lightrec_uses_deadline(state))
+		return;
+
 	u8 tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
 
 	jit_ldxi_ui(tmp, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
@@ -2346,9 +2367,13 @@ static void rec_hw_cycle_sync_in(struct regcache *reg_cache,
 	lightrec_free_reg(reg_cache, tmp);
 }
 
-static void rec_hw_cycle_sync_out(struct regcache *reg_cache,
+static void rec_hw_cycle_sync_out(struct lightrec_state *state,
+				  struct regcache *reg_cache,
 				  jit_state_t *_jit)
 {
+	if (lightrec_uses_deadline(state))
+		return;
+
 	u8 tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
 
 	jit_ldxi_ui(tmp, LIGHTREC_REG_STATE, lightrec_offset(current_cycle));
@@ -2391,7 +2416,7 @@ static bool rec_load_hw_call(struct lightrec_cstate *cstate,
 
 	jit_note(__FILE__, __LINE__);
 
-	rec_hw_cycle_sync_in(reg_cache, _jit);
+	rec_hw_cycle_sync_in(cstate->state, reg_cache, _jit);
 
 	/* A LUI folded into this load (LIGHTREC_MOVI) was not emitted: build
 	 * the full address here, as rec_load_memory does. */
@@ -2430,7 +2455,7 @@ static bool rec_load_hw_call(struct lightrec_cstate *cstate,
 
 	lightrec_restore_temps(reg_cache, _jit);
 
-	rec_hw_cycle_sync_out(reg_cache, _jit);
+	rec_hw_cycle_sync_out(cstate->state, reg_cache, _jit);
 
 	if (out_reg) {
 		rt = lightrec_alloc_reg_out(reg_cache, _jit, out_reg, flags);
@@ -2460,7 +2485,7 @@ static bool rec_store_hw_call(struct lightrec_cstate *cstate,
 
 	jit_note(__FILE__, __LINE__);
 
-	rec_hw_cycle_sync_in(reg_cache, _jit);
+	rec_hw_cycle_sync_in(cstate->state, reg_cache, _jit);
 
 	rs = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rs, 0);
 	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
@@ -2499,7 +2524,7 @@ static bool rec_store_hw_call(struct lightrec_cstate *cstate,
 	lightrec_regcache_mark_live(reg_cache, _jit);
 	lightrec_restore_temps(reg_cache, _jit);
 
-	rec_hw_cycle_sync_out(reg_cache, _jit);
+	rec_hw_cycle_sync_out(cstate->state, reg_cache, _jit);
 
 	return true;
 }
@@ -2610,11 +2635,15 @@ static void rec_exit_early(struct lightrec_cstate *state,
 	jit_movi(tmp, exit_code);
 	jit_stxi_i(lightrec_offset(exit_flags), LIGHTREC_REG_STATE, tmp);
 
-	jit_ldxi_i(tmp, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-	jit_subr(tmp, tmp, LIGHTREC_REG_CYCLE);
-	jit_movi(LIGHTREC_REG_CYCLE, 0);
-	jit_stxi_i(lightrec_offset(target_cycle), LIGHTREC_REG_STATE, tmp);
-	jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, tmp);
+	if (lightrec_uses_deadline(state->state)) {
+		jit_movi(_R14, 0);
+	} else {
+		jit_ldxi_i(tmp, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
+		jit_subr(tmp, tmp, LIGHTREC_REG_CYCLE);
+		jit_movi(LIGHTREC_REG_CYCLE, 0);
+		jit_stxi_i(lightrec_offset(target_cycle), LIGHTREC_REG_STATE, tmp);
+		jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, tmp);
+	}
 
 	lightrec_free_reg(reg_cache, tmp);
 
@@ -2787,11 +2816,18 @@ rec_mtc0(struct lightrec_cstate *state, const struct block *block, u16 offset)
 	if (c.r.rd == 12 || c.r.rd == 13) {
 		to_end = jit_beqi(tmp, 0);
 
-		jit_ldxi_i(tmp2, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-		jit_subr(tmp2, tmp2, LIGHTREC_REG_CYCLE);
-		jit_movi(LIGHTREC_REG_CYCLE, 0);
-		jit_stxi_i(lightrec_offset(target_cycle), LIGHTREC_REG_STATE, tmp2);
-		jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, tmp2);
+		if (lightrec_uses_deadline(state->state)) {
+			jit_movi(_R14, 0);
+		} else {
+			jit_ldxi_i(tmp2, LIGHTREC_REG_STATE,
+				   lightrec_offset(target_cycle));
+			jit_subr(tmp2, tmp2, LIGHTREC_REG_CYCLE);
+			jit_movi(LIGHTREC_REG_CYCLE, 0);
+			jit_stxi_i(lightrec_offset(target_cycle),
+				   LIGHTREC_REG_STATE, tmp2);
+			jit_stxi_i(lightrec_offset(current_cycle),
+				   LIGHTREC_REG_STATE, tmp2);
+		}
 
 
 		jit_patch(to_end);
@@ -3167,6 +3203,12 @@ static void rec_cp0_RFE(struct lightrec_cstate *state,
 	jit_nei(tmp, tmp, 0);
 	jit_andr(tmp, tmp, status);
 	jit_stxi_i(lightrec_offset(exit_flags), LIGHTREC_REG_STATE, tmp);
+	if (lightrec_uses_deadline(state->state)) {
+		jit_node_t *no_exit = jit_beqi(tmp, 0);
+
+		jit_movi(_R14, 0);
+		jit_patch(no_exit);
+	}
 
 	lightrec_free_reg(reg_cache, status);
 	lightrec_free_reg(reg_cache, tmp);
@@ -3721,7 +3763,7 @@ void lightrec_rec_opcode(struct lightrec_cstate *state,
 	u16 unload_offset;
 
 	if (op_flag_sync(op->flags)) {
-		if (state->cycles)
+		if (!lightrec_uses_deadline(state->state) && state->cycles)
 			jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);
 		state->cycles = 0;
 

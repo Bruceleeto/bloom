@@ -37,6 +37,23 @@
 #define jit_regload_delete		1	/* just remove node */
 #define jit_regload_isdead		2	/* delete and unset live bit */
 
+/* SH-4 lightrec trampolines borrow the dispatcher's 280-byte spill area.
+ * r14 normally names the top of that area, but generated guest code reserves
+ * r14 for the asynchronous deadline gate.  Address the same slots from r15:
+ * dispatcher_sp == dispatcher_fp - function->frame, so an old FP-relative
+ * offset N is SP-relative (frame + N).  Normal C-callable Lightning functions
+ * keep the ordinary r14 frame-pointer contract. */
+#if defined(__sh__)
+#define jit_spill_base() \
+	(_jitc->function->assume_frame ? JIT_SP : JIT_FP)
+#define jit_spill_offset(offset) \
+	(_jitc->function->assume_frame ? \
+	 _jitc->function->frame + (offset) : (offset))
+#else
+#define jit_spill_base() JIT_FP
+#define jit_spill_offset(offset) (offset)
+#endif
+
 /*
  * Prototypes
  */
@@ -283,7 +300,8 @@ _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 		    assert(!_jitc->getreg);
 		    _jitc->getreg = 1;
 #endif
-		    emit_stxi(_jitc->function->regoff[regno], JIT_FP, regno);
+		    emit_stxi(jit_spill_offset(_jitc->function->regoff[regno]),
+			      jit_spill_base(), regno);
 #if DEBUG
 		    _jitc->getreg = 0;
 #endif
@@ -299,7 +317,8 @@ _jit_get_reg(jit_state_t *_jit, jit_int32_t regspec)
 		    assert(!_jitc->getreg);
 		    _jitc->getreg = 1;
 #endif
-		    emit_stxi_d(_jitc->function->regoff[regno], JIT_FP, regno);
+		    emit_stxi_d(jit_spill_offset(_jitc->function->regoff[regno]),
+				jit_spill_base(), regno);
 #if DEBUG
 		    _jitc->getreg = 0;
 #endif
@@ -354,9 +373,11 @@ _jit_unget_reg(jit_state_t *_jit, jit_int32_t regno)
 	    _jitc->getreg = 1;
 #endif
 	    if (jit_class(_rvs[regno].spec) & jit_class_gpr)
-		emit_ldxi(regno, JIT_FP, _jitc->function->regoff[regno]);
+		emit_ldxi(regno, jit_spill_base(),
+			  jit_spill_offset(_jitc->function->regoff[regno]));
 	    else
-		emit_ldxi_d(regno, JIT_FP, _jitc->function->regoff[regno]);
+		emit_ldxi_d(regno, jit_spill_base(),
+			    jit_spill_offset(_jitc->function->regoff[regno]));
 #if DEBUG
 	    /* emit_ldxi must not need a temporary register */
 	    _jitc->getreg = 0;
@@ -4209,8 +4230,9 @@ _patch_registers(jit_state_t *_jit)
 				_jitc->function->regoff[regno] =
 				    jit_allocai(sizeof(jit_float64_t));
 			}
-			node->u.w = _jitc->function->regoff[regno];
-			node->v.w = JIT_FP;
+			node->u.w = jit_spill_offset(
+				_jitc->function->regoff[regno]);
+			node->v.w = jit_spill_base();
 			node->w.w = regno;
 			node->link = NULL;
 		    }
@@ -4235,8 +4257,9 @@ _patch_registers(jit_state_t *_jit)
 		else
 		    node->code = jit_code_ldxi_d;
 		node->v.w = regno;
-		node->v.w = JIT_FP;
-		node->w.w = _jitc->function->regoff[regno];
+		node->v.w = jit_spill_base();
+		node->w.w = jit_spill_offset(
+			_jitc->function->regoff[regno]);
 		node->link = NULL;
 		break;
 	    case jit_code_prolog:

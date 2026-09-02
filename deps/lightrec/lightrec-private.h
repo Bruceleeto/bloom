@@ -25,6 +25,10 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#ifndef BLOOM_DEADLINE
+#define BLOOM_DEADLINE 0
+#endif
+
 #define X32_FMT "0x%08"PRIx32
 #define PC_FMT "PC "X32_FMT
 
@@ -220,6 +224,7 @@ struct lightrec_state {
 	uintptr_t wrapper_regs[NUM_TEMPS];
 	uintptr_t wrapper_temps_r4[4];	/* r4-r7 temps, lightrec_save_temps() */
 	uintptr_t wrapper_cycle;
+	uintptr_t dispatcher_fp;
 	u8 in_delay_slot_n;
 	u32 current_cycle;
 	u32 target_cycle;
@@ -255,6 +260,11 @@ struct lightrec_state {
 	_Bool mirrors_mapped;
 	void *code_lut[];
 };
+
+static inline _Bool lightrec_uses_deadline(const struct lightrec_state *state)
+{
+	return BLOOM_DEADLINE && state->ops.deadline_flag;
+}
 
 #define lightrec_offset(ptr) \
 	offsetof(struct lightrec_state, ptr)

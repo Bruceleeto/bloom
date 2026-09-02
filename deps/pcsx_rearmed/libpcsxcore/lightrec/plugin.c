@@ -6,6 +6,11 @@
 #include <signal.h>
 #include <assert.h>
 
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+#include <arch/arch.h>
+#include <kos/irq.h>
+#endif
+
 #if P_HAVE_MMAP
 #include <sys/mman.h>
 #endif
@@ -122,6 +127,222 @@ enum my_cp2_opcodes {
  * exit (`mov #n,r0; shll8 r0; add r0,r1`) where `add #-n,r1` does. */
 #define CYCLE_SCALE 4
 
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+
+/* KOS's local timer fork leaves TMU2 idle and keeps TMU1 as a free-running
+ * 12.468720 MHz clock.  This is the same ownership split bloop uses. */
+#define DEADLINE_TMU_BASE	0xffd80000u
+#define DEADLINE_TSTR		(*(volatile u8  *)(DEADLINE_TMU_BASE + 0x04))
+#define DEADLINE_TCNT1		(*(volatile u32 *)(DEADLINE_TMU_BASE + 0x18))
+#define DEADLINE_TCOR2		(*(volatile u32 *)(DEADLINE_TMU_BASE + 0x20))
+#define DEADLINE_TCNT2		(*(volatile u32 *)(DEADLINE_TMU_BASE + 0x24))
+#define DEADLINE_TCR2		(*(volatile u16 *)(DEADLINE_TMU_BASE + 0x28))
+
+#define DEADLINE_TSTR_CH2	(1u << 2)
+#define DEADLINE_TCR_UNIE	(1u << 5)
+#define DEADLINE_TMU_HZ		12468720u
+#define DEADLINE_PSX_HZ		33868800u
+
+/* bloop clock.h's CLOCK_SLOWDOWN, done in the conversion instead of the
+ * TMU prescaler: the guest's ENTIRE clock runs at 1/N of real time, applied
+ * uniformly to both the charge and the alarm, so the guest lives in a
+ * consistent slower world - it neither falls behind (slow-mo) nor waits
+ * long (idle spin).  N is the speedometer: the guest world runs at 60/N
+ * fps, and every real JIT win is cashed in by lowering N.  3 ~= the
+ * baseline tree's pace; bloop sustains ~2.  (Earlier attempts: raw wall
+ * charge = guest starved per slice; alarm-stretch with clamped charge =
+ * torn world, guest spun its waits at wall pace - both measured losses on
+ * hardware 2026-09-02.) */
+/* Rational: guest clock runs at DEN/NUM of real time.  Hardware ladder
+ * 2026-09-02: 1/1 -> 56 ms (no waits, guest always behind, game at real
+ * time with dropped frames); 3/2 -> 73 ms and 3/1 -> 130 ms (rendered
+ * frame snaps to ceil(work/vblank_period)*period - every notch above 1
+ * only adds quantized vsync spin, branch_taken jit is the gauge: 197k
+ * clean vs 456k/1061k spinning).  S=1 is this model's optimum; fps gains
+ * must come from throughput (the 56), not the clock. */
+#define DEADLINE_SLOWDOWN_NUM	1u
+#define DEADLINE_SLOWDOWN_DEN	1u
+
+static volatile u32 deadline_gate = 1;
+static u32 deadline_last_tmu;
+static uint64_t deadline_fraction;
+static bool deadline_active;
+static bool deadline_installed;
+static irq_cb_t deadline_old_tmu2;
+static unsigned int deadline_old_tmu2_priority;
+
+static inline bool deadline_pc_is_generated(u32 pc)
+{
+	return (u32)(pc - (u32)(uintptr_t)code_buffer) < CODE_BUFFER_SIZE;
+}
+
+static void deadline_timer_stop(void)
+{
+	irq_mask_t old = irq_disable();
+
+	DEADLINE_TSTR &= (u8)~DEADLINE_TSTR_CH2;
+	DEADLINE_TCR2 = DEADLINE_TCR_UNIE;
+	irq_restore(old);
+}
+
+static u32 deadline_ticks_for_cycles(u32 cycles)
+{
+	uint64_t ticks = (uint64_t)cycles * DEADLINE_TMU_HZ;
+
+	ticks = (ticks + DEADLINE_PSX_HZ - 1) / DEADLINE_PSX_HZ;
+	if (!ticks)
+		return 1;
+	if (ticks > UINT32_MAX)
+		return UINT32_MAX;
+	return (u32)ticks;
+}
+
+/* Arm only after all event work is complete.  Time spent in the scheduler or
+ * a hardware callback is host overhead, just as it is in bloop's hook, and is
+ * not charged into the following guest interval. */
+static void deadline_timer_arm(u32 cycles)
+{
+	irq_mask_t old = irq_disable();
+	u32 ticks = (u32)((uint64_t)deadline_ticks_for_cycles(cycles) *
+			  DEADLINE_SLOWDOWN_NUM / DEADLINE_SLOWDOWN_DEN);
+
+	DEADLINE_TSTR &= (u8)~DEADLINE_TSTR_CH2;
+	DEADLINE_TCR2 = DEADLINE_TCR_UNIE;
+	DEADLINE_TCNT2 = ticks;
+	deadline_last_tmu = DEADLINE_TCNT1;
+	deadline_active = true;
+	deadline_gate = 1;
+	DEADLINE_TSTR |= DEADLINE_TSTR_CH2;
+
+	irq_restore(old);
+}
+
+/* Stop the one-shot and publish elapsed time in the units PCSX devices
+ * already consume.  The charge is clamped to the guest-cycle budget this
+ * slice was armed with: the TMU is an ALARM here, not the guest's clock.
+ * Without the clamp, host time the guest never saw (the renderer runs ~18 ms
+ * per frame with the timer armed) is billed to the guest clock, events fire
+ * ~3x early in guest terms, and the game slow-mos - measured on hardware
+ * 2026-09-02, ~56 ms/frame with permanent recompile storms.  True wall-time
+ * charging is bloop's end state but it requires the timer to pause across
+ * every host-overhead region first.  The remainder is in TMU_HZ denominator
+ * units, so repeated short hardware calls cannot lose fractional cycles. */
+static void deadline_collect_time(void)
+{
+	irq_mask_t old = irq_disable();
+	uint64_t scaled;
+	u32 now, elapsed, cycles;
+
+	DEADLINE_TSTR &= (u8)~DEADLINE_TSTR_CH2;
+	DEADLINE_TCR2 = DEADLINE_TCR_UNIE;
+	now = DEADLINE_TCNT1;
+
+	if (!deadline_active) {
+		deadline_last_tmu = now;
+		irq_restore(old);
+		return;
+	}
+
+	elapsed = deadline_last_tmu - now;
+	deadline_last_tmu = now;
+	deadline_active = false;
+
+	scaled = deadline_fraction +
+		(uint64_t)elapsed * DEADLINE_PSX_HZ * DEADLINE_SLOWDOWN_DEN;
+	cycles = (u32)(scaled / (DEADLINE_TMU_HZ * (uint64_t)DEADLINE_SLOWDOWN_NUM));
+	deadline_fraction = scaled % (DEADLINE_TMU_HZ * (uint64_t)DEADLINE_SLOWDOWN_NUM);
+	psxRegs.cycle += cycles;
+
+	irq_restore(old);
+}
+
+static void deadline_request_event(void)
+{
+	deadline_timer_stop();
+	deadline_active = false;
+	deadline_gate = 0;
+}
+
+/* TMU2 never touches r14 blindly.  The code-buffer test establishes JIT land,
+ * and r14==1 distinguishes a guest/trampoline gate from the dispatcher's or a
+ * generated C wrapper's real frame pointer.  This poke is the whole tight-loop
+ * delivery path: a guest loop spinning inside generated code has its
+ * in-register gate cleared right here, and every other route back to the hook
+ * (dispatcher loop, C-wrapper return) reloads the gate from memory.  bloop's
+ * PTEH/ASID flip was tried as a second path and CORRUPTED THE GUEST under
+ * testcast (kernel dispatch jumped to PC 0); it is redundant with the poke,
+ * so it is gone, not parked. */
+static void deadline_underflow(irq_t src, irq_context_t *ctx, void *data)
+{
+	(void)src;
+	(void)data;
+
+	DEADLINE_TCR2 = DEADLINE_TCR_UNIE;
+	DEADLINE_TSTR &= (u8)~DEADLINE_TSTR_CH2;
+	deadline_gate = 0;
+
+	if (deadline_pc_is_generated(ctx->pc) && ctx->r[14] == 1)
+		ctx->r[14] = 0;
+}
+
+static void deadline_scheduler_init(void)
+{
+	irq_mask_t old;
+
+	if (deadline_installed)
+		return;
+
+	old = irq_disable();
+	deadline_old_tmu2 = irq_get_handler(EXC_TMU2_TUNI2);
+	deadline_old_tmu2_priority = irq_get_priority(IRQ_SRC_TMU2);
+
+	DEADLINE_TSTR &= (u8)~DEADLINE_TSTR_CH2;
+	DEADLINE_TCR2 = DEADLINE_TCR_UNIE;
+	DEADLINE_TCOR2 = UINT32_MAX;
+	DEADLINE_TCNT2 = UINT32_MAX;
+	deadline_last_tmu = DEADLINE_TCNT1;
+	deadline_fraction = 0;
+	deadline_active = false;
+	deadline_gate = 1;
+
+	irq_set_handler(EXC_TMU2_TUNI2, deadline_underflow, NULL);
+	irq_set_priority(IRQ_SRC_TMU2, IRQ_PRIO_MAX);
+	deadline_installed = true;
+	irq_restore(old);
+
+	printf("Lightrec: r14/TMU2 deadline scheduler\n");
+}
+
+static void deadline_scheduler_reset(void)
+{
+	deadline_timer_stop();
+	deadline_last_tmu = DEADLINE_TCNT1;
+	deadline_fraction = 0;
+	deadline_active = false;
+	deadline_gate = 1;
+}
+
+static void deadline_scheduler_shutdown(void)
+{
+	irq_mask_t old;
+
+	if (!deadline_installed)
+		return;
+
+	old = irq_disable();
+	DEADLINE_TSTR &= (u8)~DEADLINE_TSTR_CH2;
+	DEADLINE_TCR2 = 0;
+	deadline_active = false;
+	deadline_gate = 1;
+	irq_set_priority(IRQ_SRC_TMU2, deadline_old_tmu2_priority);
+	irq_set_handler(EXC_TMU2_TUNI2, deadline_old_tmu2.hdl,
+			deadline_old_tmu2.data);
+	deadline_installed = false;
+	irq_restore(old);
+}
+
+#endif
+
 static char cache_buf[64 * 1024];
 
 static void cop2_op(struct lightrec_state *state, u32 func)
@@ -155,19 +376,67 @@ static bool has_interrupt(void)
 
 static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+	deadline_collect_time();
+	lightrec_reset_cycle_count(state, 0);
+#else
 	psxRegs.cycle += lightrec_current_cycle_count(state) / CYCLE_SCALE;
 	lightrec_reset_cycle_count(state, 0);
+#endif
 }
 
 static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 {
 	s32 cycles_left = psxRegs.next_interupt - psxRegs.cycle;
 
-	if (block_stepping || cycles_left <= 0 || has_interrupt())
+	if (block_stepping || cycles_left <= 0 || has_interrupt()) {
 		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
-	else {
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+		deadline_request_event();
+#endif
+	} else {
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+		deadline_timer_arm((u32)cycles_left);
+#else
 		lightrec_set_target_cycle_count(state, cycles_left * CYCLE_SCALE);
+#endif
 	}
+}
+
+/* The dispatcher calls this without leaving JIT land. */
+static s32 lightrec_run_event(struct lightrec_state *state, u32 *pc)
+{
+	struct lightrec_registers *regs = lightrec_get_registers(state);
+	s32 cycles_left;
+
+	if (block_stepping)
+		return 0;
+
+	lightrec_tansition_to_pcsx(state);
+	psxRegs.pc = *pc;
+	gen_interupt((psxCP0Regs *)regs->cp0);
+	*pc = psxRegs.pc;
+
+	if (psxRegs.stop) {
+		lightrec_set_target_cycle_count(state, 0);
+		return 0;
+	}
+
+	cycles_left = psxRegs.next_interupt - psxRegs.cycle;
+	if (cycles_left <= 0 || has_interrupt()) {
+		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
+		return 0;
+	}
+
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+	deadline_timer_arm((u32)cycles_left);
+	lightrec_set_target_cycle_count(state, 1);
+	return 1;
+#else
+	cycles_left *= CYCLE_SCALE;
+	lightrec_set_target_cycle_count(state, (u32)cycles_left);
+	return cycles_left;
+#endif
 }
 
 /* I_STAT / I_MASK / DMA ICR: served straight from the register file, no
@@ -514,6 +783,10 @@ static const struct lightrec_ops lightrec_ops = {
 	.enable_ram = lightrec_enable_ram,
 	.hw_direct = lightrec_can_hw_direct,
 	.code_inv = LIGHTREC_CODE_INV ? lightrec_code_inv : NULL,
+	.run_event = lightrec_run_event,
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+	.deadline_flag = &deadline_gate,
+#endif
 };
 
 static int lightrec_plugin_init(void)
@@ -561,6 +834,10 @@ static int lightrec_plugin_init(void)
 	lightrec_state = lightrec_init(LIGHTREC_PROG_NAME,
 			lightrec_map, ARRAY_SIZE(lightrec_map),
 			&lightrec_ops);
+
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+	deadline_scheduler_init();
+#endif
 
 	// fprintf(stderr, "M=0x%lx, P=0x%lx, R=0x%lx, H=0x%lx\n",
 	// 		(uintptr_t) psxM,
@@ -705,6 +982,12 @@ static void lightrec_plugin_execute_internal(bool block_only)
 							      cycles_lightrec);
 		} else {
 			enum perf_area pa = perf_area_switch(PERF_JIT);
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+			if (!block_only)
+				deadline_timer_arm(cycles_pcsx);
+			else
+				deadline_request_event();
+#endif
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
 			perf_area_switch(pa);
@@ -854,6 +1137,9 @@ static void lightrec_plugin_apply_config()
 
 static void lightrec_plugin_shutdown(void)
 {
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+	deadline_scheduler_shutdown();
+#endif
 	lightrec_destroy(lightrec_state);
 
 	if (!LIGHTREC_CUSTOM_MAP) {
@@ -870,6 +1156,10 @@ static void lightrec_plugin_reset(void)
 	struct lightrec_registers *regs;
 
 	regs = lightrec_get_registers(lightrec_state);
+
+#if BLOOM_DEADLINE && defined(_arch_dreamcast)
+	deadline_scheduler_reset();
+#endif
 
 	/* Invalidate all blocks */
 	lightrec_invalidate_all(lightrec_state);
