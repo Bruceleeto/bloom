@@ -232,6 +232,7 @@ option(WITH_480P "Enable high-resolution 480p mode" ON)
 option(WITH_HYBRID_RENDERING "Enable hybrid rendering" ON)
 option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF)
 option(WITH_CLIPPING "Enable pixel clipping" ON)
+option(WITH_FPS_OVERLAY "Draw an on-screen fps/frame-time counter" OFF)
 
 if (WITH_HYBRID_RENDERING)
 	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
@@ -273,6 +274,12 @@ add_executable(bloom
 	src/platform.c
 	src/plugins.c
 )
+if (WITH_FPS_OVERLAY)
+	target_sources(bloom PRIVATE src/overlay.c)
+	# pvrtex/file_dctex.h, for the embedded .dt font
+	target_include_directories(bloom PRIVATE $ENV{KOS_BASE}/utils)
+endif(WITH_FPS_OVERLAY)
+
 target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#lightning lightrec libpcsxcore gpu spu
 	#${ZLIB_LIBRARIES} tsunami parallax

@@ -21,6 +21,7 @@
 
 #include "bloom-config.h"
 #include "emu.h"
+#include "overlay.h"
 #include "pvr.h"
 
 #if ENABLE_THREADED_RENDERER
@@ -428,6 +429,7 @@ void pvr_renderer_init(void)
 	pvr.start_y = 0;
 
 	if (!WITH_24BPP) {
+		overlay_init();
 		pvr.fake_tex = pvr_mem_malloc(sizeof(fake_tex_data));
 		pvr_txr_load(fake_tex_data, pvr.fake_tex,
 			     sizeof(fake_tex_data));
@@ -3189,6 +3191,8 @@ void hw_render_stop(void)
 	 * need to send a dummy poly to avoid glitches. */
 	if (WITH_CLIPPING)
 		pvr_avoid_tile_clip_glitch();
+
+	overlay_draw(get_zvalue(0xffff));
 
 	pvr_list_finish();
 
