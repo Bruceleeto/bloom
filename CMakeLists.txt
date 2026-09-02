@@ -247,7 +247,7 @@ endif()
 target_compile_definitions(gpu PRIVATE POLY_BUFFER_SIZE=${POLY_BUFFER_SIZE})
 
 if (NOT SPU_PLUGIN)
-	set(SPU_PLUGIN AICA CACHE STRING "SPU plugin" FORCE)
+	set(SPU_PLUGIN Null CACHE STRING "SPU plugin" FORCE)
 	set_property(CACHE SPU_PLUGIN PROPERTY
 		STRINGS Null AICA
 	)
