@@ -64,7 +64,6 @@ struct regcache {
  * A pinned slot is never handed to another guest register.  The set is a
  * global constant (v0 v1 a0 = 55% of Rayman's guest register references).
  */
-#define PIN_FIRST_SLOT 0
 #define NUM_PINNED LIGHTREC_NUM_PINNED
 /* Ordered by Rayman's register reference counts (v0 32%, v1 13, a0 10,
  * a1 8, at 3.4); every one sits below offset 60 in regs.gpr so its entry
@@ -79,8 +78,48 @@ _Static_assert(NUM_PINNED <= 6, "pin_guest_all is too short");
 #else
 static const u8 pin_guest[1] = { 0 };   /* NUM_PINNED 0: never indexed */
 #endif
-_Static_assert(PIN_FIRST_SLOT + NUM_PINNED <= NUM_VREGS, "pins exceed V pool");
 _Static_assert(NUM_PINNED == LIGHTREC_NUM_PINNED, "regcache.h disagrees");
+
+/*
+ * Shared Lightning/template boundary ABI on SH-4+GBR:
+ *
+ *   r7-r12 = v0, v1, a0, a1, at, a2
+ *   r13    = 0x1fffffff guest address mask
+ *
+ * Regcache slots 0..5 normally spell r8..r13 and slots 6..9 r4..r7,
+ * hence the deliberately non-contiguous pin slots. Other hosts retain
+ * lightrec's original contiguous JIT_V assignment.
+ */
+#if defined(__sh__) && OPT_SH4_USE_GBR
+static const u8 pin_slot_all[6] = {
+	NUM_VREGS + 3, 0, 1, 2, 3, 4,
+};
+static const u8 pin_host_all[6] = {
+	_R7, _R8, _R9, _R10, _R11, _R12,
+};
+#define SH4_MASK_SLOT 5 /* JIT_V5 / r13: never allocated */
+_Static_assert(NUM_PINNED == 6, "shared SH-4 ABI requires six pins");
+_Static_assert(NUM_VREGS == 6 && NUM_ARGREGS == 4,
+	       "SH-4 regcache slot layout changed");
+#endif
+
+static inline unsigned int pin_slot(unsigned int pin)
+{
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	return pin_slot_all[pin];
+#else
+	return pin;
+#endif
+}
+
+static inline u8 pin_host(unsigned int pin)
+{
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	return pin_host_all[pin];
+#else
+	return JIT_V(FIRST_REG + pin);
+#endif
+}
 
 static inline int pin_slot_of_guest(u16 reg)
 {
@@ -88,7 +127,7 @@ static inline int pin_slot_of_guest(u16 reg)
 
 	for (i = 0; i < NUM_PINNED; i++)
 		if (pin_guest[i] == reg)
-			return PIN_FIRST_SLOT + i;
+			return (int)pin_slot(i);
 
 	return -1;
 }
@@ -98,7 +137,29 @@ static inline bool nreg_is_pinned(const struct regcache *cache,
 {
 	unsigned int idx = (unsigned int)(nreg - cache->lightrec_regs);
 
-	return idx >= PIN_FIRST_SLOT && idx < PIN_FIRST_SLOT + NUM_PINNED;
+	for (unsigned int i = 0; i < NUM_PINNED; i++)
+		if (idx == pin_slot(i))
+			return true;
+
+	return false;
+}
+
+static inline bool nreg_is_reserved(const struct regcache *cache,
+				     const struct native_register *nreg)
+{
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	return (unsigned int)(nreg - cache->lightrec_regs) == SH4_MASK_SLOT;
+#else
+	(void)cache;
+	(void)nreg;
+	return false;
+#endif
+}
+
+static inline bool nreg_is_unavailable(const struct regcache *cache,
+				       const struct native_register *nreg)
+{
+	return nreg_is_pinned(cache, nreg) || nreg_is_reserved(cache, nreg);
 }
 
 bool lightrec_reg_is_pinned(u16 reg)
@@ -112,7 +173,7 @@ static void lightrec_pins_reset(struct regcache *cache)
 
 	for (i = 0; i < NUM_PINNED; i++) {
 		struct native_register *nreg =
-			&cache->lightrec_regs[PIN_FIRST_SLOT + i];
+			&cache->lightrec_regs[pin_slot(i)];
 
 		nreg->emulated_register = pin_guest[i];
 		nreg->prio = REG_IS_TEMP;
@@ -126,7 +187,7 @@ static void lightrec_pins_canonical(struct regcache *cache)
 
 	for (i = 0; i < NUM_PINNED; i++) {
 		struct native_register *nreg =
-			&cache->lightrec_regs[PIN_FIRST_SLOT + i];
+			&cache->lightrec_regs[pin_slot(i)];
 
 		nreg->extended = true;
 		nreg->zero_extended = false;
@@ -144,10 +205,10 @@ static void lightrec_pins_reload_stale(struct regcache *cache,
 	unsigned int i;
 
 	for (i = 0; i < NUM_PINNED; i++) {
-		nreg = &cache->lightrec_regs[PIN_FIRST_SLOT + i];
+		nreg = &cache->lightrec_regs[pin_slot(i)];
 
 		if (nreg->prio < REG_IS_LOADED) {
-			jit_ldxi_i(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i),
+			jit_ldxi_i(pin_host(i),
 				   LIGHTREC_REG_STATE,
 				   lightrec_offset(regs.gpr) + (pin_guest[i] << 2));
 			nreg->extended = true;
@@ -286,7 +347,7 @@ static struct native_register * alloc_temp(struct regcache *cache)
 	for (i = ARRAY_SIZE(cache->lightrec_regs); i; i--) {
 		elm = &cache->lightrec_regs[i - 1];
 
-		if (nreg_is_pinned(cache, elm))
+		if (nreg_is_unavailable(cache, elm))
 			continue;
 
 		if (!elm->used && !elm->locked && elm->prio < best) {
@@ -340,7 +401,7 @@ static struct native_register * alloc_in_out(struct regcache *cache,
 	for (i = 0; i < ARRAY_SIZE(cache->lightrec_regs); i++) {
 		elm = &cache->lightrec_regs[i];
 
-		if (nreg_is_pinned(cache, elm))
+		if (nreg_is_unavailable(cache, elm))
 			continue;
 
 		if (!elm->used && !elm->locked && elm->prio < best) {
@@ -806,7 +867,7 @@ static void lightrec_regs_live(struct regcache *cache, jit_state_t *_jit)
 	unsigned int i;
 
 	for (i = 0; i < NUM_PINNED; i++)
-		jit_live(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i));
+		jit_live(pin_host(i));
 
 	/* r4-r7 slots are plain gpr class to lightning: say so while they
 	 * hold something, or it takes them as scratch. */
@@ -849,8 +910,8 @@ void lightrec_regcache_store_pins(struct regcache *cache, jit_state_t *_jit)
 	unsigned int i;
 
 	for (i = 0; i < NUM_PINNED; i++) {
-		clean_reg(_jit, &cache->lightrec_regs[PIN_FIRST_SLOT + i],
-			  JIT_V(FIRST_REG + PIN_FIRST_SLOT + i), true);
+		clean_reg(_jit, &cache->lightrec_regs[pin_slot(i)],
+			  pin_host(i), true);
 	}
 }
 
@@ -872,7 +933,7 @@ void lightrec_regcache_entry_loads(struct regcache *cache, jit_state_t *_jit)
 	unsigned int i;
 
 	for (i = 0; i < NUM_PINNED; i++) {
-		jit_ldxi_i(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i),
+		jit_ldxi_i(pin_host(i),
 			   LIGHTREC_REG_STATE,
 			   lightrec_offset(regs.gpr) + (pin_guest[i] << 2));
 	}
@@ -886,7 +947,7 @@ void lightrec_regcache_pin_stores_raw(jit_state_t *_jit)
 	for (i = 0; i < NUM_PINNED; i++) {
 		jit_stxi_i(lightrec_offset(regs.gpr) + (pin_guest[i] << 2),
 			   LIGHTREC_REG_STATE,
-			   JIT_V(FIRST_REG + PIN_FIRST_SLOT + i));
+			   pin_host(i));
 	}
 }
 
@@ -898,10 +959,23 @@ void lightrec_regcache_pin_loads_raw(jit_state_t *_jit)
 	unsigned int i;
 
 	for (i = 0; i < NUM_PINNED; i++) {
-		jit_ldxi_i(JIT_V(FIRST_REG + PIN_FIRST_SLOT + i),
+		jit_ldxi_i(pin_host(i),
 			   LIGHTREC_REG_STATE,
 			   lightrec_offset(regs.gpr) + (pin_guest[i] << 2));
 	}
+}
+
+void lightrec_regcache_reserve_abi(jit_state_t *_jit)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUM_PINNED; i++)
+		jit_reserve_reg(pin_host(i));
+
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	/* r13 is live across every edge even before a template consumes it. */
+	jit_reserve_reg(_R13);
+#endif
 }
 
 void lightrec_regcache_pin_block(struct regcache *cache, jit_state_t *_jit)

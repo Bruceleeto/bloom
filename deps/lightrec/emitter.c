@@ -107,6 +107,11 @@ lightrec_jump_to_eob(struct lightrec_cstate *state, jit_state_t *_jit)
 static void lightrec_jump_to_fast_eob(struct lightrec_cstate *state,
 				      jit_state_t *_jit, u32 offset)
 {
+	/* LIGHTREC_REG_PC already carries the guest target.  Keep lightning's
+	 * wide-immediate lowering from borrowing it while materialising the LUT
+	 * address into AUX (r5). */
+	jit_live(LIGHTREC_REG_PC);
+
 	/* Load the LUT entry address to LIGHTREC_REG_AUX where the dispatcher expects it */
 	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)lut_address(state->state, offset));
 
@@ -205,6 +210,8 @@ void lightrec_emit_link_stub(struct lightrec_cstate *state, jit_state_t *_jit)
 	jit_link(state->link_stub);
 	state->link_stub = NULL;
 
+	/* As above, the next PC is live while the far wrapper address is built. */
+	jit_live(LIGHTREC_REG_PC);
 	jit_movi(LIGHTREC_REG_AUX,
 		 (uintptr_t)state->state->eob_wrapper_pins_func);
 
@@ -223,10 +230,10 @@ void lightrec_emit_link_stub(struct lightrec_cstate *state, jit_state_t *_jit)
  * entry, or the preprocessed-not-compiled marker take the dispatcher
  * route, which is what every indirect exit used to take.
  *
- * Registers: LIGHTREC_REG_PC (r4) holds the target. r5 (AUX), r6 and r7
- * are dead at a block exit; r2 must hold the address mask on entry when
- * the arch has no fast mask, r3 belongs to lightning, r1 is the cycle
- * counter and r8-r11 are the pins. Mirrors the LUT lookup in
+ * Registers: LIGHTREC_REG_PC (r4) holds the target. r5 (AUX), r6 and r3
+ * are dead at a block exit; r2 holds lightning's cached address mask,
+ * r13 holds the shared-ABI mask, r1 is the cycle counter, and r7-r12 are
+ * the pins. Mirrors the LUT lookup in
  * generate_dispatcher(). */
 static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 				      jit_state_t *_jit)
@@ -238,9 +245,9 @@ static void lightrec_jump_to_indirect(struct lightrec_cstate *state,
 	 * The LUT is byte-indexed (entry i at code_lut + i * 4 == pc & mask). */
 	jit_andi(LIGHTREC_REG_AUX, LIGHTREC_REG_PC, RAM_SIZE - 1);
 	jit_andi(_R6, LIGHTREC_REG_PC, BIOS_SIZE - 1);
-	jit_andi(_R7, LIGHTREC_REG_PC, BIT(28));
+	jit_andi(_R3, LIGHTREC_REG_PC, BIT(28));
 	jit_addi(_R6, _R6, RAM_SIZE);
-	jit_movnr(LIGHTREC_REG_AUX, _R6, _R7);
+	jit_movnr(LIGHTREC_REG_AUX, _R6, _R3);
 
 	jit_add_state(LIGHTREC_REG_AUX, LIGHTREC_REG_AUX);
 	jit_addi(LIGHTREC_REG_AUX, LIGHTREC_REG_AUX, lightrec_offset(code_lut));
@@ -416,6 +423,9 @@ void lightrec_emit_jump_to_interpreter(struct lightrec_cstate *state,
 	lightrec_load_next_pc_imm(reg_cache, _jit, block->pc,
 				  block->pc + (offset << 2));
 
+	/* Preserve the newly materialised PC while lightning lowers the block
+	 * pointer constant into AUX. */
+	jit_live(LIGHTREC_REG_PC);
 	jit_movi(LIGHTREC_REG_AUX, (uintptr_t)block);
 
 	jit_subi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_CYCLE, state->cycles);

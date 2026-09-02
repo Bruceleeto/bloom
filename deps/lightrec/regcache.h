@@ -130,14 +130,11 @@ _Bool lightrec_has_dirty_regs(struct regcache *cache);
 #else
 #  define LIGHTREC_PIN_STUB_BYTES 0
 #endif
-/* The dispatcher's own working registers. They must not be JIT_V0/JIT_V1
- * when guest registers are pinned there: every dispatcher round trip would
- * destroy two pins, which is exactly what forces the per-block entry reload.
- * r6/r7 are caller-saved, so nothing may be held in them across a C call -
- * the cycle counter goes through the state struct instead. */
+/* The dispatcher's own working registers. r7-r12 are the shared pin suffix,
+ * so the handoff stays in r4/r5 and r6 is its remaining local scratch. */
 #if defined(__sh__) && LIGHTREC_NUM_PINNED > 0
-#  define DISPATCH_PC  _R7
-#  define DISPATCH_TMP _R6
+#  define DISPATCH_PC  _R4
+#  define DISPATCH_TMP _R5
 #else
 #  define DISPATCH_PC  JIT_V0
 #  define DISPATCH_TMP JIT_V1
@@ -156,6 +153,7 @@ void lightrec_regcache_store_pins(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_entry_loads(struct regcache *cache, jit_state_t *_jit);
 void lightrec_regcache_pin_stores_raw(jit_state_t *_jit);
 void lightrec_regcache_pin_loads_raw(jit_state_t *_jit);
+void lightrec_regcache_reserve_abi(jit_state_t *_jit);
 
 _Bool lightrec_reg_is_loaded(struct regcache *cache, u16 reg);
 void lightrec_clean_reg_if_loaded(struct regcache *cache, jit_state_t *_jit,

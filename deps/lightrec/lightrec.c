@@ -19,6 +19,7 @@
 #include "reaper.h"
 #include "recompiler.h"
 #include "regcache.h"
+#include "sh4template.h"
 #include "optimizer.h"
 #include "tlsf/tlsf.h"
 
@@ -433,6 +434,114 @@ static void lightrec_rw_helper(struct lightrec_state *state,
 static void lightrec_rw_cb(struct lightrec_state *state, u32 arg)
 {
 	lightrec_rw_helper(state, (union code) arg, NULL, NULL, 0);
+}
+
+/* Memory access for the SH-4 template.  Unlike lightrec_rw_cb it writes a load
+ * result straight to gpr[rt] instead of deferring it to temp_reg: the template
+ * only routes loads whose delay slot the optimizer already resolved, and it has
+ * no check_load_delay pass to drain a deferred value. */
+static void lightrec_sh4t_rw(struct lightrec_state *state, u32 arg)
+{
+	union code op = (union code) arg;
+	u32 ret = lightrec_rw(state, op, state->regs.gpr[op.i.rs],
+			      state->regs.gpr[op.i.rt], NULL, NULL, 0);
+
+	switch (op.i.op) {
+	case OP_LB:
+	case OP_LBU:
+	case OP_LH:
+	case OP_LHU:
+	case OP_LW:
+		if (op.i.rt)
+			state->regs.gpr[op.i.rt] = ret;
+		break;
+	default:
+		break;
+	}
+}
+
+/* SH-4 template mult/div/HI-LO bucket.  Mirrors the interpreter, operating on
+ * state->regs.gpr directly (HI/LO are gpr[REG_HI]/gpr[REG_LO], possibly aliased
+ * to real GPRs under OPT_FLAG_MULT_DIV).  flags carries LIGHTREC_NO_HI/NO_LO, so
+ * it is passed alongside the opcode.  The template syncs pins to memory around
+ * the call, so writing gpr[] here is authoritative. */
+static void lightrec_sh4t_muldiv(struct lightrec_state *state, u32 arg, u32 flags)
+{
+	union code op = (union code) arg;
+	u32 *reg_cache = state->regs.gpr;
+	u8 reg_lo = get_mult_div_lo(op);
+	u8 reg_hi = get_mult_div_hi(op);
+
+	switch (op.r.op) {
+	case OP_SPECIAL_MFHI:
+		if (op.r.rd)
+			reg_cache[op.r.rd] = reg_cache[REG_HI];
+		break;
+	case OP_SPECIAL_MTHI:
+		reg_cache[REG_HI] = reg_cache[op.r.rs];
+		break;
+	case OP_SPECIAL_MFLO:
+		if (op.r.rd)
+			reg_cache[op.r.rd] = reg_cache[REG_LO];
+		break;
+	case OP_SPECIAL_MTLO:
+		reg_cache[REG_LO] = reg_cache[op.r.rs];
+		break;
+	case OP_SPECIAL_MULT: {
+		u64 res = (s64)(s32)reg_cache[op.r.rs] * (s64)(s32)reg_cache[op.r.rt];
+
+		if (!op_flag_no_hi(flags))
+			reg_cache[reg_hi] = res >> 32;
+		if (!op_flag_no_lo(flags))
+			reg_cache[reg_lo] = res;
+		break;
+	}
+	case OP_SPECIAL_MULTU: {
+		u64 res = (u64)reg_cache[op.r.rs] * (u64)reg_cache[op.r.rt];
+
+		if (!op_flag_no_hi(flags))
+			reg_cache[reg_hi] = res >> 32;
+		if (!op_flag_no_lo(flags))
+			reg_cache[reg_lo] = res;
+		break;
+	}
+	case OP_SPECIAL_DIV: {
+		s32 rs = reg_cache[op.r.rs], rt = reg_cache[op.r.rt];
+		u32 lo, hi;
+
+		if (rt == 0) {
+			hi = rs;
+			lo = (rs < 0) * 2 - 1;
+		} else {
+			lo = rs / rt;
+			hi = rs % rt;
+		}
+		if (!op_flag_no_hi(flags))
+			reg_cache[reg_hi] = hi;
+		if (!op_flag_no_lo(flags))
+			reg_cache[reg_lo] = lo;
+		break;
+	}
+	case OP_SPECIAL_DIVU: {
+		u32 rs = reg_cache[op.r.rs], rt = reg_cache[op.r.rt];
+		u32 lo, hi;
+
+		if (rt == 0) {
+			hi = rs;
+			lo = (u32)-1;
+		} else {
+			lo = rs / rt;
+			hi = rs % rt;
+		}
+		if (!op_flag_no_hi(flags))
+			reg_cache[reg_hi] = hi;
+		if (!op_flag_no_lo(flags))
+			reg_cache[reg_lo] = lo;
+		break;
+	}
+	default:
+		break;
+	}
 }
 
 static void lightrec_rw_generic_cb(struct lightrec_state *state, u32 arg)
@@ -1221,6 +1330,14 @@ GBR_SHIM(u32, lightrec_emulate_block,
 	 (state, block, pc))
 GBR_SHIM_VOID(lightrec_link_inv_cb,
 	      (u32 arg, struct lightrec_state *state), (arg, state))
+/* SH-4 template memory bucket: the flat emitter calls this for any load/store
+ * mode it does not handle inline. It reads rs/rt from state and writes the
+ * result back, so the template syncs its pins to memory around the call. */
+GBR_SHIM_VOID(lightrec_sh4t_rw,
+	      (struct lightrec_state *state, u32 arg), (state, arg))
+GBR_SHIM_VOID(lightrec_sh4t_muldiv,
+	      (struct lightrec_state *state, u32 arg, u32 flags),
+	      (state, arg, flags))
 #endif
 
 /* Out-of-line stub for the store-invalidate rare path (emitter.c,
@@ -1335,30 +1452,27 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 	arg_trace = jit_arg();
 	arg_cycles = jit_arg();
 
-	/* Fetch in reverse. The arguments arrive in r4..r7 and DISPATCH_PC is
-	 * r7: reading arg 1 into it first would destroy arg 3, which is still
-	 * sitting there. */
-	jit_getarg_i(LIGHTREC_REG_CYCLE, arg_cycles);
-	jit_getarg(DISPATCH_TMP, arg_trace);
-	jit_getarg(DISPATCH_PC, arg_pc);
+	/* Fetch before the pin loads claim r7. Arguments arrive in r4..r7;
+	 * state moves to GBR first, then r5/r6 are copied into the r4/r5
+	 * dispatcher handoff pair, and cycles leave r7. */
 	jit_getarg(LIGHTREC_REG_STATE, arg_state);
+	jit_getarg_i(LIGHTREC_REG_CYCLE, arg_cycles);
+	jit_getarg(DISPATCH_PC, arg_pc);
+	jit_getarg(DISPATCH_TMP, arg_trace);
 
 	/* Force all callee-saved registers to be pushed on the stack */
 	for (i = 0; i < NUM_VREGS; i++)
 		jit_movr(JIT_V(i + FIRST_REG), JIT_V(i + FIRST_REG));
 
-#if defined(__sh__) && OPT_SH4_USE_GBR
-	/* Blocks arrive over a direct link with the pins live in their
-	 * registers, so nothing on this path may hand one to lightning as
-	 * scratch - jit_jmpi() and the wide-displacement addressing helpers
-	 * both ask for one. Blocks get the same treatment where they are
-	 * compiled; the dispatcher needs it in its own jit_state. */
-	for (i = 0; i < LIGHTREC_NUM_PINNED; i++)
-		jit_reserve_reg(JIT_V(FIRST_REG + i));
-#endif
+	/* Mixed template/Lightning dispatch requires one boundary ABI. */
+	lightrec_regcache_reserve_abi(_jit);
 
 	/* First entry from lightrec_execute(): the pins hold nothing yet. */
 	lightrec_regcache_pin_loads_raw(_jit);
+#if defined(__sh__) && OPT_SH4_USE_GBR
+	/* Templates consume this directly; Lightning preserves it. */
+	jit_movi(_R13, 0x1fffffff);
+#endif
 
 	to_loop = jit_jmpi();
 
@@ -1436,9 +1550,13 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 	lightrec_regcache_pin_stores_raw(_jit);
 
+	/* SH-4 pushargr writes arguments into r4, r5, ... immediately.  Since
+	 * the PC itself arrives in r4, park it before pushing state into the
+	 * first argument slot. */
+	jit_movr(JIT_R1, DISPATCH_PC);
 	jit_prepare();
 	jit_pushargr(LIGHTREC_REG_STATE);
-	jit_pushargr(DISPATCH_PC);
+	jit_pushargr(JIT_R1);
 
 	/* Save the cycles register if needed. DISPATCH_* are caller-saved, so
 	 * this cannot be parked in a register across the call. */
@@ -1520,10 +1638,14 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 
 		lightrec_regcache_pin_stores_raw(_jit);
 
+		/* Preserve both caller-saved handoff values before pushargr starts
+		 * filling r4-r6. */
+		jit_movr(JIT_R1, DISPATCH_TMP);
+		jit_movr(JIT_R2, DISPATCH_PC);
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(DISPATCH_TMP);
-		jit_pushargr(DISPATCH_PC);
+		jit_pushargr(JIT_R1);
+		jit_pushargr(JIT_R2);
 		jit_finishi(LIGHTREC_C_CALL(lightrec_emulate_block));
 
 		jit_retval(DISPATCH_PC);
@@ -1552,10 +1674,14 @@ static struct block * generate_dispatcher(struct lightrec_state *state)
 		sync_next_pc(_jit);
 		update_cycle_counter_before_c(_jit);
 
+		/* r4/r5 are the values being passed and are also the ABI argument
+		 * slots, so stage them before the first push overwrites r4. */
+		jit_movr(JIT_R1, DISPATCH_PC);
+		jit_movr(JIT_R2, DISPATCH_TMP);
 		jit_prepare();
 		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(DISPATCH_PC);
-		jit_pushargr(DISPATCH_TMP);
+		jit_pushargr(JIT_R1);
+		jit_pushargr(JIT_R2);
 		lightrec_regcache_pin_stores_raw(_jit);
 		jit_finishi(LIGHTREC_C_CALL(lightrec_check_load_delay));
 
@@ -1857,6 +1983,358 @@ static bool block_returns_through_ra(const struct block *block)
 	return false;
 }
 
+#if defined(__sh__) && OPT_SH4_USE_GBR && ENABLE_CODE_BUFFER && !BLOOM_ATTR
+/* Resolve a direct-map load's host base and mask from its IO mode, then emit
+ * it.  Mirrors is_supported_load()'s gate exactly, so any op can_emit_block
+ * accepted is emitted here without failure. */
+static bool sh4t_emit_load(struct lightrec_state *state,
+			   struct lightrec_sh4t *t, const struct opcode *op)
+{
+	bool use_mask = !op_flag_no_mask(op->flags);
+	uintptr_t host_offset;
+	u32 mask;
+
+	switch (op->i.op) {
+	case OP_LB:
+	case OP_LBU:
+	case OP_LH:
+	case OP_LHU:
+	case OP_LW:
+		break;
+	default:
+		return false;
+	}
+
+	if (op_flag_load_delay(op->flags))
+		return false;
+
+	switch (LIGHTREC_FLAGS_GET_IO_MODE(op->flags)) {
+	case LIGHTREC_IO_RAM:
+		host_offset = state->offset_ram;
+		mask = (RAM_SIZE << (state->mirrors_mapped * 2)) - 1;
+		break;
+	case LIGHTREC_IO_BIOS:
+		host_offset = state->offset_bios;
+		mask = 0x1fffffff;
+		break;
+	case LIGHTREC_IO_SCRATCH:
+		host_offset = state->offset_scratch;
+		mask = 0x1fffffff;
+		break;
+	default:
+		/* IO_DIRECT / IO_HW / IO_DIRECT_HW: hand to the C helper. */
+		lightrec_sh4t_emit_mem_call(t, op->opcode,
+				(uintptr_t)LIGHTREC_C_CALL(lightrec_sh4t_rw));
+		return true;
+	}
+
+	return lightrec_sh4t_emit_load(t, op, host_offset, use_mask, mask);
+}
+
+/* Store counterpart of sh4t_emit_load.  Mirrors is_supported_store()'s gate,
+ * including the invalidation policy, so it never fails for an accepted op. */
+static bool sh4t_emit_store(struct lightrec_state *state,
+			    struct lightrec_sh4t *t, const struct opcode *op)
+{
+	bool inv_dma_only = !!(state->opt_flags & LIGHTREC_OPT_INV_DMA_ONLY);
+	bool use_mask = !op_flag_no_mask(op->flags);
+	uintptr_t host_offset;
+	u32 mask;
+
+	switch (op->i.op) {
+	case OP_SB:
+	case OP_SH:
+	case OP_SW:
+		break;
+	default:
+		return false;
+	}
+
+	switch (LIGHTREC_FLAGS_GET_IO_MODE(op->flags)) {
+	case LIGHTREC_IO_RAM:
+		if (!inv_dma_only && !op_flag_no_invalidate(op->flags))
+			return false;
+		host_offset = state->offset_ram;
+		mask = (RAM_SIZE << (state->mirrors_mapped * 2)) - 1;
+		break;
+	case LIGHTREC_IO_SCRATCH:
+		host_offset = state->offset_scratch;
+		mask = 0x1fffffff;
+		break;
+	default:
+		/* IO_DIRECT / IO_HW / IO_DIRECT_HW: hand to the C helper. */
+		lightrec_sh4t_emit_mem_call(t, op->opcode,
+				(uintptr_t)LIGHTREC_C_CALL(lightrec_sh4t_rw));
+		return true;
+	}
+
+	return lightrec_sh4t_emit_store(t, op, host_offset, use_mask, mask);
+}
+
+/* Route one non-terminator guest op to its template emitter. */
+/* mult/div/MFHI/MFLO/MTHI/MTLO: emit a C-helper call (any of them). */
+static bool sh4t_emit_muldiv(struct lightrec_state *state,
+			     struct lightrec_sh4t *t, const struct opcode *op)
+{
+	if (op->i.op != OP_SPECIAL)
+		return false;
+
+	switch (op->r.op) {
+	case OP_SPECIAL_MULT:
+	case OP_SPECIAL_MULTU:
+	case OP_SPECIAL_DIV:
+	case OP_SPECIAL_DIVU:
+	case OP_SPECIAL_MFHI:
+	case OP_SPECIAL_MFLO:
+	case OP_SPECIAL_MTHI:
+	case OP_SPECIAL_MTLO:
+		lightrec_sh4t_emit_muldiv_call(t, op->opcode, op->flags,
+				(uintptr_t)LIGHTREC_C_CALL(lightrec_sh4t_muldiv));
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool sh4t_emit_body_op(struct lightrec_state *state,
+			      struct lightrec_sh4t *t, const struct opcode *op)
+{
+	return (op->i.op >= OP_ADDI && op->i.op <= OP_LUI &&
+		lightrec_sh4t_emit_alu_imm(t, op)) ||
+	       (op->i.op == OP_SPECIAL && lightrec_sh4t_emit_alu_reg(t, op)) ||
+	       (op->i.op == OP_META && lightrec_sh4t_emit_meta_alu(t, op)) ||
+	       sh4t_emit_muldiv(state, t, op) ||
+	       sh4t_emit_load(state, t, op) ||
+	       sh4t_emit_store(state, t, op);
+}
+
+static uint32_t sh4t_lut_entry(struct lightrec_state *state, u32 pc)
+{
+	return (uint32_t)(uintptr_t)lut_address(state, lut_offset(pc));
+}
+
+/* Compile one whole block without creating lightning IR.  The capability
+ * scan is deliberately outside this function: arriving here means every
+ * guest op and the boundary exit have a template implementation. */
+static int lightrec_compile_sh4_template(struct lightrec_cstate *cstate,
+					 struct block *block,
+					 bool fully_tagged)
+{
+	struct lightrec_state *state = cstate->state;
+	/* A direct-map load can expand to an address build plus literals, well
+	 * past an ALU op's few words; size for the worst case so the emitter
+	 * never overruns.  On overrun it still fails cleanly and falls back. */
+	const size_t capacity = (size_t)block->nb_ops * 48 + 64;
+	struct lightrec_link *old_links = block->links;
+	bool old_template = block_has_flag(block, BLOCK_SH4_TEMPLATE);
+	unsigned int old_code_size = block->code_size;
+	jit_state_t *oldjit = block->_jit;
+	void *old_fn = block->function;
+	struct lightrec_sh4t t;
+	unsigned int cycles = 0;
+	unsigned int i;
+	void *code;
+	size_t size;
+	u8 old_flags;
+
+	code = lightrec_alloc_code(state, capacity);
+	if (!code) {
+		if (ENABLE_THREADED_COMPILER)
+			return -ENOMEM;
+
+		lightrec_remove_outdated_blocks(state->block_cache, block);
+		code = lightrec_alloc_code(state, capacity);
+		if (!code)
+			return -ENOMEM;
+	}
+
+	lightrec_sh4t_init(&t, code, capacity, (uintptr_t)code,
+			   lightrec_offset(regs.gpr));
+
+	{
+	/* Forward control-flow emitter.  Ops are emitted in order; a conditional
+	 * branch places a forward bt/bf to either a later op (patched when that op
+	 * is reached) or an appended external exit stub; an unconditional J emits
+	 * its exit inline.  can_emit_block has proven every branch is forward and
+	 * every op supported, so nothing here needs to reject. */
+	u32 block_end = block->pc + block->nb_ops * sizeof(u32);
+	bool consumed[64] = { false };
+	struct { size_t br; unsigned int tgt; } fwd[64];
+	struct { size_t br; u32 pc; } ext[64];
+	unsigned int nfwd = 0, next = 0, k;
+	bool fell_through = true;
+
+	for (i = 0; i < block->nb_ops; i++) {
+		const struct opcode *op = &block->opcode_list[i];
+		bool no_ds = op_flag_no_ds(op->flags);
+		bool cond, uncond, jr;
+		u32 target, return_pc;
+
+		/* Land any forward branches that target this op. */
+		for (k = 0; k < nfwd; k++)
+			if (fwd[k].tgt == i)
+				sh4asm_patch_cond_branch(&t.as, fwd[k].br);
+
+		cycles += lightrec_cycles_of_opcode(state, op->c);
+		if (consumed[i] || !op->opcode)
+			continue;
+
+		cond = lightrec_sh4t_is_cond_branch(op);
+		uncond = lightrec_sh4t_is_uncond(op);
+		jr = lightrec_sh4t_is_jump_reg(op);
+		if (!cond && !uncond && !jr) {
+			if (!sh4t_emit_body_op(state, &t, op)) {
+				t.as.failed = true;
+				break;
+			}
+			fell_through = true;
+			continue;
+		}
+
+		/* A real delay slot is emitted before the branch's effect. */
+		if (!no_ds) {
+			const struct opcode *ds = &block->opcode_list[i + 1];
+
+			cycles += lightrec_cycles_of_opcode(state, ds->c);
+			if (ds->opcode && !sh4t_emit_body_op(state, &t, ds)) {
+				t.as.failed = true;
+				break;
+			}
+			consumed[i + 1] = true;
+		}
+
+		/* Guest return address, for the linking forms (JAL/JALR). */
+		return_pc = block->pc + (i - !!no_ds + 2) * sizeof(u32);
+
+		if (jr) {
+			unsigned int link = op->r.op == OP_SPECIAL_JALR ?
+				op->r.rd : 0;
+
+			lightrec_sh4t_emit_jump_reg(&t, op->r.rs, link, return_pc,
+					cycles,
+					lightrec_offset(eob_wrapper_func));
+			fell_through = false;
+			continue;
+		}
+
+		target = lightrec_sh4t_branch_target(op, block->pc, i, no_ds);
+
+		if (cond) {
+			bool use_bt = lightrec_sh4t_emit_condition(&t, op);
+			size_t br = sh4asm_emit_cond_branch_fwd(&t.as, use_bt);
+
+			if (target >= block->pc && target < block_end) {
+				fwd[nfwd].br = br;
+				fwd[nfwd++].tgt = (target - block->pc) / sizeof(u32);
+			} else {
+				ext[next].br = br;
+				ext[next++].pc = target;
+			}
+			fell_through = true;
+		} else {
+			lightrec_sh4t_emit_call(&t,
+					op->i.op == OP_JAL ? 31 : 0, return_pc,
+					cycles, target, sh4t_lut_entry(state, target),
+					lightrec_offset(fast_eob));
+			fell_through = false;
+		}
+	}
+
+	/* Fall-through off the end of the block, if reachable. */
+	if (!t.as.failed && fell_through)
+		lightrec_sh4t_emit_dispatch_exit(&t, cycles, block_end,
+				sh4t_lut_entry(state, block_end),
+				lightrec_offset(fast_eob));
+
+	/* Appended external taken-exit stubs. */
+	for (k = 0; k < next && !t.as.failed; k++) {
+		sh4asm_patch_cond_branch(&t.as, ext[k].br);
+		lightrec_sh4t_emit_dispatch_exit(&t, cycles, ext[k].pc,
+				sh4t_lut_entry(state, ext[k].pc),
+				lightrec_offset(fast_eob));
+	}
+	}
+
+	if (!sh4asm_finalize(&t.as)) {
+		lightrec_free_code(state, code);
+		return -E2BIG;
+	}
+
+	size = sh4asm_size(&t.as);
+	lightrec_realloc_code(state, code, size);
+	lightrec_register(MEM_FOR_CODE, (unsigned int)size);
+	if (state->ops.code_inv)
+		state->ops.code_inv(code, size);
+
+	if (ENABLE_THREADED_COMPILER)
+		lightrec_reaper_pause(state->reaper);
+
+	/* Templates in this first slice always return through fast_eob, so
+	 * they publish no direct-link patch sites of their own. */
+	if (lightrec_links_register_block(state, block, code, NULL, 0)) {
+		if (ENABLE_THREADED_COMPILER)
+			lightrec_reaper_continue(state->reaper);
+		lightrec_free_code(state, code);
+		lightrec_unregister(MEM_FOR_CODE, (unsigned int)size);
+		block->links = old_links;
+		return -EINVAL;
+	}
+
+	block->_jit = NULL;
+	block->function = code;
+	block->code_size = (unsigned int)size;
+	block_set_flags(block, BLOCK_SH4_TEMPLATE);
+	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
+	lut_write(state, lut_offset(block->pc), code);
+
+	if (ENABLE_THREADED_COMPILER)
+		lightrec_reaper_continue(state->reaper);
+
+	if (fully_tagged)
+		old_flags = block_set_flags(block, BLOCK_NO_OPCODE_LIST);
+	else
+		old_flags = block->flags;
+
+	if (fully_tagged && !(old_flags & BLOCK_NO_OPCODE_LIST)) {
+		if (ENABLE_THREADED_COMPILER)
+			lightrec_reaper_add(state->reaper,
+					    lightrec_reap_opcode_list,
+					    block->opcode_list);
+		else
+			lightrec_free_opcode_list(state, block->opcode_list);
+	}
+
+	if (oldjit || old_template) {
+		if (ENABLE_THREADED_COMPILER) {
+			if (old_links)
+				lightrec_reaper_add(state->reaper,
+						    lightrec_reap_links,
+						    old_links);
+			if (oldjit)
+				lightrec_reaper_add(state->reaper,
+						    lightrec_reap_jit, oldjit);
+			if (old_fn)
+				lightrec_reaper_add(state->reaper,
+						    lightrec_reap_function,
+						    old_fn);
+		} else {
+			lightrec_links_free_list(state, old_links);
+			if (oldjit)
+				_jit_destroy_state(oldjit);
+			if (old_fn)
+				lightrec_free_function(state, old_fn);
+		}
+		lightrec_unregister(MEM_FOR_CODE, old_code_size);
+	}
+
+	pr_debug("SH-4 template block at "PC_FMT": %u bytes\n",
+		 block->pc, block->code_size);
+	state->nb_compile++;
+	lightrec_perf_nb_compile++;
+	return 0;
+}
+#endif
+
 int lightrec_compile_block(struct lightrec_cstate *cstate,
 			   struct block *block)
 {
@@ -1864,7 +2342,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	u32 was_dead[ARRAY_SIZE(cstate->targets) / 8];
 	struct lightrec_state *state = cstate->state;
 	struct lightrec_branch_target *target;
-	bool fully_tagged = false;
+	bool fully_tagged = false, old_template;
 	struct block *block2;
 	struct opcode *elm;
 	jit_state_t *_jit, *oldjit;
@@ -1881,17 +2359,37 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	if (fully_tagged)
 		block_set_flags(block, BLOCK_FULLY_TAGGED);
 
+	if (OPT_DETECT_IDLE && !block_has_flag(block, BLOCK_NO_OPCODE_LIST))
+		lightrec_detect_idle(block);
+
+#if defined(__sh__) && OPT_SH4_USE_GBR && ENABLE_CODE_BUFFER && !BLOOM_ATTR
+	{
+		/* One decision for the whole block.  Unsupported/mixed blocks never
+		 * enter the flat emitter and remain wholly on lightning. */
+		if (lightrec_sh4t_can_emit_block(block->opcode_list,
+				block->nb_ops, block->pc,
+				!!(state->opt_flags & LIGHTREC_OPT_INV_DMA_ONLY))) {
+			int ret = lightrec_compile_sh4_template(cstate, block,
+					fully_tagged);
+
+			/* -E2BIG means the flat code (or its literal pool) did
+			 * not fit; the block is untouched, so fall through to
+			 * lightning rather than failing the compile. */
+			if (ret != -E2BIG)
+				return ret;
+		}
+	}
+#endif
+
 	_jit = jit_new_state();
 	if (!_jit)
 		return -ENOMEM;
-
-	if (OPT_DETECT_IDLE && !block_has_flag(block, BLOCK_NO_OPCODE_LIST))
-		lightrec_detect_idle(block);
 
 	oldjit = block->_jit;
 	old_fn = block->function;
 	old_code_size = block->code_size;
 	old_links = block->links;
+	old_template = block_has_flag(block, BLOCK_SH4_TEMPLATE);
 	block->_jit = _jit;
 
 	lightrec_regcache_reset(cstate->reg_cache);
@@ -1927,21 +2425,9 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	jit_prolog();
 	jit_tramp(256);
 
-#if defined(__sh__) && OPT_SH4_USE_GBR
-	{
-		/* With the state pointer in GBR, lightning's addressing
-		 * fallbacks (jit_sh-cpu.c _stxi_i / _ldxi_i, offsets past the
-		 * 1020-byte GBR displacement) allocate their own scratch with
-		 * jit_get_reg(). Lightning knows nothing about the pins, so
-		 * without this it can hand one out and clobber a guest
-		 * register. The non-GBR paths stage through R0 and never
-		 * allocate, which is why this only bites here. */
-		unsigned int pin;
-
-		for (pin = 0; pin < LIGHTREC_NUM_PINNED; pin++)
-			jit_reserve_reg(JIT_V(pin));  /* pins live at slot 0.. */
-	}
-#endif
+	/* Prevent lightning's own scratch allocation from taking a shared pin
+	 * or the permanent r13 address mask. */
+	lightrec_regcache_reserve_abi(_jit);
 
 	/* Pinned registers (regcache.c): the code-LUT entry is this fixed
 	 * stub of loads; a direct link enters just behind it with the pins
@@ -2110,7 +2596,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	}
 
 	block->function = new_fn;
-	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
+	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE | BLOCK_SH4_TEMPLATE);
 
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
@@ -2223,7 +2709,7 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		}
 	}
 
-	if (oldjit) {
+	if (oldjit || old_template) {
 		pr_debug("Block "X32_FMT" recompiled, reaping old jit context.\n",
 			 block->pc);
 
@@ -2232,14 +2718,18 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 			if (old_links)
 				lightrec_reaper_add(state->reaper,
 						    lightrec_reap_links, old_links);
-			lightrec_reaper_add(state->reaper,
-					    lightrec_reap_jit, oldjit);
-			lightrec_reaper_add(state->reaper,
-					    lightrec_reap_function, old_fn);
+			if (oldjit)
+				lightrec_reaper_add(state->reaper,
+						    lightrec_reap_jit, oldjit);
+			if (old_fn)
+				lightrec_reaper_add(state->reaper,
+						    lightrec_reap_function, old_fn);
 		} else {
 			lightrec_links_free_list(state, old_links);
-			_jit_destroy_state(oldjit);
-			lightrec_free_function(state, old_fn);
+			if (oldjit)
+				_jit_destroy_state(oldjit);
+			if (old_fn)
+				lightrec_free_function(state, old_fn);
 		}
 
 		lightrec_unregister(MEM_FOR_CODE, old_code_size);

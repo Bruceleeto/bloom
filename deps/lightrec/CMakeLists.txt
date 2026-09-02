@@ -12,6 +12,8 @@ list(APPEND LIGHTREC_SOURCES
 	memmanager.c
 	optimizer.c
 	regcache.c
+	sh4asm.c
+	sh4template.c
 )
 list(APPEND LIGHTREC_HEADERS
 	blockcache.h
@@ -26,6 +28,8 @@ list(APPEND LIGHTREC_HEADERS
 	optimizer.h
 	recompiler.h
 	regcache.h
+	sh4asm.h
+	sh4template.h
 )
 
 add_library(lightrec ${LIGHTREC_SOURCES} ${LIGHTREC_HEADERS})
