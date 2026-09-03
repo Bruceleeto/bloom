@@ -8,7 +8,7 @@ include(kallistios)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 if (NOT CMAKE_BUILD_TYPE)
-	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Type of build" FORCE)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Type of build" FORCE)
 	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
 		None Debug Release RelWithDebInfo MinSizeRel
 	)
