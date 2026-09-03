@@ -162,6 +162,31 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 	}
 }
 
+/*
+ * I_MASK, served straight from the register file with no clock
+ * transition: it is a plain mask the guest wrote itself, and nothing
+ * schedules against it.
+ *
+ * I_STAT and the DMA ICR are NOT safe here, though the commit this comes
+ * from included them. The transition is what advances psxRegs.cycle, and
+ * only then does the scheduler raise pending interrupts into I_STAT - so
+ * serving those raw leaves the guest polling a status that can never
+ * arrive, and it re-issues the transfer forever.
+ *
+ * A write can still expose a pending interrupt by unmasking it, so the
+ * exit flag is checked.
+ */
+static inline bool hw_is_irq_reg(u32 mem)
+{
+	return (mem & 0x1fff) == 0x1074;
+}
+
+static inline void hw_light_write_done(struct lightrec_state *state)
+{
+	if (has_interrupt())
+		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
+}
+
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
@@ -175,6 +200,11 @@ static void hw_write_byte(struct lightrec_state *state,
 static void hw_write_half(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	if (hw_is_irq_reg(mem)) {
+		psxHwWrite16(mem, val);
+		hw_light_write_done(state);
+		return;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite16(mem, val);
@@ -185,6 +215,11 @@ static void hw_write_half(struct lightrec_state *state,
 static void hw_write_word(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
+	if (hw_is_irq_reg(mem)) {
+		psxHwWrite32(mem, val);
+		hw_light_write_done(state);
+		return;
+	}
 	lightrec_tansition_to_pcsx(state);
 
 	psxHwWrite32(mem, val);
@@ -210,6 +245,8 @@ static u16 hw_read_half(struct lightrec_state *state,
 {
 	u16 val;
 
+	if (hw_is_irq_reg(mem))
+		return psxHu16(mem);
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead16(mem);
@@ -225,6 +262,8 @@ static u32 hw_read_word(struct lightrec_state *state,
 	static u32 old_cycle, oldold_cycle, old_gpusr;
 	u32 val, diff;
 
+	if (hw_is_irq_reg(mem))
+		return psxHu32(mem);
 	lightrec_tansition_to_pcsx(state);
 
 	val = psxHwRead32(mem);
