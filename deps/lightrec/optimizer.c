@@ -1840,6 +1840,28 @@ static int lightrec_flag_io(struct lightrec_state *state, struct block *block)
 				}
 			}
 
+			switch (list->i.op) {
+			case OP_SWL:
+			case OP_SWR:
+			case OP_LWL:
+			case OP_LWR:
+				/* The unaligned four only ever touch the word
+				 * that holds the address, and the byte offset
+				 * within it decides every shift and mask they
+				 * need.  When the low two bits of the address
+				 * are known the emitter can bake all of that
+				 * in, so record the offset here. */
+				list->flags &= ~LIGHTREC_ALIGN_MASK;
+
+				if ((v[list->i.rs].known & 0x3) == 0x3) {
+					val = v[list->i.rs].value + (s16) list->i.imm;
+					list->flags |= LIGHTREC_ALIGN((val & 0x3) + 1);
+				}
+				break;
+			default:
+				break;
+			}
+
 			if (!LIGHTREC_FLAGS_GET_IO_MODE(list->flags)
 			    && list->i.rs >= 28 && list->i.rs <= 29
 			    && !state->maps[PSX_MAP_KERNEL_USER_RAM].ops) {

@@ -29,6 +29,14 @@
 #define LIGHTREC_NO_MASK	BIT(4)
 #define LIGHTREC_LOAD_DELAY	BIT(5)
 
+/* Byte offset within the 32-bit word for LWL/LWR/SWL/SWR, when constant
+ * propagation could work it out: 0 means unknown, otherwise n + 1. */
+#define LIGHTREC_ALIGN_LSB	9
+#define LIGHTREC_ALIGN(x)	((x) << LIGHTREC_ALIGN_LSB)
+#define LIGHTREC_ALIGN_MASK	LIGHTREC_ALIGN(0x7)
+#define LIGHTREC_FLAGS_GET_ALIGN(x) \
+	(((x) & LIGHTREC_ALIGN_MASK) >> LIGHTREC_ALIGN_LSB)
+
 /* I/O mode for load/store opcodes */
 #define LIGHTREC_IO_MODE_LSB	6
 #define LIGHTREC_IO_MODE(x)	((x) << LIGHTREC_IO_MODE_LSB)

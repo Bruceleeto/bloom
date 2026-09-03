@@ -1729,18 +1729,428 @@ static void rec_SW(struct lightrec_cstate *state,
 		  jit_code_stxi_i, jit_code_bswapr_ui);
 }
 
+/* The unaligned four: LWL, LWR, SWL, SWR.
+ *
+ * All of them touch exactly one 32-bit word - the one that contains the
+ * address - and the byte offset n = addr & 3 within it decides everything
+ * else.  The four-entry tables the CPU manual gives for their masks are each
+ * one constant shifted by 8n, so there is no table and no branch:
+ *
+ *   LWL  rt  = (rt   & (0x00ffffff >> 8n))        | (word << (24 - 8n))
+ *   LWR  rt  = (rt   & (0xffffff00 << (24 - 8n))) | (word >>  8n)
+ *   SWL  mem = (word & (0xffffff00 << 8n))        | (rt   >> (24 - 8n))
+ *   SWR  mem = (word & (0x00ffffff >> (24 - 8n))) | (rt   <<  8n)
+ *
+ * Every shift distance lands in 0..24, so none of them is the shift by 32 that
+ * the host would refuse to do.
+ *
+ * When the optimizer knew the low two bits of the address it has recorded n in
+ * the opcode flags, and the whole thing collapses.  A store becomes the one or
+ * two sized stores that cover exactly the bytes it writes, with no word read
+ * at all; a load becomes one word load, one constant shift and a merge.
+ */
+
+static void rec_lut_invalidate(struct lightrec_cstate *cstate,
+			       const struct block *block, u8 addr_reg)
+{
+	const struct lightrec_state *state = cstate->state;
+	struct regcache *reg_cache = cstate->reg_cache;
+	jit_state_t *_jit = block->_jit;
+	u8 zero, tmp;
+
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	zero = lightrec_alloc_reg_in(reg_cache, _jit, 0, 0);
+
+	if (lut_is_32bit(state)) {
+		jit_add_state(tmp, addr_reg);
+		jit_stxi_i(lightrec_offset(code_lut), tmp, zero);
+	} else {
+		jit_lshi(tmp, addr_reg, 1);
+		jit_add_state(tmp, tmp);
+		jit_stxi(lightrec_offset(code_lut), tmp, zero);
+	}
+
+	lightrec_free_reg(reg_cache, zero);
+	lightrec_free_reg(reg_cache, tmp);
+}
+
+/* Leaves in @tmp the host address of the word the opcode touches, and, when
+ * the byte offset is not known at compile time, 8 * (addr & 3) in a freshly
+ * allocated temporary returned through @n8_reg (-1 otherwise). */
+static void rec_unaligned_addr(struct lightrec_cstate *cstate,
+			       const struct block *block, u16 offset,
+			       uintptr_t addr_offset, u32 addr_mask,
+			       bool invalidate, u32 lut_clamp,
+			       u8 tmp, s8 *n8_reg)
+{
+	struct regcache *reg_cache = cstate->reg_cache;
+	const struct opcode *op = &block->opcode_list[offset];
+	jit_state_t *_jit = block->_jit;
+	union code c = op->c;
+	u8 align = LIGHTREC_FLAGS_GET_ALIGN(op->flags);
+	bool no_mask = op_flag_no_mask(op->flags);
+	jit_word_t imm = (s16)c.i.imm;
+	u8 rs, addr_reg, tmp2;
+	u32 mask;
+
+	/* A known byte offset aligns the address for free, in the immediate. */
+	if (align)
+		imm -= align - 1;
+
+	mask = addr_mask & ~(u32)3;
+	if (no_mask && !invalidate)
+		mask = align ? 0 : ~(u32)3;
+
+	rs = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rs, 0);
+	addr_reg = rs;
+
+	if (imm) {
+		jit_addi(tmp, addr_reg, imm);
+		addr_reg = tmp;
+	}
+
+	if (align) {
+		*n8_reg = -1;
+	} else {
+		tmp2 = lightrec_alloc_reg_temp(reg_cache, _jit);
+		jit_andi(tmp2, addr_reg, 0x3);
+		jit_lshi(tmp2, tmp2, 3);
+		*n8_reg = (s8)tmp2;
+	}
+
+	if (mask) {
+		rec_and_mask(cstate, _jit, tmp, addr_reg, mask);
+		addr_reg = tmp;
+	}
+
+	if (addr_reg != tmp)
+		jit_movr(tmp, addr_reg);
+
+	lightrec_free_reg(reg_cache, rs);
+
+	if (invalidate) {
+		if (lut_clamp) {
+			/* The mask kept the scratchpad bit so the host address
+			 * stays valid for both regions, but a scratchpad
+			 * address would index way past the code LUT. Clamp
+			 * anything outside RAM to 0, as rec_store_direct does,
+			 * so it lands on a harmless entry. */
+			u8 lut_reg = lightrec_alloc_reg_temp(reg_cache, _jit);
+			u8 size_reg = lightrec_alloc_reg_temp_with_value(reg_cache,
+									_jit,
+									lut_clamp);
+
+			jit_ltr_u(lut_reg, tmp, size_reg);
+			jit_movnr(lut_reg, tmp, lut_reg);
+
+			/* Fold RAM mirrors onto the entry the base address
+			 * owns, as lut_offset() does, so the index can never
+			 * leave the LUT. */
+			jit_andi(lut_reg, lut_reg, RAM_SIZE - 1);
+
+			rec_lut_invalidate(cstate, block, lut_reg);
+
+			lightrec_free_reg(reg_cache, size_reg);
+			lightrec_free_reg(reg_cache, lut_reg);
+		} else {
+			rec_lut_invalidate(cstate, block, tmp);
+		}
+	}
+
+	if (addr_offset)
+		rec_add_offset(cstate, _jit, tmp, tmp, addr_offset);
+}
+
+static void rec_store_unaligned(struct lightrec_cstate *cstate,
+				const struct block *block, u16 offset,
+				uintptr_t addr_offset, u32 addr_mask,
+				bool invalidate, u32 lut_clamp)
+{
+	struct regcache *reg_cache = cstate->reg_cache;
+	const struct opcode *op = &block->opcode_list[offset];
+	jit_state_t *_jit = block->_jit;
+	union code c = op->c;
+	bool left = c.i.op == OP_SWL;
+	u8 align = LIGHTREC_FLAGS_GET_ALIGN(op->flags);
+	u8 rt, tmp, tmp2, tmp3, tmp4;
+	s8 n8;
+
+	jit_note(__FILE__, __LINE__);
+
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	rec_unaligned_addr(cstate, block, offset, addr_offset, addr_mask,
+			   invalidate, lut_clamp, tmp, &n8);
+
+	rt = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rt, 0);
+
+	if (align) {
+		/* Only the bytes the opcode covers are written, so a sized
+		 * store does the whole job and the word is never read. */
+		u8 n = align - 1;
+
+		if ((left && n == 3) || (!left && n == 0)) {
+			jit_stxi_i(0, tmp, rt);
+		} else if (left) {
+			tmp2 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+			if (n == 0) {
+				jit_rshi_u(tmp2, rt, 24);
+				jit_stxi_c(0, tmp, tmp2);
+			} else if (n == 1) {
+				jit_rshi_u(tmp2, rt, 16);
+				jit_stxi_s(0, tmp, tmp2);
+			} else {
+				jit_rshi_u(tmp2, rt, 8);
+				jit_stxi_s(0, tmp, tmp2);
+				jit_rshi_u(tmp2, rt, 24);
+				jit_stxi_c(2, tmp, tmp2);
+			}
+
+			lightrec_free_reg(reg_cache, tmp2);
+		} else if (n == 3) {
+			jit_stxi_c(3, tmp, rt);
+		} else if (n == 2) {
+			jit_stxi_s(2, tmp, rt);
+		} else {
+			tmp2 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+			jit_stxi_c(1, tmp, rt);
+			jit_rshi_u(tmp2, rt, 8);
+			jit_stxi_s(2, tmp, tmp2);
+
+			lightrec_free_reg(reg_cache, tmp2);
+		}
+
+		lightrec_free_reg(reg_cache, rt);
+		lightrec_free_reg(reg_cache, tmp);
+		return;
+	}
+
+	tmp2 = (u8)n8;
+	tmp3 = lightrec_alloc_reg_temp(reg_cache, _jit);
+	tmp4 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	if (left) {
+		jit_movi(tmp3, 0xffffff00);
+		jit_lshr(tmp3, tmp3, tmp2);		/* bytes to keep */
+		jit_rsbi(tmp2, tmp2, 24);
+		jit_rshr_u(tmp4, rt, tmp2);		/* bytes to write */
+	} else {
+		jit_lshr(tmp4, rt, tmp2);		/* bytes to write */
+		jit_rsbi(tmp2, tmp2, 24);
+		jit_movi(tmp3, 0x00ffffff);
+		jit_rshr_u(tmp3, tmp3, tmp2);		/* bytes to keep */
+	}
+
+	lightrec_free_reg(reg_cache, rt);
+
+	jit_ldxi_i(tmp2, tmp, 0);
+	jit_andr(tmp2, tmp2, tmp3);
+	jit_orr(tmp2, tmp2, tmp4);
+	jit_stxi_i(0, tmp, tmp2);
+
+	lightrec_free_reg(reg_cache, tmp4);
+	lightrec_free_reg(reg_cache, tmp3);
+	lightrec_free_reg(reg_cache, tmp2);
+	lightrec_free_reg(reg_cache, tmp);
+}
+
+static void rec_load_unaligned(struct lightrec_cstate *cstate,
+			       const struct block *block, u16 offset,
+			       uintptr_t addr_offset, u32 addr_mask)
+{
+	struct regcache *reg_cache = cstate->reg_cache;
+	const struct opcode *op = &block->opcode_list[offset];
+	bool load_delay = op_flag_load_delay(op->flags) && !cstate->no_load_delay;
+	jit_state_t *_jit = block->_jit;
+	union code c = op->c;
+	bool left = c.i.op == OP_LWL;
+	u8 align = LIGHTREC_FLAGS_GET_ALIGN(op->flags);
+	u8 rt, out, tmp, tmp2, tmp3, tmp4, out_reg;
+	s8 n8;
+
+	if (load_delay)
+		out_reg = REG_TEMP;
+	else if (c.i.rt)
+		out_reg = c.i.rt;
+	else
+		return;
+
+	jit_note(__FILE__, __LINE__);
+
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+	rec_unaligned_addr(cstate, block, offset, addr_offset, addr_mask,
+			   false, 0, tmp, &n8);
+
+	/* The opcode keeps the bytes it does not cover, so the destination is
+	 * read as well as written. */
+	rt = lightrec_alloc_reg_in(reg_cache, _jit, c.i.rt, 0);
+
+	if (align) {
+		u8 n = align - 1;
+		u32 keep = left ? 0x00ffffffu >> (8 * n)
+				: 0xffffff00u << (24 - 8 * n);
+		u8 shift = left ? 24 - 8 * n : 8 * n;
+
+		tmp2 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+		jit_ldxi_i(tmp2, tmp, 0);
+		if (shift && left)
+			jit_lshi(tmp2, tmp2, shift);
+		else if (shift)
+			jit_rshi_u(tmp2, tmp2, shift);
+
+		out = lightrec_alloc_reg_out(reg_cache, _jit, out_reg, 0);
+
+		if (keep) {
+			jit_andi(out, rt, keep);
+			jit_orr(out, out, tmp2);
+		} else {
+			jit_movr(out, tmp2);
+		}
+
+		lightrec_free_reg(reg_cache, tmp2);
+		lightrec_free_reg(reg_cache, rt);
+		lightrec_free_reg(reg_cache, out);
+		lightrec_free_reg(reg_cache, tmp);
+		return;
+	}
+
+	tmp2 = (u8)n8;
+	tmp3 = lightrec_alloc_reg_temp(reg_cache, _jit);
+	tmp4 = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_ldxi_i(tmp3, tmp, 0);
+	lightrec_free_reg(reg_cache, tmp);
+
+	if (left) {
+		jit_rsbi(tmp4, tmp2, 24);
+		jit_lshr(tmp3, tmp3, tmp4);		/* bytes loaded */
+		jit_movi(tmp4, 0x00ffffff);
+		jit_rshr_u(tmp4, tmp4, tmp2);		/* bytes kept */
+	} else {
+		jit_rshr_u(tmp3, tmp3, tmp2);		/* bytes loaded */
+		jit_rsbi(tmp2, tmp2, 24);
+		jit_movi(tmp4, 0xffffff00);
+		jit_lshr(tmp4, tmp4, tmp2);		/* bytes kept */
+	}
+
+	out = lightrec_alloc_reg_out(reg_cache, _jit, out_reg, 0);
+
+	jit_andr(out, rt, tmp4);
+	jit_orr(out, out, tmp3);
+
+	lightrec_free_reg(reg_cache, tmp4);
+	lightrec_free_reg(reg_cache, tmp3);
+	lightrec_free_reg(reg_cache, tmp2);
+	lightrec_free_reg(reg_cache, rt);
+	lightrec_free_reg(reg_cache, out);
+}
+
+static u32 rec_direct_ram_size(const struct lightrec_state *state)
+{
+	return state->mirrors_mapped ? RAM_SIZE * 4 : RAM_SIZE;
+}
+
+/* The inline sequences are written for a 32-bit little-endian host; anything
+ * else keeps the C round-trip. */
+static bool rec_can_inline_unaligned(void)
+{
+	return __WORDSIZE == 32 && !is_big_endian();
+}
+
+static void rec_swlr(struct lightrec_cstate *state,
+		     const struct block *block, u16 offset)
+{
+	const struct lightrec_state *lstate = state->state;
+	u32 flags = block->opcode_list[offset].flags;
+	bool no_invalidate = op_flag_no_invalidate(flags) ||
+		(lstate->opt_flags & LIGHTREC_OPT_INV_DMA_ONLY);
+
+	if (rec_can_inline_unaligned()) {
+		switch (LIGHTREC_FLAGS_GET_IO_MODE(flags)) {
+		case LIGHTREC_IO_RAM:
+			rec_store_unaligned(state, block, offset,
+					    lstate->offset_ram,
+					    rec_ram_mask(lstate),
+					    !no_invalidate, 0);
+			return;
+		case LIGHTREC_IO_SCRATCH:
+			rec_store_unaligned(state, block, offset,
+					    lstate->offset_scratch,
+					    0x1fffffff, false, 0);
+			return;
+		case LIGHTREC_IO_DIRECT:
+			/* Address is not known at compile time but is proven
+			 * not to be I/O. With a perfect map one mask covers
+			 * both RAM and scratchpad, so no runtime branch is
+			 * needed - only the LUT clamp. */
+			if (lstate->offset_ram != lstate->offset_scratch)
+				break;
+
+			rec_store_unaligned(state, block, offset,
+					    lstate->offset_ram,
+					    0x1f800000 | (rec_direct_ram_size(lstate) - 1),
+					    !no_invalidate,
+					    rec_direct_ram_size(lstate));
+			return;
+		default:
+			break;
+		}
+	}
+
+	rec_io(state, block, offset, true, false);
+}
+
+static void rec_lwlr(struct lightrec_cstate *state,
+		     const struct block *block, u16 offset)
+{
+	const struct lightrec_state *lstate = state->state;
+	u32 flags = block->opcode_list[offset].flags;
+
+	if (rec_can_inline_unaligned()) {
+		switch (LIGHTREC_FLAGS_GET_IO_MODE(flags)) {
+		case LIGHTREC_IO_RAM:
+			rec_load_unaligned(state, block, offset,
+					   lstate->offset_ram,
+					   rec_ram_mask(lstate));
+			return;
+		case LIGHTREC_IO_BIOS:
+			rec_load_unaligned(state, block, offset,
+					   lstate->offset_bios, 0x1fffffff);
+			return;
+		case LIGHTREC_IO_SCRATCH:
+			rec_load_unaligned(state, block, offset,
+					   lstate->offset_scratch, 0x1fffffff);
+			return;
+		case LIGHTREC_IO_DIRECT:
+			if (lstate->offset_ram != lstate->offset_scratch)
+				break;
+
+			rec_load_unaligned(state, block, offset,
+					   lstate->offset_ram,
+					   0x1f800000 | (rec_direct_ram_size(lstate) - 1));
+			return;
+		default:
+			break;
+		}
+	}
+
+	rec_io(state, block, offset, true, true);
+}
+
 static void rec_SWL(struct lightrec_cstate *state,
 		    const struct block *block, u16 offset)
 {
 	_jit_name(block->_jit, __func__);
-	rec_io(state, block, offset, true, false);
+	rec_swlr(state, block, offset);
 }
 
 static void rec_SWR(struct lightrec_cstate *state,
 		    const struct block *block, u16 offset)
 {
 	_jit_name(block->_jit, __func__);
-	rec_io(state, block, offset, true, false);
+	rec_swlr(state, block, offset);
 }
 
 static void rec_load_memory(struct lightrec_cstate *cstate,
@@ -2058,13 +2468,13 @@ static void rec_LHU(struct lightrec_cstate *state, const struct block *block, u1
 static void rec_LWL(struct lightrec_cstate *state, const struct block *block, u16 offset)
 {
 	_jit_name(block->_jit, __func__);
-	rec_io(state, block, offset, true, true);
+	rec_lwlr(state, block, offset);
 }
 
 static void rec_LWR(struct lightrec_cstate *state, const struct block *block, u16 offset)
 {
 	_jit_name(block->_jit, __func__);
-	rec_io(state, block, offset, true, true);
+	rec_lwlr(state, block, offset);
 }
 
 static void rec_LW(struct lightrec_cstate *state, const struct block *block, u16 offset)
