@@ -175,7 +175,7 @@ struct gte_hot {
 	u32 xmtrx_col_serial;
 } __attribute__((aligned(32)));
 
-static struct gte_hot gte_hot = { .xmtrx_key = -1, .xmtrx_mx = -1 };
+struct gte_hot gte_hot = { .xmtrx_key = -1, .xmtrx_mx = -1 };
 
 #define gte_flag	(gte_hot.flag)
 
@@ -350,7 +350,7 @@ struct gte_col_cache {
 } __attribute__((aligned(32)));
 
 static struct gte_rot_cache gte_rot[3];
-static struct gte_col_cache gte_col[3][4];
+struct gte_col_cache gte_col[3][4];
 static u32 gte_mtx_serial;
 
 #ifdef GTE_CACHE_STATS
@@ -464,7 +464,7 @@ static void gte_col_load(const float *t);
 #define gte_xmtrx_mx		(gte_hot.xmtrx_mx)
 #define gte_xmtrx_serial	(gte_hot.xmtrx_serial)
 
-static __attribute__((noinline)) void
+__attribute__((noinline)) void
 gte_mtx_use_slow(const psxCP2Regs *r, int mx, int cv, int key)
 {
 	struct gte_rot_cache *rc = &gte_rot[mx];
@@ -1089,6 +1089,25 @@ __attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
 	gte_rtpt_asm(r, &gte_hot);
 }
 
+/*
+ * The entry points the generated code calls (src/gte_rtp.S) do the cache
+ * check themselves and come here only when it fails.
+ */
+#ifndef GTE_FAST
+#define GTE_FAST 31
+#endif
+void gte_rtps_fast(psxCP2Regs *r);
+void gte_rtpt_fast(psxCP2Regs *r);
+void gte_mvmva_fast(psxCP2Regs *r, u32 op);
+void gte_dpcs_fast(psxCP2Regs *r, u32 op);
+void gte_intpl_fast(psxCP2Regs *r, u32 op);
+
+void gte_rtp_slow(psxCP2Regs *r)
+{
+	gte_mtx_use_slow(r, GTE_MTX_ROT, 0, 0);
+	gte_offsets(r);
+}
+
 #define gte_fpu_rtps gte_fpu_rtps_c
 #define gte_fpu_rtpt gte_fpu_rtpt_c
 #endif
@@ -1163,6 +1182,8 @@ static u32 gte_st_seed = 0x2545f491;
 
 static void gte_mvmva(psxCP2Regs *r, u32 op);
 static void gte_mvmva_c(psxCP2Regs *r, u32 op);
+static void gte_dpcs(psxCP2Regs *r, u32 op);
+static void gte_intpl(psxCP2Regs *r, u32 op);
 
 static u32 gte_st_rnd(void)
 {
@@ -1216,6 +1237,11 @@ static void gte_st_fill(psxCP2Regs *r)
 		((s32 *)r->CP2C.r)[i] = gte_st_val(16, 31);
 	for (i = 9; i < 12; i++)
 		r->CP2D.p[i].sw.l = gte_st_val(11, 15);
+	r->CP2D.p[8].sw.l = (gte_st_rnd() & 7) ? (gte_st_rnd() & 0x1fff)
+					     : gte_st_val(15, 15);
+	r->CP2D.r[6] = gte_st_rnd();
+	for (i = 20; i < 23; i++)
+		r->CP2D.r[i] = gte_st_rnd();
 	((s32 *)r->CP2C.r)[24] = gte_st_val(25, 31);
 	((s32 *)r->CP2C.r)[25] = gte_st_val(25, 31);
 	r->CP2C.p[26].w.l = (gte_st_rnd() & 7) ? (gte_st_rnd() & 0x7ff)
@@ -1228,7 +1254,7 @@ static void gte_st_fill(psxCP2Regs *r)
 static int gte_st_run(int which, int n)
 {
 	static psxCP2Regs a, b;
-	static const char *names[] = { "RTPS", "RTPT", "MVMVA" };
+	static const char *names[] = { "RTPS", "RTPT", "MVMVA", "DPCS", "INTPL" };
 	int i, bad = 0;
 	u32 op = 0;
 
@@ -1241,9 +1267,16 @@ static int gte_st_run(int which, int n)
 			u32 x = gte_st_rnd();
 			op = (1u << 19) | (((x % 3) & 3) << 17) |
 			     (((x >> 4) & 3) << 15) | (((x >> 8) & 3) << 13);
+		} else if (which >= 3) {
+			u32 x = gte_st_rnd();
+			op = ((x & 1) << 19) | (((x >> 1) & 1) << 10);
 		}
 
-		if (which == 2)
+		if (which == 3)
+			gte_dpcs(&a, op);
+		else if (which == 4)
+			gte_intpl(&a, op);
+		else if (which == 2)
 			gte_mvmva_c(&a, op);
 		else if (which)
 			gte_fpu_rtpt_c(&a);
@@ -1251,12 +1284,16 @@ static int gte_st_run(int which, int n)
 			gte_fpu_rtps_c(&a);
 		u32 fa = gte_hot.flag;
 
-		if (which == 2)
-			gte_mvmva(&b, op);
+		if (which == 3)
+			gte_dpcs_fast(&b, op);
+		else if (which == 4)
+			gte_intpl_fast(&b, op);
+		else if (which == 2)
+			gte_mvmva_fast(&b, op);
 		else if (which)
-			gte_fpu_rtpt(&b);
+			gte_rtpt_fast(&b);
 		else
-			gte_fpu_rtps(&b);
+			gte_rtps_fast(&b);
 		u32 fb = gte_hot.flag;
 
 		if (memcmp(&a, &b, sizeof(a)) || fa != fb) {
@@ -1282,7 +1319,7 @@ static int gte_st_run(int which, int n)
 static void gte_rtp_selftest(void)
 {
 	static int done;
-	int bs, bt, bm;
+	int bs, bt, bm, bd, bi;
 
 	if (done)
 		return;
@@ -1316,8 +1353,10 @@ static void gte_rtp_selftest(void)
 	bs = gte_st_run(0, 4000);
 	bt = gte_st_run(1, 4000);
 	bm = gte_st_run(2, 4000);
-	printf("GTE selftest: RTPS %d/4000 bad, RTPT %d/4000 bad, MVMVA %d/4000 bad\n",
-	       bs, bt, bm);
+	bd = gte_st_run(3, 4000);
+	bi = gte_st_run(4, 4000);
+	printf("GTE selftest: RTPS %d/4000 bad, RTPT %d/4000 bad, MVMVA %d/4000 bad, DPCS %d/4000 bad, INTPL %d/4000 bad\n",
+	       bs, bt, bm, bd, bi);
 }
 #endif
 #endif
@@ -1528,6 +1567,61 @@ GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
 
 #ifdef __sh__
 #undef gte_mvmva
+
+void gte_mvmva_slow(psxCP2Regs *r, u32 op)
+{
+	gte_mvmva_c(r, op);
+}
+
+#ifdef GTE_SHADOW
+/*
+ * Every call from the generated code runs the C reference on a copy of the
+ * file first, then the assembly on the real one, and prints the first few
+ * disagreements with the op word.  A crash with no disagreement printed is
+ * a calling-contract bug, not a value bug.
+ */
+static int gte_shadow_bad;
+static void gte_dpcs(psxCP2Regs *r, u32 op);
+static void gte_intpl(psxCP2Regs *r, u32 op);
+
+static void gte_shadow_cmp(const char *name, u32 op, const psxCP2Regs *a,
+			   const psxCP2Regs *b, u32 fa, u32 fb)
+{
+	int k;
+
+	if (!memcmp(a, b, sizeof(*a)) && fa == fb)
+		return;
+	if (++gte_shadow_bad > 8)
+		return;
+	printf("GTE shadow %s op %08x: flag %08x vs %08x\n", name, op, fa, fb);
+	for (k = 0; k < 64; k++)
+		if (((u32 *)a)[k] != ((u32 *)b)[k])
+			printf("  r%d: %08x vs %08x\n", k, ((u32 *)a)[k], ((u32 *)b)[k]);
+}
+
+#define GTE_SHADOW_FN(name, cfn, afn, ...)				\
+static void gte_shadow_##name(psxCP2Regs *r, u32 op)			\
+{									\
+	static psxCP2Regs copy;						\
+	u32 fa, fb;							\
+	copy = *r;							\
+	cfn(&copy, ##__VA_ARGS__);					\
+	fa = gte_hot.flag;						\
+	afn(r, ##__VA_ARGS__);						\
+	fb = gte_hot.flag;						\
+	gte_shadow_cmp(#name, op, &copy, r, fa, fb);			\
+}
+
+static void gte_rtps_c_op(psxCP2Regs *r, u32 op) { (void)op; gte_fpu_rtps_c(r); }
+static void gte_rtpt_c_op(psxCP2Regs *r, u32 op) { (void)op; gte_fpu_rtpt_c(r); }
+static void gte_rtps_a_op(psxCP2Regs *r, u32 op) { (void)op; gte_rtps_fast(r); }
+static void gte_rtpt_a_op(psxCP2Regs *r, u32 op) { (void)op; gte_rtpt_fast(r); }
+GTE_SHADOW_FN(rtps, gte_rtps_c_op, gte_rtps_a_op, op)
+GTE_SHADOW_FN(rtpt, gte_rtpt_c_op, gte_rtpt_a_op, op)
+GTE_SHADOW_FN(mvmva, gte_mvmva_c, gte_mvmva_fast, op)
+GTE_SHADOW_FN(dpcs, gte_dpcs, gte_dpcs_fast, op)
+GTE_SHADOW_FN(intpl, gte_intpl, gte_intpl_fast, op)
+#endif
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1934,12 +2028,20 @@ gte_intpl(psxCP2Regs *r, u32 op)
 static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 {
 	switch (op & 0x3f) {
+#ifdef __sh__
+	case 0x01: gte_rtps_fast(r); break;
+	case 0x10: gte_dpcs_fast(r, op); break;
+	case 0x11: gte_intpl_fast(r, op); break;
+	case 0x12: gte_mvmva_fast(r, op); break;
+	case 0x30: gte_rtpt_fast(r); break;
+#else
 	case 0x01: gte_fpu_rtps(r); break;
 	case 0x06: gte_nclip(r); break;
 	case 0x0c: gte_op(r, op); break;
 	case 0x10: gte_dpcs(r, op); break;
 	case 0x11: gte_intpl(r, op); break;
 	case 0x12: gte_mvmva(r, op); break;
+#endif
 	case 0x13: gte_ncds(r); break;
 	case 0x14: gte_cdp(r); break;
 	case 0x16: gte_ncdt(r); break;
@@ -1952,7 +2054,9 @@ static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 	case 0x2a: gte_dpct(r); break;
 	case 0x2d: gte_avsz3(r); break;
 	case 0x2e: gte_avsz4(r); break;
+#ifndef __sh__
 	case 0x30: gte_fpu_rtpt(r); break;
+#endif
 	case 0x3d: gte_gpf(r, op); break;
 	case 0x3e: gte_gpl(r, op); break;
 	case 0x3f: gte_ncct(r); break;
@@ -2013,12 +2117,28 @@ void gte_fpu_cmd(psxCP2Regs *r, u32 op)
 void *gte_fpu_resolve(u32 op)
 {
 	switch (op & 0x3f) {
+#ifdef GTE_SHADOW
+	case 0x01: return (void *)gte_shadow_rtps;
+	case 0x10: return (void *)gte_shadow_dpcs;
+	case 0x11: return (void *)gte_shadow_intpl;
+	case 0x12: return (void *)gte_shadow_mvmva;
+	case 0x30: return (void *)gte_shadow_rtpt;
+#elif defined(__sh__)
+	case 0x01: return (void *)(GTE_FAST & 1 ? gte_rtps_fast : gte_fpu_rtps);
+	case 0x10: return (void *)(GTE_FAST & 2 ? gte_dpcs_fast : gte_dpcs);
+	case 0x11: return (void *)(GTE_FAST & 4 ? gte_intpl_fast : gte_intpl);
+	case 0x12: return (void *)(GTE_FAST & 8 ? gte_mvmva_fast : gte_mvmva);
+	case 0x30: return (void *)(GTE_FAST & 16 ? gte_rtpt_fast : gte_fpu_rtpt);
+#else
 	case 0x01: return (void *)gte_fpu_rtps;
+#endif
 	case 0x06: return (void *)gte_nclip_cmd;
 	case 0x0c: return (void *)gte_op;
+#ifndef __sh__
 	case 0x10: return (void *)gte_dpcs;
 	case 0x11: return (void *)gte_intpl;
 	case 0x12: return (void *)gte_mvmva;
+#endif
 	case 0x13: return (void *)gte_ncds;
 	case 0x14: return (void *)gte_cdp;
 	case 0x16: return (void *)gte_ncdt;
@@ -2031,7 +2151,9 @@ void *gte_fpu_resolve(u32 op)
 	case 0x2a: return (void *)gte_dpct;
 	case 0x2d: return (void *)gte_avsz3;
 	case 0x2e: return (void *)gte_avsz4;
+#ifndef __sh__
 	case 0x30: return (void *)gte_fpu_rtpt;
+#endif
 	case 0x3d: return (void *)gte_gpf;
 	case 0x3e: return (void *)gte_gpl;
 	case 0x3f: return (void *)gte_ncct;

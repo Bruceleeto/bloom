@@ -611,3 +611,512 @@ _gte_rot_convert:
 	.align	2
 1:	.long	0x39800000
 	.size	_gte_rot_convert, . - _gte_rot_convert
+
+/* ------------------------------------------------------------------ */
+/* Entry points the generated code calls directly                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The C wrappers cost 30-60 instructions of decode, cache check and call
+ * frame per command; on Spyro that was 1.5% of the frame.  These do the
+ * two-compare hot check themselves (gte_mtx_use's contract: the column entry
+ * was checked at this generation and XMTRX holds this pair) and fall straight
+ * into the body, calling C only when the check fails.
+ *
+ *   gte_hot:  flag @0, ofx @4, ofy @8, ofs_gen @12, xmtrx_key @16
+ *   gte_col:  32 bytes per (matrix, column) entry, gen @16
+ */
+
+/* RTPS/RTPT: matrix 0, column 0 (key 0), and the offsets must be current.
+ * Leaves r4 = file, r5 = &gte_hot for RTP_ENTER. */
+.macro RTP_CHECK
+	mov.l	10f, r1
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	11f, r0
+	mov.l	@(16, r0), r2		/* gte_col[0][0].gen */
+	cmp/eq	r1, r2
+	bf	8f
+	mov.l	12f, r5
+	mov.l	@(16, r5), r2		/* xmtrx_key */
+	tst	r2, r2
+	bf	8f
+	mov.l	@(12, r5), r2		/* ofs_gen */
+	cmp/eq	r1, r2
+	bt	9f
+8:	sts.l	pr, @-r15
+	mov.l	r4, @-r15
+	mov.l	13f, r1
+	jsr	@r1			/* gte_rtp_slow(file) */
+	 nop
+	mov.l	@r15+, r4
+	lds.l	@r15+, pr
+	mov.l	12f, r5
+	bra	9f
+	 nop
+	.align	2
+10:	.long	_psxCP2CtrlGen
+11:	.long	_gte_col
+12:	.long	_gte_hot
+13:	.long	_gte_rtp_slow
+9:
+.endm
+
+	.balign	4
+	.global	_gte_rtps_fast
+	.type	_gte_rtps_fast, @function
+_gte_rtps_fast:
+	RTP_CHECK
+	mov.l	1f, r0
+	jmp	@r0
+	 nop
+	.align	2
+1:	.long	_gte_rtps_asm
+	.size	_gte_rtps_fast, . - _gte_rtps_fast
+
+	.balign	4
+	.global	_gte_rtpt_fast
+	.type	_gte_rtpt_fast, @function
+_gte_rtpt_fast:
+	RTP_CHECK
+	mov.l	1f, r0
+	jmp	@r0
+	 nop
+	.align	2
+1:	.long	_gte_rtpt_asm
+	.size	_gte_rtpt_fast, . - _gte_rtpt_fast
+
+/*
+ * MVMVA: r4 = file, r5 = the op word.  sf=1, a real matrix and lm=0 go to
+ * the body above (r5 = vector, r6 = stride, r7 = &gte_hot); anything else is
+ * the reference's C.
+ */
+	.balign	4
+	.global	_gte_mvmva_fast
+	.type	_gte_mvmva_fast, @function
+_gte_mvmva_fast:
+	mov.l	20f, r0			/* sf */
+	tst	r0, r5
+	bt	8f
+	mov.w	21f, r0			/* lm */
+	tst	r0, r5
+	bf	8f
+	mov	r5, r0
+	shlr16	r0
+	shlr	r0
+	and	#3, r0			/* mx */
+	cmp/eq	#3, r0
+	bt	8f
+	mov	r0, r6
+	mov	r5, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0			/* cv */
+	mov	r0, r7
+	mov	r6, r1
+	shll2	r1
+	add	r0, r1			/* key */
+	mov.l	10f, r2
+	mov.l	@r2, r2			/* gen */
+	mov	r1, r0
+	shll2	r0
+	shll2	r0
+	shll	r0
+	mov.l	11f, r3
+	add	r3, r0
+	mov.l	@(16, r0), r3		/* gte_col[mx][cv].gen */
+	cmp/eq	r2, r3
+	bf	7f
+	mov.l	12f, r3
+	mov.l	@(16, r3), r2		/* xmtrx_key */
+	cmp/eq	r1, r2
+	bf	7f
+6:	mov	r5, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0			/* v */
+	cmp/eq	#3, r0
+	bt	5f
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	mov	r0, r5			/* V0..2: three halfwords in a row */
+	mov	#2, r6
+	mov.l	12f, r7
+	mov.l	13f, r0
+	jmp	@r0
+	 nop
+5:	mov	r4, r5
+	add	#36, r5			/* IR1..3: every four bytes */
+	mov	#4, r6
+	mov.l	12f, r7
+	mov.l	13f, r0
+	jmp	@r0
+	 nop
+7:	sts.l	pr, @-r15
+	mov.l	r5, @-r15
+	mov.l	r4, @-r15
+	mov	r6, r5
+	mov	r7, r6
+	mov	r1, r7
+	mov.l	14f, r1
+	jsr	@r1			/* gte_mtx_use_slow(file, mx, cv, key) */
+	 nop
+	mov.l	@r15+, r4
+	mov.l	@r15+, r5
+	lds.l	@r15+, pr
+	bra	6b
+	 nop
+8:	mov.l	15f, r1
+	jmp	@r1			/* gte_mvmva_slow(file, op) */
+	 nop
+	.align	2
+10:	.long	_psxCP2CtrlGen
+11:	.long	_gte_col
+12:	.long	_gte_hot
+13:	.long	_gte_mvmva_asm
+14:	.long	_gte_mtx_use_slow
+15:	.long	_gte_mvmva_slow
+20:	.long	0x80000
+21:	.word	0x400
+	.size	_gte_mvmva_fast, . - _gte_mvmva_fast
+
+/* ------------------------------------------------------------------ */
+/* DPCS / INTPL - the depth cue, which Spyro runs on every vertex       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The reference's arithmetic, with its 64-bit bounds checks done the SH-4
+ * way: `subv` reports the subtraction overflowing 32 bits, and a shift that
+ * left 32 bits is one that does not shift back.  gcc emulated the s64 shifts
+ * with subc/shld chains and branched on the shift amount - ~210 instructions
+ * per DPCS.  The values are the same either way; only the flags need the
+ * checks, so they live in the stubs.
+ *
+ * Register plan for both:
+ *   r2  file + 32   IR0 @0, IR1..3 @4/8/12
+ *   r6  file + 64   RGB0..2 @16/20/24, MAC1..3 @36/40/44
+ *   r9  file + 212  RFC/GFC/BFC @0/4/8
+ *   r3  flags   r7  IR0   r12  the colour word being built
+ *   r5  DPCS: the extra shift (12 when sf=0, else 0), r14 = -r5
+ *       INTPL: the final shift (-12 when sf=1, else 0), r13 = lm's low bound
+ *   r8  DPCS: the RGB word
+ */
+
+/* limC(mac >> 4) into byte \n of r12; r10 = mac */
+.macro RGB_BYTE n, fC
+	mov	r10, r0
+	mov	#-4, r11
+	shad	r11, r0
+	mov.w	80f, r11
+	cmp/hi	r11, r0
+	bt	49f
+50:
+.if \n == 0
+	mov	r0, r12
+.elseif \n == 1
+	shll8	r0
+	or	r0, r12
+.else
+	shll16	r0
+	or	r0, r12
+.endif
+	bra	99f
+	 nop
+49:	mov.l	\fC, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	54f
+	bra	50b
+	 mov	#0, r0
+54:	mov.w	80f, r0
+	bra	50b
+	 nop
+.endm
+
+/* One DPCS component: X = colour byte \n */
+.macro DPCS_COMP n, fcoff, macoff, iroff, fAneg, fApos, fB, fC
+	mov	r8, r1
+.if \n == 1
+	shlr8	r1
+.elseif \n == 2
+	shlr16	r1
+.endif
+	extu.b	r1, r1			/* X */
+	mov	r1, r10
+	shll2	r10
+	shll2	r10			/* X << 4 */
+	mov.l	@(\fcoff, r9), r0
+	subv	r10, r0			/* t = FC - (X << 4), T on overflow */
+	bt	41f
+42:	mov	r0, r10
+	shld	r5, r0			/* t << (12 - shift) */
+	mov	r0, r11
+	shad	r14, r11
+	cmp/eq	r10, r11		/* did it survive the shift? */
+	bf	43f
+44:	exts.w	r0, r11
+	cmp/eq	r0, r11
+	bf	45f			/* limB */
+46:	mul.l	r11, r7			/* IR0 * lim */
+	mov	r1, r0
+	shll16	r0			/* X << 16 */
+	sts	macl, r11
+	add	r11, r0
+	mov	#-12, r11
+	shad	r11, r0			/* MAC */
+	mov.l	r0, @(\macoff, r6)
+	mov	r0, r10
+	exts.w	r0, r11
+	cmp/eq	r0, r11
+	bf	47f			/* IR = limB(MAC) */
+48:	mov.w	r0, @(\iroff, r2)
+	RGB_BYTE \n, \fC
+
+	/* the subtraction overflowed: X<<4 >= 0, so it went negative */
+41:	mov.l	\fAneg, r11
+	or	r11, r3
+	bra	42b
+	 nop
+	/* the shift overflowed: the sign of t says which way */
+43:	cmp/pz	r10
+	bt	51f
+	mov.l	\fAneg, r11
+	or	r11, r3
+	bra	44b
+	 nop
+51:	mov.l	\fApos, r11
+	or	r11, r3
+	bra	44b
+	 nop
+	/* limB on the shifted t: bound into r11 */
+45:	mov.l	\fB, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	52f
+	mov.w	82f, r11
+	bra	46b
+	 nop
+52:	mov.w	81f, r11
+	bra	46b
+	 nop
+	/* limB on MAC for IR: bound into r0 */
+47:	mov.l	\fB, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	53f
+	mov.w	82f, r0
+	bra	48b
+	 nop
+53:	mov.w	81f, r0
+	bra	48b
+	 nop
+80:	.word	255
+81:	.word	0x7fff
+82:	.word	0x8000
+	.align	2
+99:
+.endm
+
+/* One INTPL component: X = IR\n+1 */
+.macro INTPL_COMP n, fcoff, macoff, iroff, fAneg, fApos, fB, fC
+	mov.w	@(\iroff, r2), r0
+	mov	r0, r1			/* X = IRn */
+	mov.l	@(\fcoff, r9), r0
+	subv	r1, r0			/* t = FC - IRn */
+	bt	41f
+42:	exts.w	r0, r11
+	cmp/eq	r0, r11
+	bf	45f			/* limB */
+46:	mul.l	r11, r7			/* IR0 * lim */
+	mov	r1, r0
+	mov	#12, r11
+	shld	r11, r0			/* IRn << 12 */
+	sts	macl, r11
+	add	r11, r0
+	shad	r5, r0			/* >> 12 when sf */
+	mov.l	r0, @(\macoff, r6)
+	mov	r0, r10
+	mov.w	81f, r11
+	cmp/gt	r11, r0
+	bt	47f
+	cmp/ge	r13, r0
+	bf	55f			/* IR = lim(MAC), lm's low bound */
+48:	mov.w	r0, @(\iroff, r2)
+	RGB_BYTE \n, \fC
+
+	/* FC - IRn overflowed: IRn > 0 means it went negative, and IRn < 0
+	 * would need FC near INT_MAX, which the positive check covers */
+41:	cmp/pz	r1
+	bf	56f
+	mov.l	\fAneg, r11
+	or	r11, r3
+	bra	42b
+	 nop
+56:	mov.l	\fApos, r11
+	or	r11, r3
+	bra	42b
+	 nop
+45:	mov.l	\fB, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	52f
+	mov.w	82f, r11
+	bra	46b
+	 nop
+52:	mov.w	81f, r11
+	bra	46b
+	 nop
+47:	mov.l	\fB, r11
+	or	r11, r3
+	mov.w	81f, r0
+	bra	48b
+	 nop
+55:	mov.l	\fB, r11
+	or	r11, r3
+	bra	48b
+	 mov	r13, r0
+80:	.word	255
+81:	.word	0x7fff
+82:	.word	0x8000
+	.align	2
+99:
+.endm
+
+/* The colour FIFO shift, RGB2 from r12 + the old CODE, FLAG out, return.
+ * Pops r8..r14. */
+.macro RGB_LEAVE
+	mov.l	@(20, r6), r0
+	mov.l	r0, @(16, r6)		/* RGB0 = RGB1 */
+	mov.l	@(24, r6), r0
+	mov.l	r0, @(20, r6)		/* RGB1 = RGB2 */
+	mov.l	@(24, r4), r0
+	shlr16	r0
+	shlr8	r0
+	shll16	r0
+	shll8	r0			/* CODE << 24 */
+	or	r12, r0
+	mov.l	r0, @(24, r6)		/* RGB2 */
+	mov.l	90f, r0
+	mov.l	r3, @r0			/* gte_hot.flag */
+	mov.w	91f, r0
+	mov.l	r3, @(r0, r4)		/* FLAG */
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	rts
+	 mov.l	@r15+, r8
+91:	.word	252
+	.align	2
+90:	.long	_gte_hot
+.endm
+
+.macro CUE_ENTER
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov.w	92f, r9
+	add	r4, r9
+	mov	#0, r3
+	mov.w	@r2, r7			/* IR0 */
+.endm
+
+	.balign	4
+	.global	_gte_dpcs_fast
+	.type	_gte_dpcs_fast, @function
+_gte_dpcs_fast:
+	CUE_ENTER
+	mov.l	93f, r0
+	tst	r0, r5			/* T = (sf == 0) */
+	movt	r5
+	shll2	r5
+	mov	r5, r0
+	add	r0, r5
+	add	r0, r5			/* 12 when sf == 0, else 0 */
+	neg	r5, r14
+	mov.l	@(24, r4), r8		/* RGB */
+	bra	1f
+	 nop
+92:	.word	212
+	.align	2
+93:	.long	0x80000
+1:
+	DPCS_COMP 0, 0, 36, 4,  60f, 61f, 62f, 63f
+	DPCS_COMP 1, 4, 40, 8,  64f, 65f, 66f, 67f
+	DPCS_COMP 2, 8, 44, 12, 68f, 69f, 70f, 71f
+	RGB_LEAVE
+	.align	2
+60:	.long	0x88000000		/* A1 negative */
+61:	.long	0x40000000		/* A1 positive */
+62:	.long	0x81000000		/* limB1 */
+63:	.long	0x00200000		/* limC1 */
+64:	.long	0x84000000
+65:	.long	0x20000000
+66:	.long	0x80800000
+67:	.long	0x00100000
+68:	.long	0x82000000
+69:	.long	0x10000000
+70:	.long	0x00400000
+71:	.long	0x00080000
+	.size	_gte_dpcs_fast, . - _gte_dpcs_fast
+
+	.balign	4
+	.global	_gte_intpl_fast
+	.type	_gte_intpl_fast, @function
+_gte_intpl_fast:
+	CUE_ENTER
+	mov.w	94f, r0
+	tst	r0, r5			/* T = (lm == 0) */
+	movt	r13
+	neg	r13, r13		/* -1 when lm == 0 */
+	mov.w	95f, r0
+	and	r0, r13			/* -0x8000 when lm == 0, else 0 */
+	mov.l	93f, r0
+	tst	r0, r5			/* T = (sf == 0) */
+	movt	r5
+	add	#-1, r5			/* -1 when sf, else 0 */
+	shll2	r5
+	mov	r5, r0
+	add	r0, r5
+	add	r0, r5			/* -12 when sf, else 0 */
+	bra	1f
+	 nop
+92:	.word	212
+94:	.word	0x400
+95:	.word	0x8000
+	.align	2
+93:	.long	0x80000
+1:
+	INTPL_COMP 0, 0, 36, 4,  60f, 61f, 62f, 63f
+	INTPL_COMP 1, 4, 40, 8,  64f, 65f, 66f, 67f
+	INTPL_COMP 2, 8, 44, 12, 68f, 69f, 70f, 71f
+	RGB_LEAVE
+	.align	2
+60:	.long	0x88000000
+61:	.long	0x40000000
+62:	.long	0x81000000
+63:	.long	0x00200000
+64:	.long	0x84000000
+65:	.long	0x20000000
+66:	.long	0x80800000
+67:	.long	0x00100000
+68:	.long	0x82000000
+69:	.long	0x10000000
+70:	.long	0x00400000
+71:	.long	0x00080000
+	.size	_gte_intpl_fast, . - _gte_intpl_fast
