@@ -577,6 +577,16 @@ void pvr_renderer_init(void)
 	pvr.start_x = 0;
 	pvr.start_y = 0;
 
+	/* The PVR heap is torn down and rebuilt between games, so anything
+	 * still held from the last one points into freed VRAM. */
+	rtt_tex[0] = NULL;
+	rtt_tex[1] = NULL;
+	rtt_enabled = false;
+	rtt_active = false;
+	rtt_want = false;
+	rtt_fresh = true;
+	rtt_cur = 0;
+
 	if (!WITH_24BPP) {
 		overlay_init();
 		pvr.fake_tex = pvr_mem_malloc(sizeof(fake_tex_data));
