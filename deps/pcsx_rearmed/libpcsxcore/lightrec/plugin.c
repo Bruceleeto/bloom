@@ -632,8 +632,18 @@ static void lightrec_plugin_execute_internal(bool block_only)
 							      psxRegs.pc,
 							      cycles_lightrec);
 		} else {
+#ifdef __sh__
+			/* Generated code may keep the state pointer in GBR
+			 * (OPT_SH4_USE_GBR); KOS keeps the thread's TLS base
+			 * there, so give it back to the C side. */
+			uint32_t saved_gbr;
+			__asm__ __volatile__("stc gbr, %0" : "=r"(saved_gbr));
+#endif
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
+#ifdef __sh__
+			__asm__ __volatile__("ldc %0, gbr" : : "r"(saved_gbr));
+#endif
 		}
 
 		lightrec_tansition_to_pcsx(lightrec_state);
