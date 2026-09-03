@@ -114,6 +114,7 @@ set(LIBLIGHTNING_INCLUDE_DIR $<TARGET_PROPERTY:lightning,INTERFACE_INCLUDE_DIREC
 # Include Lightrec's own CMake file
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
+
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
 math(EXPR CODEBUF_SIZE "0x100000 * ${CODE_BUFFER_SIZE_MB}")
 if (NOT CODEBUF_SIZE)
@@ -180,6 +181,7 @@ target_compile_definitions(libpcsxcore PUBLIC
 	HAVE_CDROM
 	GPUSTATUS_POLLING_THRESHOLD=${WITH_GPUSTATUS_POLLING_THRESHOLD}
 )
+target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)
 target_link_libraries(libpcsxcore PUBLIC lightrec zlib)
 
@@ -279,6 +281,8 @@ if (WITH_FPS_OVERLAY)
 	# pvrtex/file_dctex.h, for the embedded .dt font
 	target_include_directories(bloom PRIVATE $ENV{KOS_BASE}/utils)
 endif(WITH_FPS_OVERLAY)
+
+target_sources(bloom PRIVATE src/gte_fpu.c)
 
 target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#lightning lightrec libpcsxcore gpu spu

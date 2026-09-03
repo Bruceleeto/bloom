@@ -730,6 +730,63 @@ void lightrec_free_regcache(struct regcache *cache)
 			     sizeof(*cache), cache);
 }
 
+/*
+ * Save and restore the caller-saved temporaries around a direct call to C.
+ *
+ * Marking registers live does not preserve them: jit_live() constrains
+ * lightning's own allocator and emits nothing.  What preserves the temporaries
+ * on the normal path is the C wrapper block, which spills all of them to
+ * state->wrapper_regs on the way in and reloads them on the way out
+ * (lightrec.c, generate_wrapper).  A call that skips the wrapper has to do the
+ * same, or whatever guest register was living in a temporary is destroyed by
+ * the callee.
+ *
+ * The wrapper saves every temporary because it cannot know which are in use.
+ * Here the register cache is in front of us, so only the live ones are spilled.
+ */
+void lightrec_save_temps(struct regcache *cache, jit_state_t *_jit)
+{
+	struct native_register *nreg;
+	unsigned int i;
+
+	/*
+	 * LIGHTREC_REG_CYCLE is JIT_R0 - a temporary, and not one of the
+	 * NUM_TEMPS this loop covers.  The wrapper block preserves it by
+	 * converting the delta it holds into state->current_cycle before the
+	 * call and rebuilding it after; a call that does not need the cycle
+	 * count to be readable during it can just put the register somewhere.
+	 */
+	jit_stxi(lightrec_offset(wrapper_cycle), LIGHTREC_REG_STATE,
+		 LIGHTREC_REG_CYCLE);
+
+	for (i = 0; i < NUM_TEMPS; i++) {
+		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP) {
+			jit_stxi(lightrec_offset(wrapper_regs[i]),
+				 LIGHTREC_REG_STATE, JIT_R(FIRST_TEMP + i));
+		}
+	}
+}
+
+void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit)
+{
+	struct native_register *nreg;
+	unsigned int i;
+
+	jit_ldxi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE,
+		 lightrec_offset(wrapper_cycle));
+
+	for (i = 0; i < NUM_TEMPS; i++) {
+		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP) {
+			jit_ldxi(JIT_R(FIRST_TEMP + i), LIGHTREC_REG_STATE,
+				 lightrec_offset(wrapper_regs[i]));
+		}
+	}
+}
+
 void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit)
 {
 	struct native_register *nreg;
