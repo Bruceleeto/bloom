@@ -19,6 +19,11 @@
 #include <kos/regfield.h>
 #include <kos/string.h>
 
+/* Render the frame into a texture and blit it, instead of rendering
+ * straight to the framebuffer and un-interleaving the front buffer to get
+ * the previous frame back. */
+#define BLOOM_RTT 1
+
 #include "bloom-config.h"
 #include "emu.h"
 #include "overlay.h"
@@ -313,6 +318,150 @@ static const struct square_fcoords fb_fcoords_right = {
 	.v = { 1.0f / 1024.0f, 1.0f / 1024.0f, 961.0f / 1024.0f, 961.0f / 1024.0f },
 };
 
+/*
+ * Render-to-texture (GPF's pvr_scene_begin_rtt, KOS 8a9baf98).
+ *
+ * The frame is rendered into a texture instead of the framebuffer, then
+ * blitted to the screen.  That costs one extra full-screen pass, and it
+ * buys the expensive one back: the previous frame is now an ordinary
+ * texture, so re-injecting it is a single textured quad rather than the
+ * five passes pvr_render_fb() needs to un-interleave the front buffer.
+ */
+static const struct square_fcoords rtt_fcoords = {
+	.x = { 0.0f, (float)SCREEN_WIDTH, 0.0f, (float)SCREEN_WIDTH },
+	.y = { 0.0f, 0.0f, (float)SCREEN_HEIGHT, (float)SCREEN_HEIGHT },
+	.u = { 0.0f, (float)SCREEN_WIDTH / 1024.0f,
+	       0.0f, (float)SCREEN_WIDTH / 1024.0f },
+	.v = { 0.0f, 0.0f, (float)SCREEN_HEIGHT / 1024.0f,
+	       (float)SCREEN_HEIGHT / 1024.0f },
+};
+
+/* Sampling an RTT texture: 16-bit, non-twiddled, row pitch from the
+ * global stride register.  REPLACE and no blending - it is a copy. */
+static pvr_poly_hdr_t rtt_header = {
+	.m0 = {
+		.txr_en = true,
+		.auto_strip_len = true,
+		.list_type = PVR_LIST_OP_POLY,
+		.hdr_type = PVR_HDR_POLY,
+	},
+	.m1 = {
+		.txr_en = true,
+		.depth_cmp = PVR_DEPTHCMP_ALWAYS,
+	},
+	.m2 = {
+		.v_size = PVR_UV_SIZE_1024,
+		.u_size = PVR_UV_SIZE_1024,
+		.shading = PVR_TXRENV_REPLACE,
+		.txralpha_dis = true,
+		.fog_type = PVR_FOG_DISABLE,
+		.blend_dst = PVR_BLEND_ZERO,
+		.blend_src = PVR_BLEND_ONE,
+	},
+	.m3 = {
+		.x32stride = true,
+		.nontwiddled = true,
+		.pixel_mode = PVR_PIXEL_MODE_RGB565,
+	},
+};
+
+/* The same quad, injected behind the guest's geometry inside the RTT
+ * scene: TR list, depth GREATER, so it loses to anything drawn over it. */
+static pvr_poly_hdr_t rtt_prev_header = {
+	.m0 = {
+		.txr_en = true,
+		.auto_strip_len = true,
+		.list_type = PVR_LIST_TR_POLY,
+		.hdr_type = PVR_HDR_POLY,
+	},
+	.m1 = {
+		.txr_en = true,
+		.depth_cmp = PVR_DEPTHCMP_GREATER,
+	},
+	.m2 = {
+		.v_size = PVR_UV_SIZE_1024,
+		.u_size = PVR_UV_SIZE_1024,
+		.shading = PVR_TXRENV_REPLACE,
+		.txralpha_dis = true,
+		.fog_type = PVR_FOG_DISABLE,
+		.blend_dst = PVR_BLEND_ZERO,
+		.blend_src = PVR_BLEND_ONE,
+	},
+	.m3 = {
+		.x32stride = true,
+		.nontwiddled = true,
+		.pixel_mode = PVR_PIXEL_MODE_RGB565,
+	},
+};
+
+static pvr_ptr_t rtt_tex[2];
+static unsigned int rtt_cur;
+static bool rtt_enabled;
+/*
+ * Rendering to a texture only pays when the frame needs the previous one
+ * kept: it turns five full-screen passes into one, but costs a second
+ * scene and a blit.  A game that redraws the whole screen every frame
+ * never needed the old contents, so it renders straight to the
+ * framebuffer as before.  The decision has to be made when the scene
+ * opens, before this frame's draw area is known, so it follows the last
+ * frame - and the frame that switches over has no previous frame in the
+ * texture yet, so that one reconstructs it the old way.
+ */
+static bool rtt_active;
+static bool rtt_want;
+static bool rtt_fresh;
+
+#define RTT_BYTES	(SCREEN_WIDTH * SCREEN_HEIGHT * 2)
+
+extern bool bloom_pvr_bound;
+
+/*
+ * The targets are 1.2 MiB of the same VRAM the texture cache lives in, so
+ * they are only held while a game is actually drawing on top of its own
+ * output.  A 3D game that redraws the whole screen never allocates them.
+ * Called with no render in flight.
+ */
+static void rtt_update_alloc(void)
+{
+	if (!BLOOM_RTT || WITH_24BPP)
+		return;
+
+	/*
+	 * Two conditions, and both matter.  Overpaint says the five-pass
+	 * reconstruction is running at all; pvr_bound says the frame is
+	 * actually waiting on the PVR, so removing that work turns into
+	 * frames.  A game pinned at 100% SH-4 gets nothing from it and
+	 * should not be charged 1.2 MiB of texture heap for it.
+	 *
+	 * Once taken, the targets are kept: releasing and re-taking blocks
+	 * this size fragments the heap against the texture cache, which is
+	 * how "out of PVR memory" happened.
+	 */
+	if (rtt_want && bloom_pvr_bound) {
+		if (!rtt_enabled) {
+			rtt_tex[0] = pvr_mem_malloc(RTT_BYTES);
+			rtt_tex[1] = pvr_mem_malloc(RTT_BYTES);
+			rtt_enabled = rtt_tex[0] && rtt_tex[1];
+
+			if (!rtt_enabled) {
+				/* Not fatal: the old five-pass path still
+				 * works, it is just slower. */
+				if (rtt_tex[0])
+					pvr_mem_free(rtt_tex[0]);
+				if (rtt_tex[1])
+					pvr_mem_free(rtt_tex[1]);
+				rtt_tex[0] = rtt_tex[1] = NULL;
+			} else {
+				rtt_cur = 0;
+				rtt_fresh = true;
+				printf("RTT: %ux%u targets, %u KiB\n",
+				       SCREEN_WIDTH, SCREEN_HEIGHT,
+				       RTT_BYTES * 2 / 1024);
+			}
+		}
+	}
+}
+
 static pvr_poly_hdr_t fake_tex_header = {
 	.m0 = {
 		.txr_en = true,
@@ -403,7 +552,7 @@ void pvr_renderer_init(void)
 
 	pvr_printf("PVR renderer init\n");
 
-	pvr_txr_set_stride(640);
+	pvr_txr_set_stride(SCREEN_WIDTH);
 
 	if (WITH_MAGENTA_BG)
 		pvr_set_bg_color(1.0f, 0.0f, 1.0f);
@@ -1269,6 +1418,43 @@ static void render_square(const struct square_fcoords *coords,
 	}
 }
 
+/* The previous frame, in one pass. */
+static void pvr_render_prev_frame(void)
+{
+	pvr_poly_hdr_t *sq_hdr;
+
+	rtt_prev_header.m3.txr_base = to_pvr_txr_ptr(rtt_tex[rtt_cur ^ 1]);
+
+	sq_hdr = pvr_dr_target();
+	copy32(sq_hdr, &rtt_prev_header);
+	pvr_dr_commit(sq_hdr);
+
+	render_square(&rtt_fcoords, get_zvalue(0), 0.0f);
+}
+
+/* Put the finished frame on screen. */
+static void pvr_blit_rtt(void)
+{
+	pvr_poly_hdr_t *sq_hdr;
+
+	pvr_wait_ready();
+	pvr_scene_begin();
+	pvr_list_begin(PVR_LIST_OP_POLY);
+
+	rtt_header.m3.txr_base = to_pvr_txr_ptr(rtt_tex[rtt_cur]);
+
+	sq_hdr = pvr_dr_target();
+	copy32(sq_hdr, &rtt_header);
+	pvr_dr_commit(sq_hdr);
+
+	render_square(&rtt_fcoords, 1.0f, 0.0f);
+
+	pvr_list_finish();
+	pvr_scene_finish();
+
+	rtt_cur ^= 1;
+}
+
 static void pvr_render_fb(void)
 {
 	pvr_poly_hdr_t *sq_hdr;
@@ -1981,8 +2167,17 @@ static void pvr_start_scene(pvr_list_t list)
 {
 	pvr_wait_ready();
 	pvr_reap_textures();
+	rtt_update_alloc();
 
-	pvr_scene_begin();
+	rtt_active = BLOOM_RTT && !WITH_24BPP && rtt_enabled && rtt_want;
+
+	if (rtt_active) {
+		pvr_scene_begin_rtt(rtt_tex[rtt_cur], SCREEN_WIDTH,
+				    SCREEN_HEIGHT, SCREEN_WIDTH);
+	} else {
+		pvr_scene_begin();
+		rtt_fresh = true;
+	}
 	pvr_set_list(list);
 
 	pvr.new_frame = 0;
@@ -3210,6 +3405,9 @@ void hw_render_stop(void)
 			&& pvr.start_y == pvr.view_y;
 		vid_set_dithering(!overpaint);
 
+		/* What the next frame should render into. */
+		rtt_want = overpaint;
+
 		if (overpaint) {
 			/* We'll most likely render the FB with different clip
 			 * parameters, so we need to send dummy polys to avoid
@@ -3217,7 +3415,15 @@ void hw_render_stop(void)
 			if (WITH_CLIPPING)
 				pvr_avoid_tile_clip_glitch();
 
-			pvr_render_fb();
+			/* The front buffer is readable whatever we are
+			 * rendering into, so the old path also covers the
+			 * first frame after switching to a texture. */
+			if (rtt_active && !rtt_fresh)
+				pvr_render_prev_frame();
+			else
+				pvr_render_fb();
+
+			rtt_fresh = false;
 
 			if (WITH_CLIPPING)
 				pvr.old_flags |= POLY_NOCLIP;
@@ -3242,6 +3448,9 @@ void hw_render_stop(void)
 		pvr_render_modifier_volumes();
 
 	pvr_scene_finish();
+
+	if (rtt_active)
+		pvr_blit_rtt();
 
 	/* Discard any textures covered by the draw area */
 	pvr_update_caches(pvr.start_x, pvr.start_y,

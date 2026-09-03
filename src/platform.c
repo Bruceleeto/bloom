@@ -36,6 +36,10 @@
 
 static unsigned int frames;
 static uint64_t timer_ms;
+/* Whether the PVR, and not the emulator, is what the frame is waiting on.
+ * Read by the renderer: cutting PVR work is only worth VRAM when this is
+ * true (src/pvr.c, rtt_update_alloc). */
+bool bloom_pvr_bound;
 
 static pvr_ptr_t pvram;
 static uint32_t *pvram_sq;
@@ -318,6 +322,11 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		overlay_set("%.1f fps  %.2f ms",
 			    (float)frames * 1000.0f / (float)(new_timer - timer_ms),
 			    (float)(new_timer - timer_ms) / (float)frames);
+
+		/* Idle on the SH-4 that the PVR is being waited on for. */
+		bloom_pvr_bound = idle_diff * 100 > cpu_diff * 10
+			&& (float)pvr_stats.rnd_last_time / 1000000.0f
+			   > (float)(new_timer - timer_ms) / (float)frames * 0.5f;
 
 		timer_ms = new_timer;
 		frames = 0;
