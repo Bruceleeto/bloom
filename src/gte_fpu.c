@@ -1568,8 +1568,33 @@ GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
 #ifdef __sh__
 #undef gte_mvmva
 
+void gte_mvmva_sf0_asm(psxCP2Regs *r, const s16 *v, const s16 *m,
+		       const s32 *t);
+
+/* cv == 3 selects no translation column; the asm reads three words either
+ * way, so point it at zeros rather than branch inside the loop. */
+static const s32 gte_no_translation[3];
+
 void gte_mvmva_slow(psxCP2Regs *r, u32 op)
 {
+	int mx = GTE_MX(op);
+	int cv = GTE_CV(op);
+
+	/* sf == 0 is the shape the FPU path cannot take and the one games
+	 * actually reach here with (Gran Turismo: every bail-out, ~9,700 a
+	 * second, and none for mx or lm). */
+	if (!GTE_SF(op) && mx < 3 && !GTE_LM(op)) {
+		s16 scratch[3];
+		const s16 *v = gte_vector(r, GTE_V(op), scratch);
+
+		gte_flag = 0;
+		gte_mvmva_sf0_asm(r, v, (const s16 *)&r->CP2C.p[mx * 8],
+				  cv < 3 ? &((s32 *)r->CP2C.r)[cv * 8 + 5]
+					 : gte_no_translation);
+		gte_end(r);
+		return;
+	}
+
 	gte_mvmva_c(r, op);
 }
 

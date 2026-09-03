@@ -1120,3 +1120,154 @@ _gte_intpl_fast:
 70:	.long	0x00400000
 71:	.long	0x00080000
 	.size	_gte_intpl_fast, . - _gte_intpl_fast
+
+/*
+ * MVMVA with sf == 0, in integers.
+ *
+ * The FPU path above cannot serve this.  gte_rot_convert folds the >>12 into
+ * XMTRX as 1/4096, so with sf set the MAC lands near 2^19 and float32's
+ * 24-bit mantissa holds it exactly.  With sf clear the results are 4096x
+ * larger - up to 2^31 - which float32 cannot represent exactly, and GTE
+ * results are guest-visible.
+ *
+ * Measured on Gran Turismo: every MVMVA bail-out is sf == 0, about 9,700 a
+ * second, and not one is mx >= 3 or lm.  This covers sf == 0, mx < 3, lm == 0;
+ * anything else still goes to the C.
+ *
+ *   r4 = psxCP2Regs *r
+ *   r5 = const s16 *v   three contiguous halfwords
+ *   r6 = const s16 *m   nine contiguous halfwords, m11 m12 m13 m21 ... m33
+ *   r7 = const s32 *t   three words; the caller passes zeros for cv == 3
+ *
+ * Bit-exact with gte_mvmva_c: 64-bit accumulate, the A1/A2/A3 bounds check,
+ * then limB1/2/3.  MAC1..3 are at r4+100/104/108 and IR1..3 at r4+36/40/44,
+ * both out of displacement range, so the two bases are kept in registers and
+ * the stores are indexed.  No calls, so PR is untouched.
+ */
+	.align	2
+	.global	_gte_mvmva_sf0_asm
+	.type	_gte_mvmva_sf0_asm, @function
+_gte_mvmva_sf0_asm:
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+
+	mov.w	@r5+, r8		/* vx, sign-extended */
+	mov.w	@r5+, r9		/* vy */
+	mov.w	@r5+, r10		/* vz */
+
+	mov.l	90f, r0
+	mov.l	@r0, r13		/* r13 = gte_hot.flag */
+	mov	r4, r14
+	add	#64, r14		/* MAC1..3 at @(36,r14)/40/44 */
+	mov	r4, r5
+	add	#32, r5			/* IR1..3  at @(4,r5)/8/12   */
+	mova	91f, r0
+	mov	r0, r1			/* r1 = flag table */
+	mov	#36, r2			/* r2 = MAC displacement */
+
+70:	/* ---- one component ---- */
+	mov.l	@r7+, r0		/* t[i] */
+	mov	r0, r11
+	mov	#12, r3
+	shld	r3, r11			/* lo = t << 12 */
+	mov	r0, r12
+	mov	#-20, r3
+	shad	r3, r12			/* hi = t >> 20, arithmetic */
+
+	mov.w	@r6+, r0
+	dmuls.l	r0, r8			/* m * vx, full signed 64 */
+	sts	macl, r0
+	sts	mach, r3
+	clrt
+	addc	r0, r11
+	addc	r3, r12
+
+	mov.w	@r6+, r0
+	dmuls.l	r0, r9			/* m * vy */
+	sts	macl, r0
+	sts	mach, r3
+	clrt
+	addc	r0, r11
+	addc	r3, r12
+
+	mov.w	@r6+, r0
+	dmuls.l	r0, r10			/* m * vz */
+	sts	macl, r0
+	sts	mach, r3
+	clrt
+	addc	r0, r11
+	addc	r3, r12
+
+	/*
+	 * A1/A2/A3.  The 64-bit value fits in s32 exactly when the high word
+	 * is the sign extension of the low one; when it does not, the sign of
+	 * the high word says which way it went.  MAC is the low word either
+	 * way, which is what the C's (s32) cast does.
+	 */
+	mov	r11, r3
+	shal	r3			/* T = bit 31 of lo */
+	subc	r3, r3			/* r3 = -T: 0 or -1 */
+	cmp/eq	r3, r12
+	bt	72f
+	cmp/pz	r12
+	bf	71f
+	mov.l	@r1, r0			/* overflowed up */
+	bra	72f
+	 or	r0, r13
+71:	mov.l	@(4,r1), r0		/* overflowed down */
+	or	r0, r13
+
+72:	mov	r2, r0
+	mov.l	r11, @(r0,r14)		/* MAC */
+
+	/* limB1/2/3: clamp to s16.  exts.w round-trips iff it is in range. */
+	exts.w	r11, r3
+	cmp/eq	r3, r11
+	bt	75f
+	mov.l	@(8,r1), r0		/* the clamp raised a flag */
+	or	r0, r13
+	mov	#1, r3
+	shll8	r3
+	shll8	r3
+	shlr	r3			/* 0x8000 */
+	cmp/pz	r11
+	bf	73f
+	bra	74f
+	 add	#-1, r3			/* 0x7fff */
+73:	neg	r3, r3			/* -0x8000 */
+74:	mov	r3, r11
+
+75:	mov	r2, r0
+	add	#-32, r0
+	mov.w	r11, @(r0,r5)		/* IR */
+
+	add	#4, r2
+	add	#12, r1
+	mov	#48, r0
+	cmp/eq	r0, r2
+	bf	70b
+
+	mov.l	90f, r0
+	mov.l	r13, @r0		/* gte_hot.flag */
+
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	rts
+	 mov.l	@r15+, r8
+
+	.align	2
+90:	.long	_gte_hot
+	/* per component: A max, A min, limB */
+91:	.long	0x40000000, 0x88000000, 0x81000000
+	.long	0x20000000, 0x84000000, 0x80800000
+	.long	0x10000000, 0x82000000, 0x00400000
+	.size	_gte_mvmva_sf0_asm, . - _gte_mvmva_sf0_asm
