@@ -72,6 +72,9 @@ if (WITH_FASTMEM)
 	link_libraries(fastmem)
 endif(WITH_FASTMEM)
 
+set(LIGHTREC_DIR deps/lightrec CACHE STRING "Lightrec directory")
+file(REAL_PATH ${LIGHTREC_DIR} LIGHTREC_REAL_DIR EXPAND_TILDE)
+
 set(PCSX_DIR deps/pcsx_rearmed CACHE STRING "PCSX directory")
 file(REAL_PATH ${PCSX_DIR} PCSX_REAL_DIR EXPAND_TILDE)
 
@@ -79,7 +82,12 @@ file(REAL_PATH ${PCSX_DIR} PCSX_REAL_DIR EXPAND_TILDE)
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
 set(ENABLE_CODE_BUFFER ON CACHE INTERNAL "" FORCE)
 
-# Include Lightrec's own CMake file
+# Include Lightrec's own CMake file. It no longer builds a code generator of
+# its own -- emitter.c and regcache.c are out of its source list and fgl's
+# sources are in -- but everything else it does, the optimiser above all, is
+# unchanged and is the reason fgl can be as small as it is.
+add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
+
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
 math(EXPR CODEBUF_SIZE "0x100000 * ${CODE_BUFFER_SIZE_MB}")
 if (NOT CODEBUF_SIZE)
@@ -118,6 +126,7 @@ add_library(libpcsxcore STATIC
 	${PCSX_REAL_DIR}/libpcsxcore/socket.c
 	${PCSX_REAL_DIR}/libpcsxcore/spu.c
 	${PCSX_REAL_DIR}/libpcsxcore/new_dynarec/emu_if.c
+	${PCSX_REAL_DIR}/libpcsxcore/lightrec/plugin.c
 	${PCSX_REAL_DIR}/plugins/gpulib/gpu.c
 	${PCSX_REAL_DIR}/plugins/gpulib/prim.c
 	${PCSX_REAL_DIR}/plugins/gpulib/vout_pl.c
@@ -130,15 +139,16 @@ target_include_directories(libpcsxcore PUBLIC
 	${PCSX_REAL_DIR}/include
 	${PCSX_REAL_DIR}
 )
+target_include_directories(libpcsxcore PRIVATE ${LIGHTREC_REAL_DIR})
 target_include_directories(libpcsxcore INTERFACE ${PCSX_REAL_DIR})
 target_compile_definitions(libpcsxcore PUBLIC
-	DRC_DISABLE
 	# The custom memory map is bloom's, not the recompiler's: the MMU
-	# pages, the embedded BIOS and the scratchpad all live there, and the
-	# interpreter needs them exactly as much as generated code did.
+	# pages, the embedded BIOS and the scratchpad all live there.
 	LIGHTREC
 	LIGHTREC_CUSTOM_MAP
+	LIGHTREC_CODE_INV
 	NO_SOCKET
+	DISABLE_MEM_LUTS
 	CODE_BUFFER_SIZE=${CODEBUF_SIZE}
 	USE_ASYNC_CDROM
 	USE_C11_THREADS
@@ -147,7 +157,7 @@ target_compile_definitions(libpcsxcore PUBLIC
 )
 target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)
-target_link_libraries(libpcsxcore PUBLIC zlib)
+target_link_libraries(libpcsxcore PUBLIC lightrec zlib)
 
 if (NOT GPU_PLUGIN)
 	set(GPU_PLUGIN PVR CACHE STRING "GPU plugin" FORCE)

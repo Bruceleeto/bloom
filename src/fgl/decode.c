@@ -380,8 +380,15 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                  * is the `rs` field.  Same split the reference makes. */
                 if (insn & (1u << 25)) {
                         p = ir_node_new(c, IR_GTE, pc);
+                        /* THE WHOLE INSTRUCTION WORD, not the command field.
+                         * The body that runs a command is chosen by `op &
+                         * 0x3f`, but the bodies themselves read the sf, mx,
+                         * v, cv and lm fields out of the same word -- so what
+                         * they are handed is the guest instruction exactly as
+                         * fetched. Masking it here and rebuilding it in the
+                         * emitter would be a second place to get it wrong. */
                         if (p)
-                                p->imm = insn & 0x1ffffffu;
+                                p->imm = insn;
                         return;
                 }
                 switch (rs) {

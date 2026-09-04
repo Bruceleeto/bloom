@@ -34,6 +34,11 @@ void fgl_init(fgl_emitter *e, void *buf, uint32_t size, uint32_t base)
 	e->base   = base;
 }
 
+void fgl_set_targets(fgl_emitter *e, const fgl_targets *t)
+{
+	e->tgt = t;
+}
+
 /* OR bits into an already-emitted word: how every displacement that was not
  * known at emission time gets filled in. */
 static void or_word_at(fgl_emitter *e, int at, uint16_t bits)
@@ -55,7 +60,7 @@ static void patch_fwd8(fgl_emitter *e, int site)
 	int disp = here(e) - site - 2;
 
 	if (!sh4_disp8_fits(disp))
-		e->overflow = 1;
+		e->overflow = 3;
 	else
 		or_word_at(e, site, (uint16_t)(disp & 0xff));
 }
@@ -65,7 +70,7 @@ static void patch_fwd12(fgl_emitter *e, int site)
 	int disp = here(e) - site - 2;
 
 	if (!sh4_disp12_fits(disp))
-		e->overflow = 1;
+		e->overflow = 4;
 	else
 		or_word_at(e, site, (uint16_t)(disp & 0xfff));
 }
@@ -87,7 +92,7 @@ static void emit_const(fgl_emitter *e, uint32_t v, int rn)
 	}
 
 	if (e->n_fix >= FGL_MAX_LITERALS) {
-		e->overflow = 1;
+		e->overflow = 5;
 		return;
 	}
 	e->fix[e->n_fix].value = v;
@@ -142,7 +147,7 @@ static void emit_pool(fgl_emitter *e)
 
 		disp = (pool_at + 4u * (uint32_t)k - ref) / 4u;
 		if (disp > 255) {
-			e->overflow = 1;        /* pool out of reach */
+			e->overflow = 2;        /* pool out of reach */
 			return;
 		}
 		or_word_at(e, e->fix[i].at, (uint16_t)disp);
@@ -174,9 +179,26 @@ static void maybe_flush_pool(fgl_emitter *e)
 	if (!e->n_fix)
 		return;
 
-	/* 700 rather than 1020: the pool itself, and whatever the next node
-	 * emits before the flush actually happens, both sit inside the gap. */
-	if (2 * (here(e) - e->fix[0].at) < 700)
+	/* TWO TRIGGERS, AND THE SECOND IS NOT A SAFETY MARGIN.
+	 *
+	 * Distance first: 700 rather than 1020, because the pool itself, and
+	 * whatever the next node emits before the flush actually happens, both
+	 * sit inside the gap.
+	 *
+	 * But reach is not the only thing that runs out.  `fix[]` holds one
+	 * entry per SITE, not per distinct value, and a service call costs
+	 * three sites in five instructions -- so a run of I/O or GTE nodes
+	 * fills the table long before it has travelled 700 bytes.  That is
+	 * what refused the BIOS block at 0xbfc05460: 36 nodes, no reach
+	 * problem, and `emit_const` out of fixup slots.  A full table is a
+	 * reason to flush, exactly like a full reach; it was only ever an
+	 * overflow because nothing here looked at it.
+	 *
+	 * The headroom is for the widest single node, since a flush can only
+	 * happen BETWEEN nodes -- an unaligned store setting up a shim call is
+	 * the worst of them and is nowhere near sixteen. */
+	if (2 * (here(e) - e->fix[0].at) < 700 &&
+	    e->n_fix < FGL_MAX_LITERALS - 16)
 		return;
 
 	over = bra_fwd(e);
@@ -687,7 +709,7 @@ static void emit_muldiv(fgl_emitter *e, const ir_node *p)
 	}
 
 	if (!rem) {
-		e->overflow = 1;
+		e->overflow = 6;
 		return;
 	}
 
@@ -825,7 +847,7 @@ static void emit_load_un(fgl_emitter *e, const ir_node *p)
 	int d;
 
 	if (!s0) {
-		e->overflow = 1;
+		e->overflow = 7;
 		return;
 	}
 
@@ -882,7 +904,7 @@ static void emit_store_un(fgl_emitter *e, const ir_node *p)
 	int v;
 
 	if (!s0 || !s1) {
-		e->overflow = 1;
+		e->overflow = 8;
 		return;
 	}
 
@@ -919,6 +941,217 @@ static void emit_store_un(fgl_emitter *e, const ir_node *p)
 /* ---------------------------------------------------------------- */
 /* The block                                                         */
 /* ---------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------- */
+/* Hardware registers                                                */
+/* ---------------------------------------------------------------- */
+
+/* WHEN A LOAD OR A STORE IS NOT MEMORY.
+ *
+ * lightrec's optimiser tags every access with the region it proved, and fgl
+ * lowers most of them to the two-instruction masked access that is the whole
+ * point of having a region analysis.  `FGL_IO_HW` is the tag that says the
+ * proof went the other way: this address is a device register, and reading it
+ * has side effects that a `mov.l` does not produce.
+ *
+ * WHY THIS IS A CALL AND NOT A FAULT.  bloop reaches its device model by
+ * leaving the address unmapped and catching the exception, which costs no
+ * instructions at the site at all.  Measured on hardware that path is 170-230
+ * cycles against 27 for a call, because the cost is in the exception entry and
+ * not in anything that strides or caches; see build/docs/CLAUDE.md 3c, which
+ * also records what would flip the decision back.
+ *
+ * WHAT THE CALLEE ALREADY DOES, so that the call site does not do it twice:
+ * `lightrec_hw_lb` and its family `kunseg()` the address themselves, and they
+ * return a value ALREADY EXTENDED to 32 bits -- sign for lb/lh, zero for
+ * lbu/lhu (lightrec.c, the `(u32)(s32)(s8)` and `(u8)` casts).  So there is no
+ * extension here, and a call site that added one would sign-extend an already
+ * sign-extended byte, which is invisible until the byte has its top bit set.
+ *
+ * WHAT NEEDS NO FLUSH, which is the reason this path is cheap.  These take
+ * their address and their value as ARGUMENTS and hand the result back as a
+ * return value; they do not read or write the guest register file.  So the
+ * allocator may keep every guest register in a host register across the call
+ * and nothing has to be spilled.  That is exactly not true of the generic
+ * `lightrec_rw` path, which works on the register file in the state block --
+ * see build/docs/fgl_step4_generic_io.md.
+ */
+static void emit_hw_load(fgl_emitter *e, const ir_node *p)
+{
+	uint32_t fn;
+	int rs = p->sc[0];
+	int rd;
+
+	if (!e->tgt || !e->tgt->shim_call || p->sub >= 5 ||
+	    !(fn = e->tgt->hw_load[p->sub]) || !rs) {
+		e->unsupported = 1;
+		e->unsupported_op = p->op;
+		return;
+	}
+
+	/* The address is the shim's first argument, so it is built in r1 and
+	 * r0 is the spare -- the opposite of the direct path, which keeps r0
+	 * for the address it is about to dereference. */
+	emit_addr(e, p, FGL_R_T1, FGL_R_XFER);
+	emit_const(e, fn, FGL_R_XFER);
+	emit_const(e, e->tgt->shim_call, rs);
+	sh4_emit_jsr(&e->cg, rs);
+	sh4_emit_nop(&e->cg);           /* delay slot */
+
+	/* The value comes back in r0, and from here this is the tail of an
+	 * ordinary load: parked for the shadow if deferred, otherwise written
+	 * wherever the allocator put the destination. */
+	rd = p->hd >= 0 ? p->hd : FGL_R_XFER;
+	if (p->defer) {
+		sh4_emit_mov_l_store_gbr(&e->cg, FGL_AT_TEMP_REG);
+	} else if (p->hd >= 0) {
+		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, rd);
+	} else {
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+	}
+}
+
+/* The store, which is the one service with three values to pass and therefore
+ * the one that parks a value in the state block on the way.  See shim.h. */
+static void emit_hw_store(fgl_emitter *e, const ir_node *p)
+{
+	uint32_t fn;
+	int rs = p->sc[0];
+	int rt;
+
+	if (!e->tgt || !e->tgt->shim_call_st || p->sub >= 5 ||
+	    !(fn = e->tgt->hw_store[p->sub]) || !rs) {
+		e->unsupported = 1;
+		e->unsupported_op = p->op;
+		return;
+	}
+
+	/* The value first and through r0, because `mov.l Rm,@(disp,GBR)` has
+	 * no other source register -- and it goes to memory before the address
+	 * is built, so the address computation is free to use r0 as its spare
+	 * afterwards. */
+	rt = operand(e, p->ht, p->rt, FGL_R_XFER);
+	if (rt != FGL_R_XFER)
+		sh4_emit_mov_reg(&e->cg, rt, FGL_R_XFER);
+	sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_SHIM_ARG);
+
+	emit_addr(e, p, FGL_R_T1, FGL_R_XFER);
+	emit_const(e, fn, FGL_R_XFER);
+	emit_const(e, e->tgt->shim_call_st, rs);
+	sh4_emit_jsr(&e->cg, rs);
+	sh4_emit_nop(&e->cg);           /* delay slot */
+}
+
+/* The whole access, done by C.
+ *
+ * Everything about this node is in the state block: C reads the base register
+ * from there and writes the destination back to there, which is why the
+ * allocation pass flushes around it and why there are no operands to set up.
+ * All that is left at the call site is the guest instruction word.
+ *
+ * The cycle counters are reconciled by the shim, which matters more here than
+ * anywhere else: an unproven address can reach a device, a device can raise
+ * an interrupt, and an interrupt is delivered by moving `target_cycle` in
+ * memory where a register cannot see it. */
+static void emit_rw(fgl_emitter *e, const ir_node *p)
+{
+	int rs = p->sc[0];
+
+	if (!e->tgt || !e->tgt->shim_call || !e->tgt->rw || !rs) {
+		e->unsupported = 1;
+		e->unsupported_op = p->op;
+		return;
+	}
+
+	emit_const(e, e->tgt->rw, FGL_R_XFER);
+	emit_const(e, p->imm, FGL_R_T1);        /* the guest instruction word */
+	emit_const(e, e->tgt->shim_call, rs);
+	sh4_emit_jsr(&e->cg, rs);
+	sh4_emit_nop(&e->cg);                   /* delay slot */
+}
+
+/* Does this access reach a device rather than memory?
+ *
+ * Everything the optimiser could name a plain region for is memory, including
+ * FGL_IO_DIRECT_HW -- that tag means the FRONT END certified this particular
+ * hardware address as ordinary storage (optimizer.c, `ops.hw_direct`), so the
+ * masked direct access is right for it under the same flat-map assumption RAM
+ * and BIOS already rely on.
+ *
+ * FGL_IO_UNKNOWN is deliberately NOT here.  It is not memory either, but it
+ * needs the generic `lightrec_rw` protocol rather than this one, and routing
+ * it here would silently give it a device access it may not want.  Until that
+ * path exists an unknown region is a refusal, which is what having no fallback
+ * means. */
+static int is_hw(const ir_node *p)
+{
+	return p->io == FGL_IO_HW;
+}
+
+/* ---------------------------------------------------------------- */
+/* COP2 commands                                                     */
+/* ---------------------------------------------------------------- */
+
+/* THE ONE PLACE A BLOCK CALLS OUT, AND WHAT IT COSTS TO GET THERE.
+ *
+ * A GTE command is thousands of instructions of fixed-point geometry; there
+ * was never a version of this that got inlined.  What there is instead is the
+ * cheapest possible way to leave and come back:
+ *
+ *      mov.l   @(disp,pc), r0          ; the body, resolved right now
+ *      mov.l   @(disp,pc), r1          ; the guest command word
+ *      mov.l   @(disp,pc), rS          ; fgl_shim_gte
+ *      jsr     @rS
+ *       nop
+ *
+ * The body is chosen HERE, at compile time, because the command word is a
+ * constant in the block -- so nothing decodes it at run time and nothing
+ * compares it against a table on every execution.  This is the same decision
+ * lightrec's own SH-4 path made (emitter.c, rec_CP2_gte) and the reason it
+ * skipped the generic C wrapper: a COP2 command reads and writes the COP2
+ * file in the state block and touches neither the cycle counter nor the
+ * guest's general registers.
+ *
+ * WHY THERE IS NO FLUSH HERE.  The callee reads the COP2 file out of the
+ * state block, and the COP2 file is never held in a host register -- IR_MTC2
+ * stores straight through to the state block and IR_MFC2 loads straight out
+ * of it.  So the file the callee sees is already the current one, and the
+ * guest GPRs the allocator is holding in r3-r12 are none of its business.
+ * If COP2 registers ever start living in registers, this comment is the thing
+ * that stops being true.
+ *
+ * A command the hardware ignores resolves to nothing, and the right amount of
+ * code for it is none -- not a call to an empty function. */
+static void emit_gte(fgl_emitter *e, const ir_node *p)
+{
+	uint32_t body;
+	int rs = p->sc[0];
+
+	if (!e->tgt || !e->tgt->gte_body || !e->tgt->shim_gte) {
+		e->unsupported = 1;
+		e->unsupported_op = p->op;
+		return;
+	}
+
+	body = e->tgt->gte_body(e->tgt->user, p->imm);
+	if (!body)
+		return;
+
+	/* The allocator owes this node a scratch register, because `jsr` wants
+	 * its target in a general register and r0 and r1 are both carrying
+	 * arguments. Without one there is nowhere to put the shim's address. */
+	if (!rs) {
+		e->unsupported = 1;
+		e->unsupported_op = p->op;
+		return;
+	}
+
+	emit_const(e, body, FGL_R_XFER);
+	emit_const(e, p->imm, FGL_R_T1);
+	emit_const(e, e->tgt->shim_gte, rs);
+	sh4_emit_jsr(&e->cg, rs);
+	sh4_emit_nop(&e->cg);           /* delay slot */
+}
 
 static void emit_fixup(fgl_emitter *e, const ir_fixup *f)
 {
@@ -1013,6 +1246,10 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		break;
 
 	case IR_LOAD:
+		if (is_hw(p)) {
+			emit_hw_load(e, p);
+			break;
+		}
 		/* The address goes in r0 and r1 is free for a wide
 		 * displacement; the value lands wherever the allocator put it,
 		 * or in r1 on its way to the state block.
@@ -1064,6 +1301,10 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		break;
 
 	case IR_STORE:
+		if (is_hw(p)) {
+			emit_hw_store(e, p);
+			break;
+		}
 		/* The other way round: the address is built in r1 first, so
 		 * that r0 is still free to carry a value out of the state
 		 * block. Doing it in the other order costs a scratch register
@@ -1264,6 +1505,14 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 
 	case IR_MULDIV:
 		emit_muldiv(e, p);
+		break;
+
+	case IR_GTE:
+		emit_gte(e, p);
+		break;
+
+	case IR_RW:
+		emit_rw(e, p);
 		break;
 
 	case IR_JUMP:

@@ -9,7 +9,7 @@
 #include "lightrec.h"
 #include "memmanager.h"
 #include "optimizer.h"
-#include "regcache.h"
+#include "lightrec-private.h"
 
 #include <errno.h>
 #include <stdbool.h>

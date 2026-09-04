@@ -26,6 +26,17 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
 
+/* WHAT GNU LIGHTNING USED TO SUPPLY.
+ *
+ * `__WORDSIZE` is a glibc symbol, out of <bits/wordsize.h>, and it reached
+ * this header only because <lightning.h> pulled it in. Nothing includes that
+ * any more and KOS is newlib, which does not define it -- so the three
+ * remaining uses would silently be errors on the one target that matters.
+ * GCC knows the answer without being told. */
+#ifndef __WORDSIZE
+#define __WORDSIZE (__SIZEOF_POINTER__ * 8)
+#endif
+
 #define GENMASK(h, l) \
 	(((uintptr_t)-1 << (l)) & ((uintptr_t)-1 >> (__WORDSIZE - 1 - (h))))
 
@@ -98,14 +109,8 @@
  * inclusive end -- kept in step with FGL_CYCLE_ENTRIES. */
 #define LIGHTREC_CYCLE_ENTRIES 34
 
-/* Definition of jit_state_t (avoids inclusion of <lightning.h>) */
-struct jit_node;
-struct jit_state;
-typedef struct jit_state jit_state_t;
-
 struct blockcache;
 struct recompiler;
-struct regcache;
 struct opcode;
 struct reaper;
 
@@ -118,7 +123,6 @@ struct u16x2 {
 };
 
 struct block {
-	jit_state_t *_jit;
 	struct opcode *opcode_list;
 	void (*function)(void);
 	const u32 *code;
@@ -135,23 +139,23 @@ struct block {
 #endif
 };
 
+/* KEPT, AND EMPTY, AND THAT IS THE POINT.
+ *
+ * These described a branch inside a block waiting to be patched to a label
+ * inside the same block. fgl ends a block at its first control transfer, so no
+ * branch is ever internal and nothing fills either array -- but the arrays
+ * still sit in `struct lightrec_cstate` and the compile path still resets the
+ * counts, so that restoring intra-block branches later is a change to fgl and
+ * not a change to lightrec's bookkeeping. `label` and `branch` were Lightning
+ * node pointers; a code address is what fgl would put there. */
 struct lightrec_branch {
-	struct jit_node *branch;
+	void *branch;
 	u32 target;
 };
 
 struct lightrec_branch_target {
-	struct jit_node *label;
+	void *label;
 	u32 offset;
-};
-
-enum c_wrappers {
-	C_WRAPPER_RW,
-	C_WRAPPER_RW_GENERIC,
-	C_WRAPPER_MFC,
-	C_WRAPPER_MTC,
-	C_WRAPPER_CP,
-	C_WRAPPERS_COUNT,
 };
 
 struct lightrec_cstate {
@@ -164,7 +168,6 @@ struct lightrec_cstate {
 	unsigned int nb_targets;
 	unsigned int cycles;
 
-	struct regcache *reg_cache;
 
 	_Bool no_load_delay;
 };
@@ -199,18 +202,15 @@ struct lightrec_state {
 	u32 dispatch;				/* +680 */
 	u32 lut_base;				/* +684 */
 	u32 addr_mask;				/* +688 */
+	u32 shim_arg;				/* +692 */
 	u8 in_delay_slot_n;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
-	void *c_wrapper;
-	struct block *dispatcher, *c_wrapper_block;
-	void *c_wrappers[C_WRAPPERS_COUNT];
 	struct blockcache *block_cache;
 	struct recompiler *rec;
 	struct lightrec_cstate *cstate;
 	struct reaper *reaper;
 	void *tlsf;
-	void (*eob_wrapper_func)(void);
 	void (*interpreter_func)(void);
 	void (*ds_check_func)(void);
 	void (*memset_func)(void);
@@ -436,5 +436,66 @@ static inline _Bool lightrec_store_next_pc(void)
 {
 	return 1;
 }
+
+/* ------------------------------------------------------------------ */
+/* fgl                                                                 */
+/* ------------------------------------------------------------------ */
+
+/* THE WHOLE OF THE BOUNDARY, IN ONE PLACE.
+ *
+ * Above this line is lightrec as it always was, minus a code generator. Below
+ * it is everything the two halves say to each other: what lightrec calls to
+ * compile a block, what fgl's hand-written assembly calls back into C, and the
+ * three entry points in `dispatch.S` that are stored in this struct as plain
+ * addresses because they are no longer generated.
+ */
+
+/* Compile one block. Takes lightrec's already-optimised opcode list and
+ * returns the block's entry point, or NULL if fgl met something it cannot
+ * lower -- which is a hole to fill and never a case to route around, there
+ * being no second code generator to fall back to.
+ *
+ * On failure `*why` says WHICH failure, because the two are opposites and
+ * the caller's response to one is a loop under the other:
+ *
+ *   -ENOMEM   the code arena is full.  Transient.  The caller may flush the
+ *             block cache and try again, and that is what lightrec does.
+ *   -EINVAL   fgl declined to lower this block.  Permanent, for these exact
+ *             opcodes: retrying compiles the same block and refuses again,
+ *             and answering -ENOMEM here flushes the entire cache on every
+ *             attempt, forever, at the same PC.  That is not a theory; it is
+ *             what the first fgl boot did.
+ *
+ * `why` may be NULL if the caller does not care. */
+void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
+			unsigned int *code_size, int *why);
+
+/* The code arena, shared with fgl because it places its own blocks. */
+void *lightrec_alloc_code(struct lightrec_state *state, size_t size);
+void lightrec_free_code(struct lightrec_state *state, void *ptr);
+
+/* The dispatcher: hand-written SH-4 (src/fgl/dispatch.S), not generated.
+ * `fgl_dispatch` is the way in from C and has the signature lightrec's
+ * generated dispatcher had; the rest are addresses stored in the state block
+ * or in the code table, and are entered by a jump with no return address. */
+u32 fgl_dispatch(struct lightrec_state *state, u32 pc, void *first_block,
+		 s32 cycle_delta);
+void fgl_dispatch_loop(void);
+void fgl_dispatch_compile(void);
+void fgl_dispatch_memset(void);
+void fgl_dispatch_interpreter(void);
+void fgl_dispatch_ds_check(void);
+
+/* What that assembly calls back into. The last three exist because lightrec's
+ * own functions are static; see the comment on them in lightrec.c. */
+void *fgl_get_next_block(struct lightrec_state *state, u32 pc);
+u32 fgl_memset(struct lightrec_state *state);
+u32 fgl_emulate_block(struct lightrec_state *state, struct block *block, u32 pc);
+u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg);
+
+/* An access whose region the optimiser could not prove, performed entirely in
+ * C against the state block. Reached from generated code through
+ * `fgl_shim_call`, so it wears that shim's two-argument shape. */
+void fgl_rw(u32 opcode, struct lightrec_state *state);
 
 #endif /* __LIGHTREC_PRIVATE_H__ */

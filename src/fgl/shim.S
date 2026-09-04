@@ -176,7 +176,52 @@ _fgl_shim_call:
 
 /*
  * ----------------------------------------------------------------
- * (b) The GTE.
+ * (b) The hardware stores, which need a third value.
+ * ----------------------------------------------------------------
+ *
+ *      entry   r0 = the callee, r1 = the address,
+ *              FGL_AT_SHIM_ARG = the value to store
+ *      exit    nothing -- lightrec_hw_sb/_sh/_sw all return void
+ *
+ * `lightrec_hw_sb(addr, val, state)` takes three arguments and the block has
+ * two registers to give: r0 and r1, everything from r2 up being spoken for.
+ * The state block is not one of the three that has to travel -- it is GBR and
+ * this shim reads it -- but the address and the value both are, and that is
+ * already one more than there is room for.  So the value goes through the
+ * state block instead of through a register: the call site parks it in
+ * FGL_AT_SHIM_ARG, one store, and the load below is one instruction against
+ * the register there is no way to free.  fgl_state.h says why that word is
+ * its own and not `temp_reg`.
+ *
+ * THE LOAD MUST FOLLOW THE RECONCILIATION, not precede it.  @(disp,GBR) has
+ * no destination but r0, and SHIM_CYCLES_OUT wants r0 for the counters --
+ * loading the value first would hand the callee the target cycle.
+ *
+ * The callee lands in r7 for the same reason it does above: r0 is needed by
+ * the reconciliation, and r7 is saved by the time we want somewhere to put
+ * it.  This calls C, so it reconciles in both directions like any other shim
+ * that does; there is no return value to park across the way back.
+ */
+	.align	2
+	.globl	_fgl_shim_call_st
+	.type	_fgl_shim_call_st, @function
+_fgl_shim_call_st:
+	SHIM_ENTER
+	mov	r0, r7			/* the callee, out of the way */
+	mov	r1, r4			/* argument one: the address */
+	SHIM_CYCLES_OUT
+	mov.l	@(FGL_AT_SHIM_ARG * 4, gbr), r0
+	mov	r0, r5			/* argument two: the value */
+	stc	gbr, r6			/* argument three: the state block */
+	jsr	@r7
+	 nop
+	SHIM_CYCLES_IN
+	SHIM_LEAVE
+	.size	_fgl_shim_call_st, . - _fgl_shim_call_st
+
+/*
+ * ----------------------------------------------------------------
+ * (c) The GTE.
  * ----------------------------------------------------------------
  *
  *      entry   r0 = the callee, r1 = the guest COP2 command word
@@ -220,7 +265,7 @@ _fgl_shim_gte:
 
 /*
  * ----------------------------------------------------------------
- * (c) The divides.
+ * (d) The divides.
  * ----------------------------------------------------------------
  *
  *      entry   r1 = the dividend, r0 = the divisor

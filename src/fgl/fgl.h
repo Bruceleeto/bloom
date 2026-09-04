@@ -82,6 +82,61 @@
 
 #define FGL_MAX_LITERALS 64
 
+/* WHERE THE SERVICES ARE, AND WHY THE EMITTER IS TOLD RATHER THAN LINKED.
+ *
+ * A block reaches a service by materialising its address as a literal and
+ * `jsr`-ing through it (see shim.h).  On the Dreamcast those addresses are
+ * ordinary link-time symbols, so the obvious emitter takes them straight from
+ * `&fgl_shim_gte`.  It cannot: emit.c is also compiled by the host oracle and
+ * by test_reloc, where none of those symbols exist and the SH-4 they emit is
+ * run by an interpreter rather than a linker.  Referencing them directly
+ * would make the newest and least proven paths the only ones the oracle is
+ * structurally unable to see.
+ *
+ * So the addresses arrive as data.  The emulator fills this in from the real
+ * symbols; a host test fills it in with stubs it can point wherever it likes,
+ * and exercises the identical call site.
+ *
+ * A zero address is not a default to fall back from -- there is no fallback
+ * path in fgl -- it is "this service was not supplied", and a node that needs
+ * it sets `unsupported` and says so.
+ */
+typedef struct {
+	uint32_t shim_call;     /* r0 = callee, r1 = arg   -> f(arg, state) */
+	uint32_t shim_gte;      /* r0 = callee, r1 = op    -> f(&cp2d, op)  */
+	uint32_t shim_divu;     /* r1 / r0 -> r0 quotient, r1 remainder     */
+	uint32_t shim_div;
+	uint32_t shim_call_st;  /* r0 = callee, r1 = addr, shim_arg = value */
+
+	/* The hardware-register accessors, indexed by the IR's MEM_* width so
+	 * that the width the decoder already resolved is the index and there
+	 * is no second switch.  `lightrec_hw_lb` and friends take the guest
+	 * address and the state block and RETURN THE VALUE ALREADY EXTENDED to
+	 * 32 bits -- signed for lb/lh, zero for lbu/lhu -- so a call site must
+	 * not extend it again.  The stores take a third argument, which is why
+	 * they go through `shim_call_st`.
+	 *
+	 * A width with no accessor is a zero, and a zero is a refusal: stores
+	 * have no unsigned forms and never ask for one. */
+	uint32_t hw_load[5];    /* MEM_B, MEM_BU, MEM_H, MEM_HU, MEM_W */
+	uint32_t hw_store[5];   /* MEM_B,       , MEM_H,       , MEM_W */
+
+	/* The whole-access bridge, for a region the optimiser could not prove.
+	 * `f(the guest instruction word, the state block)`, which is
+	 * fgl_shim_call's shape exactly -- it reads the base register out of
+	 * the state block and writes the destination back to it. */
+	uint32_t rw;
+
+	/* The C body that runs one COP2 command, given the guest instruction
+	 * word.  Resolved AT COMPILE TIME -- the command is a constant in the
+	 * block, so there is no runtime dispatch and nothing decodes it twice.
+	 * Returns 0 for a command the hardware ignores, for which the right
+	 * amount of code is none.  `user` is passed back untouched so a host
+	 * test can hang its own table off it. */
+	uint32_t (*gte_body)(void *user, uint32_t op);
+	void     *user;
+} fgl_targets;
+
 typedef struct {
 	sh4_codegen cg;
 	uint8_t    *start;      /* first word of the buffer          */
@@ -92,6 +147,11 @@ typedef struct {
 	 * forward -- which a 32-instruction block cannot exceed. */
 	struct { uint32_t value; int at; } fix[FGL_MAX_LITERALS];
 	int n_fix;
+
+	/* Service addresses, or NULL.  See fgl_targets: NULL and a zero entry
+	 * mean the same thing, which is that a node needing that service
+	 * cannot be emitted. */
+	const fgl_targets *tgt;
 
 	int overflow;           /* buffer or pool exhausted */
 
@@ -114,6 +174,11 @@ typedef struct {
 } fgl_emitter;
 
 void     fgl_init(fgl_emitter *e, void *buf, uint32_t size, uint32_t base);
+
+/* Supply the service addresses.  Separate from `fgl_init` so a harness with
+ * no services keeps compiling and simply cannot emit the nodes that need
+ * them.  `t` is borrowed, not copied. */
+void     fgl_set_targets(fgl_emitter *e, const fgl_targets *t);
 uint32_t fgl_size(const fgl_emitter *e);
 
 /* Emit one already-decoded, already-allocated block. Returns its entry

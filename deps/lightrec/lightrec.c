@@ -3,25 +3,24 @@
  * Copyright (C) 2014-2021 Paul Cercueil <paul@crapouillou.net>
  */
 
-#include "arch.h"
 #include "blockcache.h"
 #include "debug.h"
 #include "disassembler.h"
-#include "emitter.h"
 #include "interpreter.h"
 #include "lightrec-config.h"
-#include "lightning-wrapper.h"
+#include "lightrec-private.h"
 #include "lightrec.h"
 #include "memmanager.h"
 #include "reaper.h"
 #include "recompiler.h"
-#include "regcache.h"
 #include "optimizer.h"
 #include "tlsf/tlsf.h"
 
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #if ENABLE_THREADED_COMPILER
 #include <stdatomic.h>
 #endif
@@ -737,9 +736,20 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
 	return block;
 }
 
-static void * get_next_block_func(struct lightrec_state *state, u32 pc)
+/* THE ONE C FUNCTION THE DISPATCHER CALLS ON ITS HOT PATH.
+ *
+ * `dispatch.S` reaches this through a patchable literal slot when the code
+ * table has no entry for a PC. Its contract is exactly what the assembly
+ * assumes: return the block's entry point or NULL, and leave the PC actually
+ * arrived at in `state->curr_pc` -- which the dispatcher re-reads rather than
+ * trusting its own exit register, because this may have run the interpreter
+ * and moved it. */
+void * fgl_get_next_block(struct lightrec_state *state, u32 pc)
 {
 	struct block *block;
+	{ static unsigned c; if (c < 40) { c++;
+	  fprintf(stderr, "gnb %u pc=%08x cyc=%u/%u flags=%x\n", c, pc,
+		  state->current_cycle, state->target_cycle, state->exit_flags); } }
 	bool should_recompile;
 	void *func;
 	int err;
@@ -771,7 +781,7 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 				lightrec_recompiler_add(state->rec, block);
 			} else {
 				err = lightrec_compile_block(state->cstate, block);
-				if (err) {
+				if (err == -ENOMEM) {
 					state->exit_flags = LIGHTREC_EXIT_NOMEM;
 					return NULL;
 				}
@@ -798,7 +808,7 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 
 			/* Then compile it using the profiled data */
 			err = lightrec_compile_block(state->cstate, block);
-			if (err) {
+			if (err == -ENOMEM) {
 				state->exit_flags = LIGHTREC_EXIT_NOMEM;
 				return NULL;
 			}
@@ -821,7 +831,7 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 	return func;
 }
 
-static void * lightrec_alloc_code(struct lightrec_state *state, size_t size)
+void * lightrec_alloc_code(struct lightrec_state *state, size_t size)
 {
 	void *code;
 
@@ -851,7 +861,7 @@ static void lightrec_realloc_code(struct lightrec_state *state,
 		lightrec_code_alloc_unlock(state);
 }
 
-static void lightrec_free_code(struct lightrec_state *state, void *ptr)
+void lightrec_free_code(struct lightrec_state *state, void *ptr)
 {
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_code_alloc_lock(state);
@@ -862,180 +872,8 @@ static void lightrec_free_code(struct lightrec_state *state, void *ptr)
 		lightrec_code_alloc_unlock(state);
 }
 
-static char lightning_code_data[0x80000];
 
-static void * lightrec_emit_code(struct lightrec_state *state,
-				 const struct block *block,
-				 jit_state_t *_jit, unsigned int *size)
-{
-	bool has_code_buffer = ENABLE_CODE_BUFFER && state->tlsf;
-	jit_word_t code_size, new_code_size;
-	void *code;
 
-	jit_realize();
-
-	if (ENABLE_DISASSEMBLER)
-		jit_set_data(lightning_code_data, sizeof(lightning_code_data), 0);
-	else
-		jit_set_data(NULL, 0, JIT_DISABLE_DATA | JIT_DISABLE_NOTE);
-
-	if (has_code_buffer) {
-		jit_get_code(&code_size);
-
-#ifdef __i386__
-		/* Lightning's code size estimation routine is buggy on x86 and
-		 * will return a value that's too small. */
-		code_size *= 2;
-#endif
-
-		code = lightrec_alloc_code(state, (size_t) code_size);
-
-		if (!code) {
-			if (ENABLE_THREADED_COMPILER) {
-				/* If we're using the threaded compiler, return
-				 * an allocation error here. The threaded
-				 * compiler will then empty its job queue and
-				 * request a code flush using the reaper. */
-				return NULL;
-			}
-
-			/* Remove outdated blocks, and try again */
-			lightrec_remove_outdated_blocks(state->block_cache, block);
-
-			pr_debug("Re-try to alloc %zu bytes...\n", code_size);
-
-			code = lightrec_alloc_code(state, code_size);
-			if (!code) {
-				pr_err("Could not alloc even after removing old blocks!\n");
-				return NULL;
-			}
-		}
-
-		jit_set_code(code, code_size);
-	}
-
-	code = jit_emit();
-	if (!code) {
-		if (has_code_buffer)
-			lightrec_free_code(state, code);
-
-		return NULL;
-	}
-
-	jit_get_code(&new_code_size);
-	lightrec_register(MEM_FOR_CODE, new_code_size);
-
-	if (has_code_buffer) {
-		lightrec_realloc_code(state, code, (size_t) new_code_size);
-
-		pr_debug("Creating code block at address 0x%" PRIxPTR ", "
-			 "code size: %" PRIuPTR " new: %" PRIuPTR "\n",
-			 (uintptr_t) code, code_size, new_code_size);
-	}
-
-	*size = (unsigned int) new_code_size;
-
-	if (state->ops.code_inv)
-		state->ops.code_inv(code, new_code_size);
-
-	return code;
-}
-
-static struct block * generate_wrapper(struct lightrec_state *state)
-{
-	struct block *block;
-	jit_state_t *_jit;
-	unsigned int i;
-
-	block = lightrec_malloc(state, MEM_FOR_IR, sizeof(*block));
-	if (!block)
-		goto err_no_mem;
-
-	_jit = jit_new_state();
-	if (!_jit)
-		goto err_free_block;
-
-	jit_name("RW wrapper");
-	jit_note(__FILE__, __LINE__);
-
-	/* Wrapper entry point */
-	jit_prolog();
-	jit_tramp(256);
-
-	/* Load pointer to C wrapper */
-	jit_add_state(JIT_R1, JIT_R1);
-	jit_ldxi(JIT_R1, JIT_R1, lightrec_offset(c_wrappers));
-
-	jit_epilog();
-	jit_prolog();
-
-	/* Save all temporaries on stack */
-	for (i = 0; i < NUM_TEMPS; i++) {
-		if (i + FIRST_TEMP != 1) {
-			jit_stxi(lightrec_offset(wrapper_regs[i]),
-				 LIGHTREC_REG_STATE, JIT_R(i + FIRST_TEMP));
-		}
-	}
-
-	jit_getarg(JIT_R2, jit_arg());
-
-	jit_prepare();
-	jit_pushargr(LIGHTREC_REG_STATE);
-	jit_pushargr(JIT_R2);
-
-	jit_ldxi_ui(JIT_R2, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-
-	/* state->current_cycle = state->target_cycle - delta; */
-	jit_subr(LIGHTREC_REG_CYCLE, JIT_R2, LIGHTREC_REG_CYCLE);
-	jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, LIGHTREC_REG_CYCLE);
-
-	/* Call the wrapper function */
-	jit_finishr(JIT_R1);
-
-	/* delta = state->target_cycle - state->current_cycle */;
-	jit_ldxi_ui(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE, lightrec_offset(current_cycle));
-	jit_ldxi_ui(JIT_R1, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-	jit_subr(LIGHTREC_REG_CYCLE, JIT_R1, LIGHTREC_REG_CYCLE);
-
-	/* Restore temporaries from stack */
-	for (i = 0; i < NUM_TEMPS; i++) {
-		if (i + FIRST_TEMP != 1) {
-			jit_ldxi(JIT_R(i + FIRST_TEMP), LIGHTREC_REG_STATE,
-				 lightrec_offset(wrapper_regs[i]));
-		}
-	}
-
-	jit_ret();
-	jit_epilog();
-
-	block->_jit = _jit;
-	block->opcode_list = NULL;
-	block->flags = BLOCK_NO_OPCODE_LIST;
-	block->nb_ops = 0;
-
-	block->function = lightrec_emit_code(state, block, _jit,
-					     &block->code_size);
-	if (!block->function)
-		goto err_free_jit;
-
-	state->c_wrapper = block->function;
-
-	if (ENABLE_DISASSEMBLER) {
-		pr_debug("Wrapper block:\n");
-		jit_disassemble();
-	}
-
-	jit_clear_state();
-	return block;
-
-err_free_jit:
-	jit_destroy_state();
-err_free_block:
-	lightrec_free(state, MEM_FOR_IR, sizeof(*block), block);
-err_no_mem:
-	pr_err("Unable to compile wrapper: Out of memory\n");
-	return NULL;
-}
 
 static u32 lightrec_memset(struct lightrec_state *state)
 {
@@ -1084,259 +922,9 @@ static u32 lightrec_check_load_delay(struct lightrec_state *state, u32 pc, u8 re
 	return pc;
 }
 
-static void update_cycle_counter_before_c(jit_state_t *_jit)
-{
-	/* update state->current_cycle */
-	jit_ldxi_i(JIT_R2, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-	jit_subr(JIT_R1, JIT_R2, LIGHTREC_REG_CYCLE);
-	jit_stxi_i(lightrec_offset(current_cycle), LIGHTREC_REG_STATE, JIT_R1);
-}
 
-static void update_cycle_counter_after_c(jit_state_t *_jit)
-{
-	/* Recalc the delta */
-	jit_ldxi_i(JIT_R1, LIGHTREC_REG_STATE, lightrec_offset(current_cycle));
-	jit_ldxi_i(JIT_R2, LIGHTREC_REG_STATE, lightrec_offset(target_cycle));
-	jit_subr(LIGHTREC_REG_CYCLE, JIT_R2, JIT_R1);
-}
 
-static void sync_next_pc(jit_state_t *_jit)
-{
-	if (lightrec_store_next_pc()) {
-		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE,
-			    lightrec_offset(next_pc));
-	}
-}
 
-static struct block * generate_dispatcher(struct lightrec_state *state)
-{
-	struct block *block;
-	jit_state_t *_jit;
-	jit_node_t *to_end, *loop, *loop2,
-		   *addr, *addr2, *addr3, *addr4, *addr5;
-	unsigned int i;
-	u32 offset;
-
-	block = lightrec_malloc(state, MEM_FOR_IR, sizeof(*block));
-	if (!block)
-		goto err_no_mem;
-
-	_jit = jit_new_state();
-	if (!_jit)
-		goto err_free_block;
-
-	jit_name("dispatcher");
-	jit_note(__FILE__, __LINE__);
-
-	jit_prolog();
-	jit_frame(256);
-
-	jit_getarg(LIGHTREC_REG_STATE, jit_arg());
-	jit_getarg(JIT_V0, jit_arg());
-	jit_getarg(JIT_V1, jit_arg());
-	jit_getarg_i(LIGHTREC_REG_CYCLE, jit_arg());
-
-	/* Force all callee-saved registers to be pushed on the stack */
-	for (i = 0; i < NUM_REGS; i++)
-		jit_movr(JIT_V(i + FIRST_REG), JIT_V(i + FIRST_REG));
-
-	loop = jit_label();
-
-	if (!arch_has_fast_mask())
-		jit_movi(JIT_R1, 0x1fffffff);
-
-	/* Call the block's code */
-	jit_jmpr(JIT_V1);
-
-	/* The block will jump here, with the number of cycles remaining in
-	 * LIGHTREC_REG_CYCLE */
-	addr2 = jit_indirect();
-
-	sync_next_pc(_jit);
-
-	loop2 = jit_label();
-
-	/* Jump to end if state->target_cycle < state->current_cycle */
-	to_end = jit_blei(LIGHTREC_REG_CYCLE, 0);
-
-	/* Convert next PC to KUNSEG and avoid mirrors */
-	jit_andi(JIT_V1, JIT_V0, RAM_SIZE - 1);
-	jit_andi(JIT_R2, JIT_V0, BIOS_SIZE - 1);
-	jit_andi(JIT_R1, JIT_V0, BIT(28));
-	jit_addi(JIT_R2, JIT_R2, RAM_SIZE);
-	jit_movnr(JIT_V1, JIT_R2, JIT_R1);
-
-	/* If possible, use the code LUT */
-	if (!lut_is_32bit(state))
-		jit_lshi(JIT_V1, JIT_V1, 1);
-	jit_add_state(JIT_V1, JIT_V1);
-
-	offset = lightrec_offset(code_lut);
-	if (lut_is_32bit(state))
-		jit_ldxi_ui(JIT_V1, JIT_V1, offset);
-	else
-		jit_ldxi(JIT_V1, JIT_V1, offset);
-
-	/* Store back the current PC to the lightrec_state structure */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
-
-	/* If we get non-NULL, loop */
-	jit_patch_at(jit_bnei(JIT_V1, 0), loop);
-
-	/* The code LUT will be set to this address when the block at the target
-	 * PC has been preprocessed but not yet compiled by the threaded
-	 * recompiler */
-	addr = jit_indirect();
-
-	/* Slow path: call C function get_next_block_func() */
-
-	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
-		/* We may call the interpreter - update state->current_cycle */
-		update_cycle_counter_before_c(_jit);
-	}
-
-	jit_prepare();
-	jit_pushargr(LIGHTREC_REG_STATE);
-	jit_pushargr(JIT_V0);
-
-	/* Save the cycles register if needed */
-	if (!(ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES))
-		jit_movr(JIT_V0, LIGHTREC_REG_CYCLE);
-
-	/* Get the next block */
-	jit_finishi(&get_next_block_func);
-	jit_retval(JIT_V1);
-
-	if (ENABLE_FIRST_PASS || OPT_DETECT_IMPOSSIBLE_BRANCHES) {
-		/* The interpreter may have updated state->current_cycle and
-		 * state->target_cycle - recalc the delta */
-		update_cycle_counter_after_c(_jit);
-	} else {
-		jit_movr(LIGHTREC_REG_CYCLE, JIT_V0);
-	}
-
-	/* Reset JIT_V0 to the next PC */
-	jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(curr_pc));
-
-	/* If we get non-NULL, loop */
-	jit_patch_at(jit_bnei(JIT_V1, 0), loop);
-
-	/* When exiting, the recompiled code will jump to that address */
-	jit_note(__FILE__, __LINE__);
-	jit_patch(to_end);
-
-	/* Store back the current PC to the lightrec_state structure */
-	jit_stxi_i(lightrec_offset(curr_pc), LIGHTREC_REG_STATE, JIT_V0);
-
-	jit_retr(LIGHTREC_REG_CYCLE);
-
-	if (OPT_REPLACE_MEMSET) {
-		/* Blocks will jump here when they need to call
-		 * lightrec_memset() */
-		addr3 = jit_indirect();
-
-		jit_movr(JIT_V1, LIGHTREC_REG_CYCLE);
-
-		jit_prepare();
-		jit_pushargr(LIGHTREC_REG_STATE);
-
-		jit_finishi(lightrec_memset);
-		jit_retval(LIGHTREC_REG_CYCLE);
-
-		jit_ldxi_ui(JIT_V0, LIGHTREC_REG_STATE, lightrec_offset(regs.gpr[31]));
-
-		jit_subr(LIGHTREC_REG_CYCLE, JIT_V1, LIGHTREC_REG_CYCLE);
-
-		jit_patch_at(jit_b(), loop2);
-	}
-
-	if (OPT_DETECT_IMPOSSIBLE_BRANCHES) {
-		/* Blocks will jump here when they reach a branch that should
-		 * be executed with the interpreter, passing the branch's PC
-		 * in JIT_V0 and the address of the block in JIT_V1. */
-		addr4 = jit_indirect();
-
-		sync_next_pc(_jit);
-		update_cycle_counter_before_c(_jit);
-
-		jit_prepare();
-		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(JIT_V1);
-		jit_pushargr(JIT_V0);
-		jit_finishi(lightrec_emulate_block);
-
-		jit_retval(JIT_V0);
-
-		update_cycle_counter_after_c(_jit);
-
-		jit_patch_at(jit_b(), loop2);
-
-	}
-
-	if (OPT_HANDLE_LOAD_DELAYS) {
-		/* Blocks will jump here when they reach a branch with a load
-		 * opcode in its delay slot. The delay slot has already been
-		 * executed; the load value is in (state->temp_reg), and the
-		 * register number is in JIT_V1.
-		 * Jump to a C function which will evaluate the branch target's
-		 * first opcode, to make sure that it does not read the register
-		 * in question; and if it does, handle it accordingly. */
-		addr5 = jit_indirect();
-
-		sync_next_pc(_jit);
-		update_cycle_counter_before_c(_jit);
-
-		jit_prepare();
-		jit_pushargr(LIGHTREC_REG_STATE);
-		jit_pushargr(JIT_V0);
-		jit_pushargr(JIT_V1);
-		jit_finishi(lightrec_check_load_delay);
-
-		jit_retval(JIT_V0);
-
-		update_cycle_counter_after_c(_jit);
-
-		jit_patch_at(jit_b(), loop2);
-	}
-
-	jit_epilog();
-
-	block->_jit = _jit;
-	block->opcode_list = NULL;
-	block->flags = BLOCK_NO_OPCODE_LIST;
-	block->nb_ops = 0;
-
-	block->function = lightrec_emit_code(state, block, _jit,
-					     &block->code_size);
-	if (!block->function)
-		goto err_free_jit;
-
-	state->eob_wrapper_func = jit_address(addr2);
-	if (OPT_DETECT_IMPOSSIBLE_BRANCHES)
-		state->interpreter_func = jit_address(addr4);
-	if (OPT_HANDLE_LOAD_DELAYS)
-		state->ds_check_func = jit_address(addr5);
-	if (OPT_REPLACE_MEMSET)
-		state->memset_func = jit_address(addr3);
-	state->get_next_block = jit_address(addr);
-
-	if (ENABLE_DISASSEMBLER) {
-		pr_debug("Dispatcher block:\n");
-		jit_disassemble();
-	}
-
-	/* We're done! */
-	jit_clear_state();
-	return block;
-
-err_free_jit:
-	jit_destroy_state();
-err_free_block:
-	lightrec_free(state, MEM_FOR_IR, sizeof(*block), block);
-err_no_mem:
-	pr_err("Unable to compile dispatcher: Out of memory\n");
-	return NULL;
-}
 
 union code lightrec_read_opcode(struct lightrec_state *state, u32 pc)
 {
@@ -1437,7 +1025,6 @@ static struct block * lightrec_precompile_block(struct lightrec_state *state,
 	}
 
 	block->pc = pc;
-	block->_jit = NULL;
 	block->function = NULL;
 	block->opcode_list = list;
 	block->code = code;
@@ -1532,11 +1119,6 @@ static void lightrec_reap_block(struct lightrec_state *state, void *data)
 	lightrec_free_block(state, block);
 }
 
-static void lightrec_reap_jit(struct lightrec_state *state, void *data)
-{
-	_jit_destroy_state(data);
-}
-
 static void lightrec_free_function(struct lightrec_state *state, void *fn)
 {
 	if (ENABLE_CODE_BUFFER && state->tlsf) {
@@ -1558,116 +1140,61 @@ static void lightrec_reap_opcode_list(struct lightrec_state *state, void *data)
 int lightrec_compile_block(struct lightrec_cstate *cstate,
 			   struct block *block)
 {
-	struct block *dead_blocks[ARRAY_SIZE(cstate->targets)];
-	u32 was_dead[ARRAY_SIZE(cstate->targets) / 8];
 	struct lightrec_state *state = cstate->state;
-	struct lightrec_branch_target *target;
 	bool fully_tagged = false;
-	struct block *block2;
-	struct opcode *elm;
-	jit_state_t *_jit, *oldjit;
-	jit_node_t *start_of_block;
-	bool skip_next = false;
 	void *old_fn, *new_fn;
 	size_t old_code_size;
-	unsigned int i, j;
+	unsigned int i;
 	u8 old_flags;
-	u32 offset;
+	int err;
 
 	fully_tagged = lightrec_block_is_fully_tagged(block);
 	if (fully_tagged)
 		block_set_flags(block, BLOCK_FULLY_TAGGED);
 
-	_jit = jit_new_state();
-	if (!_jit)
-		return -ENOMEM;
-
-	oldjit = block->_jit;
 	old_fn = block->function;
 	old_code_size = block->code_size;
-	block->_jit = _jit;
 
-	lightrec_regcache_reset(cstate->reg_cache);
 
-	if (OPT_PRELOAD_PC && (block->flags & BLOCK_PRELOAD_PC))
-		lightrec_preload_pc(cstate->reg_cache, _jit);
-
-	if (!arch_has_fast_mask())
-		lightrec_preload_imm(cstate->reg_cache, _jit, JIT_R1, 0x1fffffff);
-
-	cstate->cycles = 0;
-	cstate->nb_local_branches = 0;
-	cstate->nb_targets = 0;
-	cstate->no_load_delay = false;
-
-	jit_prolog();
-	jit_tramp(256);
-
-	start_of_block = jit_label();
-
-	for (i = 0; i < block->nb_ops; i++) {
-		elm = &block->opcode_list[i];
-
-		if (skip_next) {
-			skip_next = false;
-			continue;
-		}
-
-		if (should_emulate(elm)) {
-			pr_debug("Branch at offset 0x%x will be emulated\n",
-				 i << 2);
-
-			lightrec_emit_jump_to_interpreter(cstate, block, i);
-			skip_next = !op_flag_no_ds(elm->flags);
-		} else {
-			lightrec_rec_opcode(cstate, block, i);
-			skip_next = !op_flag_no_ds(elm->flags) && has_delay_slot(elm->c);
-#if _WIN32
-			/* FIXME: GNU Lightning on Windows seems to use our
-			 * mapped registers as temporaries. Until the actual bug
-			 * is found and fixed, unconditionally mark our
-			 * registers as live here. */
-			lightrec_regcache_mark_live(cstate->reg_cache, _jit);
-#endif
-		}
-
-		cstate->cycles += lightrec_cycles_of_opcode(state, elm->c);
-	}
-
-	for (i = 0; i < cstate->nb_local_branches; i++) {
-		struct lightrec_branch *branch = &cstate->local_branches[i];
-
-		pr_debug("Patch local branch to offset 0x%"PRIx32"\n",
-			 branch->target << 2);
-
-		if (branch->target == 0) {
-			jit_patch_at(branch->branch, start_of_block);
-			continue;
-		}
-
-		for (j = 0; j < cstate->nb_targets; j++) {
-			if (cstate->targets[j].offset == branch->target) {
-				jit_patch_at(branch->branch,
-					     cstate->targets[j].label);
-				break;
-			}
-		}
-
-		if (j == cstate->nb_targets)
-			pr_err("Unable to find branch target\n");
-	}
-
-	jit_ret();
-	jit_epilog();
-
-	new_fn = lightrec_emit_code(state, block, _jit, &block->code_size);
+	/* WHERE THE WHOLE OF GNU LIGHTNING USED TO BE.
+	 *
+	 * What stood here was a compilation context, a register-cache reset, a
+	 * prologue, a per-opcode loop into `emitter.c`, a local-branch patch
+	 * pass and a final `jit_emit()`.  fgl replaces all of it with one call:
+	 * it owns the lowering, the register allocation, the emission and the
+	 * placement of the code in the arena, and it takes lightrec's already
+	 * optimised opcode list as its input so that none of the optimiser's
+	 * proofs are thrown away and re-derived.
+	 *
+	 * `cstate->targets[]` and `cstate->local_branches[]` are left empty.
+	 * They existed so that a branch INSIDE a block could be patched to an
+	 * address inside the same block and published in the code table; fgl
+	 * ends a block at the first control transfer instead, so every branch
+	 * leaves through the dispatcher and every target becomes a block of its
+	 * own.  Correct, and slower than it needs to be -- see the note in
+	 * fgl_compile_block.
+	 */
+	new_fn = fgl_compile_block(cstate, block, &block->code_size, &err);
 	if (!new_fn) {
-		if (!ENABLE_THREADED_COMPILER)
-			pr_err("Unable to compile block!\n");
-		block->_jit = oldjit;
-		jit_clear_state();
-		_jit_destroy_state(_jit);
-		return -ENOMEM;
+		if (err == -ENOMEM) {
+			if (!ENABLE_THREADED_COMPILER)
+				pr_err("Code arena full compiling block at "
+				       PC_FMT"\n", block->pc);
+			return -ENOMEM;
+		}
+
+		/* fgl cannot lower this block.  A HOLE TO FILL, and the flag
+		 * is not a fallback path -- it is what stops the emulator from
+		 * spending the rest of its life recompiling the same refusal.
+		 * -ENOMEM here means "arena full" to the caller, which flushes
+		 * the whole block cache and asks again, gets the same refusal,
+		 * and flushes again.  Interpreting the block instead keeps the
+		 * machine alive long enough for the message above to be read
+		 * and the hole to be filled. */
+		pr_err("fgl cannot lower the block at "PC_FMT" -- interpreting "
+		       "it; this is a hole in fgl, not a design\n", block->pc);
+		block_set_flags(block, BLOCK_NEVER_COMPILE);
+		return -EINVAL;
 	}
 
 	/* Pause the reaper, because lightrec_reset_lut_offset() may try to set
@@ -1681,81 +1208,14 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
 
-	/* Detect old blocks that have been covered by the new one */
-	for (i = 0; ENABLE_THREADED_COMPILER && i < cstate->nb_targets; i++) {
-		target = &cstate->targets[i];
-
-		if (!target->offset)
-			continue;
-
-		offset = block->pc + target->offset * sizeof(u32);
-
-		block2 = lightrec_find_block(state->block_cache, offset);
-		if (block2) {
-			/* No need to check if block2 is compilable - it must
-			 * be, otherwise block wouldn't be compilable either */
-
-			/* Set the "block dead" flag to prevent the dynarec from
-			 * recompiling this block */
-			old_flags = block_set_flags(block2, BLOCK_IS_DEAD);
-
-			if (old_flags & BLOCK_IS_DEAD)
-				was_dead[i / 32] |= BIT(i % 32);
-			else
-				was_dead[i / 32] &= ~BIT(i % 32);
-		}
-
-		dead_blocks[i] = block2;
-
-		/* If block2 was pending for compilation, cancel it.
-		 * If it's being compiled right now, wait until it finishes. */
-		if (block2)
-			lightrec_recompiler_remove(state->rec, block2);
-	}
-
-	for (i = 0; i < cstate->nb_targets; i++) {
-		target = &cstate->targets[i];
-
-		if (!target->offset)
-			continue;
-
-		/* We know from now on that block2 (if present) isn't going to
-		 * be compiled. We can override the LUT entry with our new
-		 * block's entry point. */
-		offset = lut_offset(block->pc) + target->offset;
-		lut_write(state, offset, jit_address(target->label));
-
-		if (ENABLE_THREADED_COMPILER) {
-			block2 = dead_blocks[i];
-		} else {
-			offset = block->pc + target->offset * sizeof(u32);
-			block2 = lightrec_find_block(state->block_cache, offset);
-		}
-		if (block2) {
-			pr_debug("Reap block "X32_FMT" as it's covered by block "
-				 X32_FMT"\n", block2->pc, block->pc);
-
-			/* Finally, reap the block. */
-			if (!ENABLE_THREADED_COMPILER) {
-				lightrec_unregister_block(state->block_cache, block2);
-				lightrec_free_block(state, block2);
-			} else if (!(was_dead[i / 32] & BIT(i % 32))) {
-				lightrec_reaper_add(state->reaper,
-						    lightrec_reap_block,
-						    block2);
-			}
-		}
-	}
+	/* The pass that walked `cstate->targets[]` -- marking blocks covered by
+	 * this one as dead and publishing each internal branch target into the
+	 * code table -- is gone with the targets themselves. Nothing here can
+	 * cover another block any more, because a block now ends at its first
+	 * control transfer. */
 
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_reaper_continue(state->reaper);
-
-	if (ENABLE_DISASSEMBLER) {
-		pr_debug("Compiling block at "PC_FMT"\n", block->pc);
-		jit_disassemble();
-	}
-
-	jit_clear_state();
 
 	if (fully_tagged)
 		old_flags = block_set_flags(block, BLOCK_NO_OPCODE_LIST);
@@ -1773,19 +1233,18 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		}
 	}
 
-	if (oldjit) {
-		pr_debug("Block "X32_FMT" recompiled, reaping old jit context.\n",
+	if (old_fn) {
+		/* Only the code is reaped now. There is no compilation context
+		 * to destroy: fgl's emitter lives on the stack for the length
+		 * of one call and owns nothing that outlives it. */
+		pr_debug("Block "X32_FMT" recompiled, reaping old code.\n",
 			 block->pc);
 
-		if (ENABLE_THREADED_COMPILER) {
-			lightrec_reaper_add(state->reaper,
-					    lightrec_reap_jit, oldjit);
+		if (ENABLE_THREADED_COMPILER)
 			lightrec_reaper_add(state->reaper,
 					    lightrec_reap_function, old_fn);
-		} else {
-			_jit_destroy_state(oldjit);
+		else
 			lightrec_free_function(state, old_fn);
-		}
 
 		lightrec_unregister(MEM_FOR_CODE, old_code_size);
 	}
@@ -1809,9 +1268,34 @@ static void lightrec_print_info(struct lightrec_state *state)
 	}
 }
 
+/* WHAT dispatch.S CALLS, AND WHY THESE WRAPPERS EXIST AT ALL.
+ *
+ * `lightrec_memset` and `lightrec_check_load_delay` are static in this file,
+ * so the assembly cannot name them however it is written. `lightrec_emulate_block`
+ * is not, and is wrapped anyway so that all three slots in dispatch.S are
+ * filled from one place and by one convention.
+ *
+ * The cycle contract differs between them and it is the dispatcher, not these,
+ * that implements it: the two that spend cycles inside C are entered and left
+ * through `.Lsync_out`/`.Lsync_in`, and memset is not, because it reports its
+ * cost as a return value and touches neither counter. */
+u32 fgl_memset(struct lightrec_state *state)
+{
+	return lightrec_memset(state);
+}
+
+u32 fgl_emulate_block(struct lightrec_state *state, struct block *block, u32 pc)
+{
+	return lightrec_emulate_block(state, block, pc);
+}
+
+u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg)
+{
+	return lightrec_check_load_delay(state, pc, reg);
+}
+
 u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 {
-	s32 (*func)(struct lightrec_state *, u32, void *, s32) = (void *)state->dispatcher->function;
 	void *block_trace;
 	s32 cycles_delta;
 
@@ -1824,12 +1308,16 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 	state->target_cycle = target_cycle;
 	state->curr_pc = pc;
 
-	block_trace = get_next_block_func(state, pc);
+	block_trace = fgl_get_next_block(state, pc);
 	if (block_trace) {
 		cycles_delta = state->target_cycle - state->current_cycle;
 
-		cycles_delta = (*func)(state, state->curr_pc,
-				       block_trace, cycles_delta);
+		/* Straight into the hand-written dispatcher. Its signature is
+		 * the one lightrec's generated dispatcher had, third argument
+		 * included -- which fgl ignores, looking the first block up
+		 * through the table like any other. */
+		cycles_delta = fgl_dispatch(state, state->curr_pc,
+					    block_trace, cycles_delta);
 
 		state->current_cycle = state->target_cycle - cycles_delta;
 	}
@@ -1877,8 +1365,6 @@ void lightrec_free_block(struct lightrec_state *state, struct block *block)
 
 	if (!(old_flags & BLOCK_NO_OPCODE_LIST))
 		lightrec_free_opcode_list(state, block->opcode_list);
-	if (block->_jit)
-		_jit_destroy_state(block->_jit);
 	if (block->function) {
 		lightrec_free_function(state, block->function);
 		lightrec_unregister(MEM_FOR_CODE, block->code_size);
@@ -1894,12 +1380,6 @@ struct lightrec_cstate * lightrec_create_cstate(struct lightrec_state *state)
 	if (!cstate)
 		return NULL;
 
-	cstate->reg_cache = lightrec_regcache_init(state);
-	if (!cstate->reg_cache) {
-		lightrec_free(state, MEM_FOR_LIGHTREC, sizeof(*cstate), cstate);
-		return NULL;
-	}
-
 	cstate->state = state;
 
 	return cstate;
@@ -1907,7 +1387,6 @@ struct lightrec_cstate * lightrec_create_cstate(struct lightrec_state *state)
 
 void lightrec_free_cstate(struct lightrec_cstate *cstate)
 {
-	lightrec_free_regcache(cstate->reg_cache);
 	lightrec_free(cstate->state, MEM_FOR_LIGHTREC, sizeof(*cstate), cstate);
 }
 
@@ -1973,11 +1452,9 @@ struct lightrec_state * lightrec_init(char *argv0,
 	else
 		lut_size = CODE_LUT_SIZE * sizeof(void *);
 
-	init_jit_with_debug(argv0, stdout);
-
 	state = calloc(1, sizeof(*state) + lut_size);
 	if (!state)
-		goto err_finish_jit;
+		goto err_free_tlsf;
 
 	lightrec_register(MEM_FOR_LIGHTREC, sizeof(*state) + lut_size);
 
@@ -2010,19 +1487,27 @@ struct lightrec_state * lightrec_init(char *argv0,
 
 	memcpy(&state->ops, ops, sizeof(*ops));
 
-	state->dispatcher = generate_dispatcher(state);
-	if (!state->dispatcher)
-		goto err_free_reaper;
+	/* THE DISPATCHER AND THE SERVICE TRAMPOLINE ARE NOT GENERATED ANY MORE.
+	 *
+	 * lightrec built both at run time, as Lightning IR, because they had to
+	 * agree with whatever registers its register allocator had picked on
+	 * this host. fgl's register contract is fixed and written down
+	 * (src/fgl/fgl.h), so both are ordinary hand-written assembly compiled
+	 * into the image, and what used to be a code generator is now a symbol.
+	 *
+	 * `c_wrappers[]` is gone with them: fgl reaches C by materialising the
+	 * callee's address as a literal and calling a fixed shim, so there is
+	 * no table to index and no selector to pack. */
+	state->memset_func      = fgl_dispatch_memset;
+	state->get_next_block   = fgl_dispatch_compile;
+	state->interpreter_func = fgl_dispatch_interpreter;
+	state->ds_check_func    = fgl_dispatch_ds_check;
 
-	state->c_wrapper_block = generate_wrapper(state);
-	if (!state->c_wrapper_block)
-		goto err_free_dispatcher;
-
-	state->c_wrappers[C_WRAPPER_RW] = lightrec_rw_cb;
-	state->c_wrappers[C_WRAPPER_RW_GENERIC] = lightrec_rw_generic_cb;
-	state->c_wrappers[C_WRAPPER_MFC] = lightrec_mfc_cb;
-	state->c_wrappers[C_WRAPPER_MTC] = lightrec_mtc_cb;
-	state->c_wrappers[C_WRAPPER_CP] = lightrec_cp_cb;
+	/* What generated code reads out of the state block. All three are
+	 * inside GBR's 1020-byte reach; fgl_lightrec.c asserts it. */
+	state->dispatch  = (u32)(uintptr_t)fgl_dispatch_loop;
+	state->lut_base  = (u32)(uintptr_t)state->code_lut;
+	state->addr_mask = 0x1fffffff;
 
 	map = &maps[PSX_MAP_BIOS];
 	state->offset_bios = (uintptr_t)map->address - map->pc;
@@ -2056,8 +1541,6 @@ struct lightrec_state * lightrec_init(char *argv0,
 
 	return state;
 
-err_free_dispatcher:
-	lightrec_free_block(state, state->dispatcher);
 err_free_reaper:
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_reaper_destroy(state->reaper);
@@ -2072,8 +1555,7 @@ err_free_state:
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
 			    lut_elm_size(state) * CODE_LUT_SIZE);
 	free(state);
-err_finish_jit:
-	finish_jit();
+err_free_tlsf:
 	if (ENABLE_CODE_BUFFER && tlsf)
 		tlsf_destroy(tlsf);
 	return NULL;
@@ -2086,8 +1568,6 @@ void lightrec_destroy(struct lightrec_state *state)
 	lightrec_print_info(state);
 
 	lightrec_free_block_cache(state->block_cache);
-	lightrec_free_block(state, state->dispatcher);
-	lightrec_free_block(state, state->c_wrapper_block);
 
 	if (ENABLE_THREADED_COMPILER) {
 		lightrec_free_recompiler(state->rec);
@@ -2096,7 +1576,6 @@ void lightrec_destroy(struct lightrec_state *state)
 		lightrec_free_cstate(state->cstate);
 	}
 
-	finish_jit();
 	if (ENABLE_CODE_BUFFER && state->tlsf)
 		tlsf_destroy(state->tlsf);
 

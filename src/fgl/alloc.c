@@ -477,6 +477,12 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                          * from here, and the shadow instruction would then
                          * read the new value instead of the old one. */
                         p->hd = p->defer ? -1 : host_dst(&s, p->rd);
+                        /* A device access is a call, and `jsr` needs its
+                         * target somewhere that is not r0 or r1 -- both are
+                         * carrying the address and the callee. Memory needs
+                         * nothing: it is two instructions and no call. */
+                        if (p->io == FGL_IO_HW)
+                                scratch(&s, p, 1);
                         break;
 
                 case IR_TEMP_GET:
@@ -519,6 +525,8 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                          * are both live across the merge. */
                         if (p->op == IR_STORE_UN)
                                 scratch(&s, p, 2);
+                        else if (p->io == FGL_IO_HW)
+                                scratch(&s, p, 1);      /* the `jsr` target */
                         break;
 
                 case IR_LOAD_UN:
@@ -549,6 +557,28 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         /* Deferred, it claims no destination -- the same
                          * shadow an ordinary load has. */
                         p->hd = p->defer ? -1 : host_dst(&s, p->rd);
+                        break;
+
+                case IR_GTE:
+                        /* No guest operands at all -- the command reads and
+                         * writes the COP2 file in the state block. What it
+                         * does need is somewhere to put the shim's address,
+                         * because `jsr` cannot take it in r0 or r1 and both
+                         * of those are carrying the call's arguments. */
+                        scratch(&s, p, 1);
+                        break;
+
+                case IR_RW:
+                        /* C performs the whole access against the state
+                         * block, so every guest register the allocator is
+                         * holding has to be there before the call -- and
+                         * reloaded after it, because C writes the destination.
+                         * `flush` does both: it stores what is dirty and
+                         * resets the ownership map, so the next reader
+                         * reloads. The scratch is the `jsr` target, and after
+                         * a flush nothing is dirty so any register will do. */
+                        flush(&s);
+                        scratch(&s, p, 1);
                         break;
 
                 case IR_STOP:

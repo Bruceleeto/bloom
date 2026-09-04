@@ -63,6 +63,35 @@
  */
 void fgl_shim_call(void);
 
+/* A hardware store, which is the one service with three values to pass.
+ *
+ *      in    r0 = the callee, r1 = the address,
+ *            state->shim_arg = the value to store
+ *      out   nothing; lightrec_hw_sb/_sh/_sw all return void
+ *      the callee sees  f(r4 = the address, r5 = the value,
+ *                        r6 = the state block)
+ *
+ * `f(addr, val, state)` needs two values carried in from the block, and the
+ * block has exactly two registers to carry anything in -- so there is no room
+ * left for the callee itself.  The value takes the state block instead: the
+ * call site parks it in FGL_AT_SHIM_ARG and the shim loads it into the second
+ * argument register.  One store here, one load there, and no register.  That
+ * word is not `temp_reg`; fgl_state.h says why.
+ *
+ * Call site, seven instructions and three pool words -- the five of
+ * fgl_shim_call plus the two that park the value, which must be through r0
+ * because @(disp,GBR) has no other destination:
+ *
+ *      mov     rV, r0                  ; the value to store
+ *      mov.l   r0, @(FGL_AT_SHIM_ARG*4, gbr)
+ *      mov.l   @(disp,pc), r0          ; the callee
+ *      mov     rA, r1                  ; the address
+ *      mov.l   @(disp,pc), rS          ; fgl_shim_call_st
+ *      jsr     @rS
+ *       nop
+ */
+void fgl_shim_call_st(void);
+
 /* The GTE.
  *
  *      in    r0 = the callee, r1 = the guest COP2 command word
@@ -116,6 +145,8 @@ void fgl_shim_div(void);
  * and the divisor into r0. */
 #define FGL_SHIM_CALL_INSNS  5
 #define FGL_SHIM_CALL_POOL   3
+#define FGL_SHIM_CALL_ST_INSNS 7
+#define FGL_SHIM_CALL_ST_POOL  3
 #define FGL_SHIM_GTE_INSNS   5
 #define FGL_SHIM_GTE_POOL    3
 #define FGL_SHIM_DIV_INSNS   3
@@ -125,6 +156,7 @@ void fgl_shim_div(void);
  * divides are ranges because the sign fixups and the non-restoring correction
  * are branched over when they are not needed. */
 #define FGL_SHIM_CALL_BODY   29
+#define FGL_SHIM_CALL_ST_BODY 29
 #define FGL_SHIM_GTE_BODY    28
 #define FGL_SHIM_DIVU_BODY   76         /* 75 when the last step was exact */
 #define FGL_SHIM_DIV_BODY    95         /* 90 at best, by the operands' signs */
@@ -136,7 +168,8 @@ void fgl_shim_div(void);
 /* The shims that rebuild the cycle delta, which is the one write to r14 that
  * anything other than a block epilogue is allowed to make. */
 #define FGL_SHIM_WRITES_CYCLE(sym) \
-	((sym) == fgl_shim_call || (sym) == fgl_shim_gte)
+	((sym) == fgl_shim_call || (sym) == fgl_shim_call_st || \
+	 (sym) == fgl_shim_gte)
 
 /* ---------------------------------------------------------------- */
 /* Where shim.S and fgl_state.h agree, and why nothing here checks it */
@@ -163,5 +196,7 @@ _Static_assert(FGL_AT_TARGET_CYCLE * 4u <= 1020u,
 	       "shim.S: the cycle counters left GBR's reach");
 _Static_assert(FGL_AT_CP2D * 4u <= 1020u,
 	       "shim.S: the COP2 file left GBR's reach");
+_Static_assert(FGL_AT_SHIM_ARG * 4u <= 1020u,
+	       "shim.S: the third argument's word left GBR's reach");
 
 #endif /* FGL_SHIM_H */

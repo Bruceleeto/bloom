@@ -9,7 +9,6 @@
 #include <string.h>
 
 #include "lightrec-private.h"
-#include "regcache.h"
 
 static const char * const std_opcodes[] = {
 	[OP_J]			= "j       ",

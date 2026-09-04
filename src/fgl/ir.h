@@ -58,11 +58,36 @@ enum {
         IR_MTC2,        /* cop2[imm] = rs              */
         IR_LWC2,        /* cop2[imm] = mem[rs + imm2]  */
         IR_SWC2,        /* mem[rs + imm2] = cop2[imm]  */
-        IR_GTE,         /* run command `imm`           */
+        IR_GTE,         /* run command `imm` -- the whole guest word */
 
         /* The other half of a deferred load: rd = the parked value. See
          * `defer` below. */
         IR_TEMP_GET,
+
+        /* A MEMORY ACCESS C HAS TO PERFORM, `imm` being the guest
+         * instruction word.
+         *
+         * lightrec's optimiser proves a region for most accesses and fgl
+         * lowers those to two instructions.  When it cannot prove one, the
+         * access may reach anything -- RAM, a device, an unmapped hole -- and
+         * the only thing that knows which is lightrec's map dispatch.  So the
+         * whole access goes to C, address arithmetic included.
+         *
+         * A SEPARATE NODE RATHER THAN A FLAG ON IR_LOAD, for a reason that is
+         * about the oracle rather than about taste.  `FGL_IO_UNKNOWN` is zero,
+         * and zero is also what the raw-word decoder leaves on every node it
+         * builds, because it has no optimiser to learn a region from.  A test
+         * for "unknown region" would therefore fire on every access the oracle
+         * has ever compared, and turn its twenty thousand blocks into C calls
+         * without failing anything.  Only `front.c` builds this node, so the
+         * decision is made where the information is and the oracle cannot be
+         * quietly redefined by it.
+         *
+         * C reads the base register and writes the destination IN THE STATE
+         * BLOCK, so every guest register the allocator is holding must be
+         * written back before this node and reloaded after it.  That is what
+         * `flush` in alloc.c does, and why this node claims no operands. */
+        IR_RW,
 
         IR_STOP,        /* SYSCALL / BREAK — sub is the exception code */
 

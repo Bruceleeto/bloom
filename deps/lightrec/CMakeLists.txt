@@ -1,29 +1,30 @@
 cmake_minimum_required(VERSION 3.10)
 project(lightrec LANGUAGES C VERSION 0.9)
 
+# emitter.c and regcache.c are gone: they WERE the GNU Lightning backend, and
+# what replaces them is fgl, whose sources live in ../../src/fgl and are added
+# below. constprop.c and optimizer.c stay -- the optimiser's proofs are what
+# let fgl emit two instructions for a load instead of a call, so they are the
+# reason this is worth doing at all.
 list(APPEND LIGHTREC_SOURCES
 	blockcache.c
 	constprop.c
-	emitter.c
 	interpreter.c
 	lightrec.c
 	memmanager.c
 	optimizer.c
-	regcache.c
 )
 list(APPEND LIGHTREC_HEADERS
 	blockcache.h
 	constprop.h
 	debug.h
 	disassembler.h
-	emitter.h
 	interpreter.h
 	lightrec-private.h
 	lightrec.h
 	memmanager.h
 	optimizer.h
 	recompiler.h
-	regcache.h
 )
 
 add_library(lightrec ${LIGHTREC_SOURCES} ${LIGHTREC_HEADERS})
@@ -114,11 +115,32 @@ if (ENABLE_CODE_BUFFER)
 	target_include_directories(lightrec PRIVATE tlsf)
 endif (ENABLE_CODE_BUFFER)
 
-find_library(LIBLIGHTNING lightning REQUIRED)
-find_path(LIBLIGHTNING_INCLUDE_DIR lightning.h REQUIRED)
-
-target_include_directories(lightrec PUBLIC ${LIBLIGHTNING_INCLUDE_DIR})
-target_link_libraries(lightrec PUBLIC ${LIBLIGHTNING})
+# fgl -- the SH-4 code generator, in place of GNU Lightning.
+#
+# The library that used to be found and linked here is not merely optional now,
+# it is absent: nothing in this target refers to it. What took its place is a
+# handful of C files and two hand-written assembly ones, compiled straight into
+# lightrec rather than linked as a library, because they and lightrec.c share a
+# private header (lightrec-private.h) and a state layout that only holds
+# because src/fgl/fgl_lightrec.c asserts it at compile time.
+#
+# The .S files need no special handling: ASM is enabled for the whole project
+# and gcc preprocesses an uppercase .S, which is what lets them #include
+# fgl_state.h and write the same displacements the emitter bakes in.
+set(FGL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../src/fgl)
+target_sources(lightrec PRIVATE
+	${FGL_DIR}/decode.c
+	${FGL_DIR}/front.c
+	${FGL_DIR}/alloc.c
+	${FGL_DIR}/emit.c
+	${FGL_DIR}/fgl_lightrec.c
+	${FGL_DIR}/dispatch.S
+	${FGL_DIR}/shim.S
+)
+target_include_directories(lightrec PRIVATE
+	${FGL_DIR}
+	${CMAKE_CURRENT_SOURCE_DIR}/../../src
+)
 
 if (LOG_LEVEL STREQUAL Debug)
 	set(ENABLE_DISASSEMBLER ON)

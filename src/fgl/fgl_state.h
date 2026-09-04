@@ -155,9 +155,29 @@
 #define FGL_AT_LUT           (FGL_AT_DISPATCH + 1u)                   /* +684 */
 #define FGL_AT_ADDR_MASK     (FGL_AT_LUT + 1u)                        /* +688 */
 
+/* THE THIRD ARGUMENT, FOR THE ONE SERVICE THAT NEEDS ONE.
+ *
+ * A block hands a service its arguments in r0 and r1, and that is all it has:
+ * r2 is carrying the exit PC and r3-r12 are carrying guest values.  Two is
+ * enough for every service but one.  `lightrec_hw_sb(addr, val, state)` takes
+ * three, and the state block is the third of them, so the value has nowhere
+ * left to travel.
+ *
+ * It travels here.  The call site stores it before the call and the shim
+ * loads it into the third argument register, which costs one instruction on
+ * each side and no registers at all.
+ *
+ * NOT `temp_reg`, WHICH IS THE OBVIOUS PLACE AND IS WRONG.  That word is the
+ * parking slot for a deferred load's value (see ir.h) and the park outlives
+ * the node that made it -- the load parks, an unrelated node runs, and
+ * IR_TEMP_GET collects.  If that unrelated node is a hardware store, reusing
+ * the slot destroys a guest register's value with nothing to show for it.
+ * Two purposes that overlap in time need two words. */
+#define FGL_AT_SHIM_ARG      (FGL_AT_ADDR_MASK + 1u)                  /* +692 */
+
 /* How many words of state block generated code can touch, so a harness knows
  * how much to allocate. */
-#define FGL_STATE_WORDS (FGL_AT_ADDR_MASK + 1u)
+#define FGL_STATE_WORDS (FGL_AT_SHIM_ARG + 1u)
 
 /* The COP0 registers that are actually live.  Everything else reads zero and
  * discards writes. */

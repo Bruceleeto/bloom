@@ -71,7 +71,17 @@
 psxRegisters psxRegs;
 Rcnt rcnts[4];
 
+/* With a custom map the code buffer is the FRONTEND'S, not this plugin's:
+ * nothing below assigns it (see the !LIGHTREC_CUSTOM_MAP branch in
+ * lightrec_plugin_init), and bloom places it itself in src/mmap.c because on
+ * the Dreamcast it has to sit at a known address in P1. A tentative
+ * definition here is a second one of the same symbol, which -fno-common makes
+ * a link error rather than quietly merging. */
+#if LIGHTREC_CUSTOM_MAP
+extern void* code_buffer;
+#else
 void* code_buffer;
+#endif
 
 static struct lightrec_state *lightrec_state;
 
@@ -513,7 +523,10 @@ static int lightrec_plugin_init(void)
 
 	lightrec_map[PSX_MAP_CODE_BUFFER].address = code_buffer;
 
-	use_lightrec_interpreter = !!getenv("LIGHTREC_INTERPRETER");
+	/* TEMPORARY A/B: 1 = lightrec's C interpreter only, no fgl code runs at
+	 * all; 0 = fgl. There is no environment on the Dreamcast, so this is a
+	 * recompile rather than a variable. Put the getenv back when done. */
+	use_lightrec_interpreter = 1;
 
 #ifdef LIGHTREC_DEBUG
 	char *cycles = getenv("LIGHTREC_BEGIN_CYCLES");

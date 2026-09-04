@@ -54,7 +54,31 @@ typedef char fgl_io_enum_matches[
  * write, a link and its jump -- so the flags are applied to the range the
  * instruction produced rather than to "the node", and each node takes only the
  * facts that mean something for its own opcode. */
-static void apply_flags(ir_ctx *c, int from, uint32_t flags)
+/* Can fgl lower this access itself, or does the whole thing go to C?
+ *
+ * Anything with a proven region is fgl's: the direct regions become a masked
+ * access, and FGL_IO_HW becomes a call to the accessor for its width.  The two
+ * that are not:
+ *
+ *   - an UNPROVEN region.  The address may reach RAM, a device or nothing at
+ *     all, and only lightrec's map dispatch knows which.
+ *   - a device access whose SHAPE has no accessor.  `lightrec_hw_lb` and its
+ *     family cover the five plain load widths and the three plain store
+ *     widths; LWL/LWR/SWL/SWR, LWC2/SWC2 and the meta forms have none, which
+ *     is the same conclusion lightrec reaches when `rec_load_hw_call` returns
+ *     false and falls through to its generic path.
+ */
+static int access_is_ours(const ir_node *p, unsigned io)
+{
+        if (io == FGL_IO_UNKNOWN)
+                return 0;
+        if (io != FGL_IO_HW)
+                return 1;               /* a region, and a direct access */
+        return p->op == IR_LOAD || p->op == IR_STORE;
+}
+
+/* Returns 0 if it met an access it cannot express, which stops the block. */
+static int apply_flags(ir_ctx *c, int from, uint32_t flags, uint32_t insn)
 {
         unsigned io = LIGHTREC_FLAGS_GET_IO_MODE(flags);
         int i;
@@ -69,6 +93,27 @@ static void apply_flags(ir_ctx *c, int from, uint32_t flags)
                         p->io = (uint8_t)io;
                         if (op_flag_no_mask(flags))
                                 p->hint |= FGL_H_NO_MASK;
+
+                        if (access_is_ours(p, io))
+                                break;
+
+                        /* A DEFERRED LOAD CANNOT GO THIS WAY, and refusing is
+                         * the only honest answer.  C decides for itself
+                         * whether to write the destination register or park
+                         * the value, from `state->in_delay_slot_n` -- which is
+                         * lightrec's own load-delay machinery and not fgl's.
+                         * The IR_TEMP_GET waiting after the shadow would then
+                         * collect from a slot that may never have been
+                         * written.  Two mechanisms for one thing, and picking
+                         * either at random here is how a register goes stale
+                         * once in a while rather than every time. */
+                        if (p->defer)
+                                return 0;
+
+                        p->op = IR_RW;
+                        p->imm = insn;  /* the whole guest word; see ir.h */
+                        p->imm2 = 0;
+                        p->rd = p->rs = p->rt = 0;
                         break;
 
                 case IR_MULDIV:
@@ -86,6 +131,7 @@ static void apply_flags(ir_ctx *c, int from, uint32_t flags)
                         break;
                 }
         }
+        return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -482,7 +528,12 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        apply_flags(&c, mark, op->flags);
+                        if (!apply_flags(&c, mark, op->flags, op->opcode)) {
+                                note_unsupported(info, op, at);
+                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                info->ended_early = 1;
+                                break;
+                        }
                         pend = shadow_step(&c, pend, &pend_insn, hword, mark);
                         info->n_ops = i + 1;
                         continue;
@@ -490,7 +541,12 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
 
                 if (major == OP_META_MULT2 || major == OP_META_MULTU2) {
                         lower_mult2(&c, op, at);
-                        apply_flags(&c, mark, op->flags);
+                        if (!apply_flags(&c, mark, op->flags, op->opcode)) {
+                                note_unsupported(info, op, at);
+                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                info->ended_early = 1;
+                                break;
+                        }
                         pend = shadow_step(&c, pend, &pend_insn, hword, mark);
                         info->n_ops = i + 1;
                         continue;
@@ -499,7 +555,12 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                 if (major == OP_META_LWU || major == OP_META_SWU) {
                         lower_fused_unaligned(&c, op, at,
                                               major == OP_META_SWU);
-                        apply_flags(&c, mark, op->flags);
+                        if (!apply_flags(&c, mark, op->flags, op->opcode)) {
+                                note_unsupported(info, op, at);
+                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                info->ended_early = 1;
+                                break;
+                        }
                         pend = shadow_step(&c, pend, &pend_insn, hword, mark);
                         info->n_ops = i + 1;
                         continue;
@@ -567,7 +628,12 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 return c.n;
                         }
 
-                        apply_flags(&c, mark, op->flags);
+                        if (!apply_flags(&c, mark, op->flags, op->opcode)) {
+                                note_unsupported(info, op, at);
+                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                info->ended_early = 1;
+                                break;
+                        }
                         pend = shadow_step(&c, pend, &pend_insn, hword, mark);
                         info->n_ops = i + 1;
                         continue;
@@ -613,7 +679,13 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 int dmark = c.n;
 
                                 ir_decode_op(&c, ops[i + 1].opcode, at + 4);
-                                apply_flags(&c, dmark, ops[i + 1].flags);
+                                if (!apply_flags(&c, dmark, ops[i + 1].flags,
+                                                 ops[i + 1].opcode)) {
+                                        note_unsupported(info, &ops[i + 1], at + 4);
+                                        info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                        info->ended_early = 1;
+                                        return c.n;
+                                }
                                 info->n_ops = i + 2;
                         } else {
                                 info->n_ops = i + 1;

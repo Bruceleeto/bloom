@@ -7,7 +7,6 @@
 #include "interpreter.h"
 #include "lightrec-private.h"
 #include "optimizer.h"
-#include "regcache.h"
 
 #include <stdbool.h>
 
