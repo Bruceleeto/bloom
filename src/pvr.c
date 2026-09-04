@@ -2423,6 +2423,15 @@ static bool poly_should_clip(const struct poly *poly)
 __pvr __attribute__((optimize(2)))
 static void process_poly(struct poly *poly, bool scissor)
 {
+	/* TEMPORARY: does the guest draw anything at all?  The only signal
+	 * that separates "booted" from "alive but rendering nothing", and it
+	 * arrives in the first second of a working boot. */
+	{
+		static unsigned n;
+		if (++n <= 3 || (n % 2000) == 0)
+			fprintf(stderr, "POLY %u drawn\n", n);
+	}
+
 	struct texture_page *page;
 	unsigned int i, offt;
 	uint16_t umin, umax;

@@ -48,6 +48,32 @@ enum {
 
         IR_MFC0,        /* rd = cop0[imm]  */
         IR_MTC0,        /* cop0[imm] = rs  */
+
+        /* MTC0 TO STATUS OR CAUSE, WHICH C HAS TO PERFORM.  `imm` is the
+         * guest instruction word.
+         *
+         * Bit 16 of Status isolates the data cache, and while it is set the
+         * PSX's stores go to the cache instead of to RAM.  The BIOS flushes
+         * its cache exactly that way -- `mtc0 t1,SR` with t1 = 0x10000, then
+         * four kilobytes of `sw zero`, then `mtc0 zero,SR` -- so a code
+         * generator that treats the write as an ordinary state store lets
+         * those four kilobytes land in guest RAM and erases the kernel's own
+         * A0/B0/C0 vector stubs.  The emulator models the isolation by saving
+         * and restoring that memory (`lightrec_enable_ram`, plugin.c), and it
+         * only learns to do so if the write reaches `lightrec_mtc0`.
+         *
+         * lightrec makes the same call for the same reason and inlines the
+         * write only where it can prove the block is running from RAM through
+         * kuseg or kseg0 (emitter.c, `block_uses_icache`), which BIOS code
+         * never is.  fgl does not carry that proof yet, so it calls C for
+         * every Status and Cause write; they occur in kernel and interrupt
+         * code and not in any loop that matters.
+         *
+         * C reads the source register out of the state block and can set exit
+         * flags, so the allocation pass flushes around it exactly as for
+         * IR_RW, AND THE BLOCK ENDS HERE -- a newly unmasked interrupt has to
+         * be delivered before the next instruction runs. */
+        IR_MTC_C,
         IR_RFE,         /* pop the interrupt-enable stack */
 
         /* COP2, the geometry unit.  `imm` is the state-block displacement of
@@ -184,10 +210,33 @@ enum {
         FGL_H_NO_LO     = 1u << 1,   /* mul/div: nothing reads LO           */
         FGL_H_NO_HI     = 1u << 2,   /* mul/div: nothing reads HI           */
         FGL_H_NO_DIV_CHK = 1u << 3,  /* divisor is provably nonzero         */
-        FGL_H_ALIGN     = 1u << 4    /* LWL/LWR/SWL/SWR byte offset known;
+        FGL_H_ALIGN     = 1u << 4,   /* LWL/LWR/SWL/SWR byte offset known;
                                       * the offset itself is in `sub`'s
                                       * upper bits -- see front.c */
+        FGL_H_NO_INV    = 1u << 5    /* the optimiser proved this store cannot
+                                      * land on code, so it need not clear the
+                                      * block table -- see emit_invalidate */
 };
+
+/* DOES THIS STORE HAVE TO CLEAR THE BLOCK TABLE?
+ *
+ * Only a store that can land in RAM can land on code, and only if the
+ * optimiser did not already prove otherwise.  The allocation pass and the
+ * emitter have to agree exactly -- one handing out a scratch register the
+ * other does not use is merely wasteful, the other way round is a store
+ * through register -1 -- so the question is asked in one place.
+ *
+ * FGL_IO_SCRATCH and the two device classes are excluded because nothing
+ * compiled ever lives there, and FGL_IO_UNKNOWN never reaches the emitter as
+ * a store: front.c turns it into IR_RW and C invalidates for itself.  That is
+ * also why the oracle, whose raw front end leaves every node UNKNOWN, emits
+ * none of this and measures the same IPI it always did. */
+static inline int ir_store_invalidates(const ir_node *p)
+{
+        if (p->hint & FGL_H_NO_INV)
+                return 0;
+        return p->io == FGL_IO_RAM || p->io == FGL_IO_DIRECT;
+}
 
 /* A block is at most 32 guest instructions, and a transfer expands to at most
  * three nodes, so this has headroom over anything the decoder can produce. */

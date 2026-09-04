@@ -747,9 +747,6 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
 void * fgl_get_next_block(struct lightrec_state *state, u32 pc)
 {
 	struct block *block;
-	{ static unsigned c; if (c < 40) { c++;
-	  fprintf(stderr, "gnb %u pc=%08x cyc=%u/%u flags=%x\n", c, pc,
-		  state->current_cycle, state->target_cycle, state->exit_flags); } }
 	bool should_recompile;
 	void *func;
 	int err;
@@ -1785,3 +1782,4 @@ void lightrec_set_cycles_per_opcode(struct lightrec_state *state, u32 cycles)
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_recompiler_unpause(state->rec);
 }
+

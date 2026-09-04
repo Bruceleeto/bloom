@@ -523,10 +523,10 @@ static int lightrec_plugin_init(void)
 
 	lightrec_map[PSX_MAP_CODE_BUFFER].address = code_buffer;
 
-	/* TEMPORARY A/B: 1 = lightrec's C interpreter only, no fgl code runs at
-	 * all; 0 = fgl. There is no environment on the Dreamcast, so this is a
-	 * recompile rather than a variable. Put the getenv back when done. */
-	use_lightrec_interpreter = 1;
+	/* TEMP A/B: 1 = lightrec's C interpreter only, no fgl code runs at all.
+	 * There is no environment on the Dreamcast, so this is a recompile
+	 * rather than a variable.  Restore the getenv when done. */
+	use_lightrec_interpreter = 0;
 
 #ifdef LIGHTREC_DEBUG
 	char *cycles = getenv("LIGHTREC_BEGIN_CYCLES");
@@ -666,6 +666,8 @@ static void lightrec_plugin_execute_internal(bool block_only)
 	gen_interupt((psxCP0Regs *)regs->cp0);
 	if (!block_only && psxRegs.stop)
 		return;
+
+
 
 	cycles_pcsx = psxRegs.next_interupt - psxRegs.cycle;
 	assert((s32)cycles_pcsx > 0);

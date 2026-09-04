@@ -93,6 +93,13 @@ static int apply_flags(ir_ctx *c, int from, uint32_t flags, uint32_t insn)
                         p->io = (uint8_t)io;
                         if (op_flag_no_mask(flags))
                                 p->hint |= FGL_H_NO_MASK;
+                        /* Whether a store has to uncompile what it wrote
+                         * over.  The optimiser clears this for the stores it
+                         * can prove never reach code -- stack traffic, mostly
+                         * -- and those are the majority, which is the only
+                         * reason emitting the sequence inline is affordable. */
+                        if (op_flag_no_invalidate(flags))
+                                p->hint |= FGL_H_NO_INV;
 
                         if (access_is_ours(p, io))
                                 break;
@@ -499,12 +506,62 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
         for (i = 0; i < nb; i++) {
                 const struct opcode *op = &ops[i];
                 uint32_t at = pc + 4u * i;
+                /* THE SWAPPED DELAY SLOT MOVES A BRANCH'S ADDRESS.
+                 *
+                 * `lightrec_swap_delay_slots` (optimizer.c:1325) swaps the
+                 * two list entries' CONTENTS and marks both LIGHTREC_NO_DS,
+                 * so a swapped branch is found at index i+1 while the address
+                 * it was fetched from is still pc + 4*i.  Its index is no
+                 * longer its address.
+                 *
+                 * Everything a transfer computes is relative to that address
+                 * -- the link value for JAL/JALR/BGEZAL, the branch target,
+                 * and the fall-through -- so taking the index for the address
+                 * puts all three four bytes high.  A wrong link does not
+                 * fault: the callee returns into the delay slot of the NEXT
+                 * call, one call gets skipped, and the machine drifts until
+                 * something far away reads through a pointer that was never
+                 * built.  That is exactly how this was found.
+                 *
+                 * lightrec does the same correction in `get_branch_pc`
+                 * (lightrec-private.h:325), which is the only reason it never
+                 * had this bug. */
+                uint32_t branch_at = at - 4u * (uint32_t)!!op_flag_no_ds(op->flags);
                 uint32_t word = op->opcode;
                 unsigned major = word >> 26;
                 /* What the hazard analysis is shown; the same word for
                  * everything that really is a MIPS instruction. */
                 uint32_t hword = hazard_word(op);
                 int mark = c.n;
+
+                /* A SWAPPED DELAY SLOT IS NOT WHERE THE LOAD DELAY THINKS.
+                 *
+                 * `lightrec_swap_delay_slots` moves a slot AHEAD of its
+                 * branch and marks both LIGHTREC_NO_DS, so the list order is
+                 * slot-then-branch while the machine's order is still
+                 * branch-then-slot.  The load shadow counts adjacency in the
+                 * list, and adjacency is exactly what the swap broke:
+                 *
+                 *      lw   a1, x        list:  lw       machine:  lw
+                 *      b    back                sw                 b
+                 *      sw   v1, 12(a1)          b                  sw
+                 *
+                 * The branch is the instruction that stands in the load's
+                 * shadow, so `a1` IS settled by the time the store runs --
+                 * lightrec agrees and leaves LIGHTREC_LOAD_DELAY clear.  fgl
+                 * saw the store sitting next to the load and deferred the
+                 * register write past it, so the store addressed off the
+                 * PREVIOUS `a1`.  On the guest that is a wild pointer; on the
+                 * Dreamcast it was an unaligned store and a data address
+                 * error, which is how it was found.
+                 *
+                 * Dropping the shadow at either half of a swapped pair covers
+                 * both directions: the slot no longer inherits a shadow the
+                 * branch has already absorbed, and a load that IS the slot
+                 * does not have its shadow settled against a branch that in
+                 * truth ran before it. */
+                if (op_flag_no_ds(op->flags))
+                        pend = -1;
 
                 if (c.n + 4 > max) {
                         movi_flush(&c, &movi, at);
@@ -636,6 +693,26 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                         }
                         pend = shadow_step(&c, pend, &pend_insn, hword, mark);
                         info->n_ops = i + 1;
+
+                        /* A STATUS OR CAUSE WRITE ENDS THE BLOCK.
+                         *
+                         * C performs it (ir.h, IR_MTC_C) and C is where a
+                         * newly unmasked interrupt is noticed, so the next
+                         * guest instruction has to be reached through the
+                         * dispatcher rather than run straight on.  lightrec
+                         * ends the block in the same place and for the same
+                         * reason (`rec_mtc`, emitter.c).
+                         *
+                         * Not when the optimiser has already moved this
+                         * instruction ahead of its branch: LIGHTREC_NO_DS says
+                         * the transfer is still to come, and stopping here
+                         * would drop it. */
+                        if (ir_mtc_needs_c(word) &&
+                            !op_flag_no_ds(op->flags)) {
+                                info->stop_reason = FGL_STOP_TRANSFER;
+                                info->ended_early = (info->n_ops < nb);
+                                break;
+                        }
                         continue;
                 }
 
@@ -650,7 +727,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                  * branch is not to pay a dispatch -- so it is the first thing
                  * to revisit once blocks can chain. */
                 if (op_flag_local_branch(op->flags)) {
-                        if (ir_decode_transfer(&c, word, at)) {
+                        if (ir_decode_transfer(&c, word, branch_at)) {
                                 ir_shadow_fix(&c, pend, pend_insn, hword, mark);
                                 if (!op_flag_no_ds(op->flags) && i + 1 < nb)
                                         ir_decode_op(&c, ops[i + 1].opcode,
@@ -664,7 +741,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                         return c.n;
                 }
 
-                if (ir_decode_transfer(&c, word, at)) {
+                if (ir_decode_transfer(&c, word, branch_at)) {
                         /* A load shadowed by the transfer settles BETWEEN the
                          * transfer's nodes and the delay slot: the transfer
                          * reads pre-slot state, and the load's write lands

@@ -497,5 +497,6 @@ u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg);
  * C against the state block. Reached from generated code through
  * `fgl_shim_call`, so it wears that shim's two-argument shape. */
 void fgl_rw(u32 opcode, struct lightrec_state *state);
+void fgl_mtc(u32 opcode, struct lightrec_state *state);
 
 #endif /* __LIGHTREC_PRIVATE_H__ */

@@ -127,6 +127,10 @@ typedef struct {
 	 * the state block and writes the destination back to it. */
 	uint32_t rw;
 
+	/* The Status/Cause write, same call shape as `rw`: `f(the guest
+	 * instruction word, the state block)`.  See ir.h on IR_MTC_C. */
+	uint32_t mtc;
+
 	/* The C body that runs one COP2 command, given the guest instruction
 	 * word.  Resolved AT COMPILE TIME -- the command is a constant in the
 	 * block, so there is no runtime dispatch and nothing decodes it twice.

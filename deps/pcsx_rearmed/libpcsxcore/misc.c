@@ -486,6 +486,32 @@ int CheckCdrom() {
 	return 0;
 }
 
+/* KOS's stdio over the IDE/FAT volume returns SHORT READS -- a 2048-byte
+ * request comes back as 1024 with no error and no EOF -- so a single fread of
+ * a header is not a header read.  Every one of them here loops. */
+static size_t full_fread(void *buf, size_t len, FILE *f)
+{
+	size_t done = 0, got;
+
+	while (done < len) {
+		got = fread((u8 *)buf + done, 1, len - done, f);
+		done += got;
+		if (got)
+			continue;
+		/* A short read here is not the end of the file: KOS's stdio
+		 * over the IDE volume ends up with EOF (and sometimes the
+		 * error flag) set on a partial block, and every later read
+		 * then returns nothing.  Clear it and ask again; only a
+		 * genuinely empty second attempt means the file is done. */
+		clearerr(f);
+		got = fread((u8 *)buf + done, 1, len - done, f);
+		if (!got)
+			break;
+		done += got;
+	}
+	return done;
+}
+
 static int PSXGetFileType(FILE *f) {
 	unsigned long current;
 	u8 mybuf[2048];
@@ -494,7 +520,7 @@ static int PSXGetFileType(FILE *f) {
 
 	current = ftell(f);
 	fseek(f, 0L, SEEK_SET);
-	if (fread(&mybuf, 1, sizeof(mybuf), f) != sizeof(mybuf))
+	if (full_fread(&mybuf, sizeof(mybuf), f) != sizeof(mybuf))
 		goto io_fail;
 	
 	fseek(f, current, SEEK_SET);
@@ -526,15 +552,18 @@ size_t fread_to_ram(void *ptr, size_t size, size_t nmemb, FILE *stream)
 	void *tmp;
 	size_t ret = 0;
 
+	/* Short reads: see full_fread. The whole body has to be read before the
+	 * copy, or a section lands half-loaded and the guest runs into whatever
+	 * was in RAM after it. */
 	tmp = malloc(size * nmemb);
 	if (tmp) {
-		ret = fread(tmp, size, nmemb, stream);
-		memcpy(ptr, tmp, size * nmemb);
+		ret = full_fread(tmp, size * nmemb, stream);
+		memcpy(ptr, tmp, ret);
 		free(tmp);
 	}
 	else
-		ret = fread(ptr, size, nmemb, stream);
-	return ret;
+		ret = full_fread(ptr, size * nmemb, stream);
+	return ret / (size ? size : 1);
 }
 
 int Load(const char *ExePath) {
@@ -557,13 +586,27 @@ int Load(const char *ExePath) {
 		type = PSXGetFileType(tmpFile);
 		switch (type) {
 			case PSX_EXE:
-				if (fread(&tmpHead, 1, sizeof(EXE_HEADER), tmpFile) != sizeof(EXE_HEADER))
+				if (full_fread(&tmpHead, sizeof(EXE_HEADER), tmpFile) != sizeof(EXE_HEADER))
 					goto fail_io;
 				section_address = SWAP32(tmpHead.t_addr);
 				section_size = SWAP32(tmpHead.t_size);
 				mem = PSXM(section_address);
 				if (mem != INVALID_PTR) {
-					fseek(tmpFile, 0x800, SEEK_SET);
+					/* KOS's stdio cannot be seeked back into on the
+					 * IDE volume -- ftell goes wrong and the error
+					 * flag latches -- so the body is read from a
+					 * FRESH handle, sequentially, with the 2 KB
+					 * header simply consumed. */
+					fclose(tmpFile);
+					tmpFile = fopen(ExePath, "rb");
+					if (!tmpFile)
+						goto fail_io;
+					{
+						u8 skip[512];
+						unsigned k;
+						for (k = 0; k < 0x800; k += sizeof(skip))
+							full_fread(skip, sizeof(skip), tmpFile);
+					}
 					fread_to_ram(mem, section_size, 1, tmpFile);
 					psxCpu->Clear(section_address, section_size / 4);
 				}

@@ -43,7 +43,7 @@ void SysPrintf(const char *fmt, ...) {
 	va_list list;
 
 	va_start(list, fmt);
-	vfprintf(stdout, fmt, list);
+	vfprintf(stderr, fmt, list);   /* TEMP: stdout is block-buffered here */
 	va_end(list);
 }
 
@@ -67,6 +67,7 @@ static void init_config(void)
 	memset(&Config, 0, sizeof(Config));
 
 	Config.PsxAuto = 1;
+	Config.PsxOut = 1;      /* TEMP: route the guest's BIOS printf to stdout */
 	Config.cycle_multiplier = CYCLE_MULT_DEFAULT;
 	Config.GpuListWalking = -1;
 	Config.FractionalFramerate = -1;

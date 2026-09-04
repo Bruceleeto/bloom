@@ -255,7 +255,8 @@ static int operand(fgl_emitter *e, int host, unsigned g, int spare)
  * load builds its address in r0, a store builds it in r1 and keeps r0 for the
  * value it is about to write.
  */
-static void emit_addr(fgl_emitter *e, const ir_node *p, int dst, int other)
+static void emit_addr_ex(fgl_emitter *e, const ir_node *p, int dst, int other,
+			 int mask)
 {
 	int32_t s = (int32_t)p->imm;
 
@@ -295,8 +296,101 @@ static void emit_addr(fgl_emitter *e, const ir_node *p, int dst, int other)
 	 * address, which is the worst kind of bug this project can produce --
 	 * so it is driven by the flag alone and never by anything inferred
 	 * here. */
-	if (!(p->hint & FGL_H_NO_MASK))
+	if (mask && !(p->hint & FGL_H_NO_MASK))
 		sh4_emit_and(&e->cg, FGL_R_MASK, dst);
+}
+
+/* A DIRECT access: the address is dereferenced right here, so it is masked
+ * into the window the host map covers. */
+static void emit_addr(fgl_emitter *e, const ir_node *p, int dst, int other)
+{
+	emit_addr_ex(e, p, dst, other, 1);
+}
+
+/* A DEVICE access, handed to C -- AND THE MASK MUST NOT BE APPLIED.
+ *
+ * `lightrec_hw_lb` and its family take the RAW guest address and run their own
+ * `kunseg` on it (lightrec.c:1615 onwards), and `kunseg` is not a mask: it
+ * tells KSEG1 from everything else by testing `addr >= 0xa0000000`, and that
+ * test is exactly what `and 0x1fffffff` destroys.
+ *
+ * For most addresses masking first is invisible, because the two agree.  It is
+ * not invisible for the segment lightrec keys a map on rather than a physical
+ * address: the cache control register is reached at 0xfffe0130, `kunseg` makes
+ * that 0x5ffe0130, and PSX_MAP_CACHE_CONTROL sits at 0x5ffe0130 (plugin.c:358).
+ * Pre-masking gives 0x1ffe0130 instead, no map matches, and the store comes
+ * back as a segfault from code that was otherwise perfectly correct.
+ *
+ * lightrec's own `rec_store_hw_call` does `jit_addi(tmp, rs, imm)` and passes
+ * that -- an add and nothing else, which is what this reproduces. */
+static void emit_addr_raw(fgl_emitter *e, const ir_node *p, int dst, int other)
+{
+	emit_addr_ex(e, p, dst, other, 0);
+}
+
+/* SELF-MODIFYING CODE: A STORE INTO RAM MUST UNCOMPILE WHAT IT WROTE OVER.
+ *
+ * The guest writes an instruction, jumps to it, and expects the NEW one to
+ * run.  Nothing about the store tells the dispatcher that the block it
+ * compiled from those bytes is now a lie, so the store has to say so: it
+ * writes NULL into the block table entry covering the word, and the next
+ * dispatch through that PC misses, calls C, and compiles the new code.
+ *
+ * lightrec emitted exactly this inline on every invalidating store
+ * (emitter.c:1600), and fgl not emitting it is what failed S7-SMC on the CPU
+ * test -- the guest patched a function, called it, and got the code from
+ * before the patch.  There is no cheaper place to put it: an emitted store is
+ * a `mov.l` with no call and no exit, so C never sees it happen.
+ *
+ * THE TABLE INDEX IS THE ADDRESS. One entry per aligned guest word, four
+ * bytes each, so the byte offset is `addr & 0x1ffffc` -- the mirrors fold
+ * into it for free, exactly as `lut_offset` does for the dispatcher, and
+ * masking the low bits is right whether or not the address was masked
+ * already (FGL_H_NO_MASK leaves a KSEG address in the register and the bits
+ * that survive are the same ones).
+ *
+ * THE RANGE TEST, and why only the unproven class pays for it. FGL_IO_RAM is
+ * a proof that the address lands in RAM, so the entry is always the right one
+ * to clear. FGL_IO_DIRECT is only a proof that it lands in SOME directly
+ * backed region, which may be the scratchpad or the BIOS -- and clearing a
+ * table entry for one of those addresses would uncompile an unrelated block.
+ * On bloom's map every non-RAM region sits above 0x1f000000 once masked, and
+ * RAM with its mirrors is the low 8 MB, so `(addr & mask) >> 24 == 0` decides
+ * it in three instructions and no literal.
+ *
+ * REGISTERS. This runs AFTER the value has been stored, so r0 and the address
+ * register are both dead and may be used freely; the address register is left
+ * holding zero, which is what gets written to the table. */
+static void emit_invalidate(fgl_emitter *e, const ir_node *p, int addr, int tmp)
+{
+	int skip = -1;
+
+	if (!ir_store_invalidates(p))
+		return;
+
+	if (tmp < 0) {
+		e->overflow = 9;        /* the allocator and ir.h disagree */
+		return;
+	}
+
+	if (p->io == FGL_IO_DIRECT) {
+		sh4_emit_mov_reg(&e->cg, addr, tmp);
+		sh4_emit_and(&e->cg, FGL_R_MASK, tmp);
+		sh4_emit_shlr16(&e->cg, tmp);
+		sh4_emit_shlr8(&e->cg, tmp);
+		sh4_emit_tst(&e->cg, tmp, tmp);   /* T = (it is RAM) */
+		skip = bf_fwd(e);
+	}
+
+	emit_const(e, 0x001ffffcu, FGL_R_XFER);
+	sh4_emit_and(&e->cg, addr, FGL_R_XFER);         /* r0 = byte offset */
+	sh4_emit_mov_reg(&e->cg, FGL_R_XFER, tmp);
+	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_LUT);
+	sh4_emit_mov_imm(&e->cg, 0, addr);              /* the NULL to write */
+	sh4_emit_mov_l_store_r0(&e->cg, addr, tmp);     /* mov.l Rn,@(r0,tmp) */
+
+	if (skip >= 0)
+		patch_fwd8(e, skip);
 }
 
 /* ---------------------------------------------------------------- */
@@ -936,6 +1030,12 @@ static void emit_store_un(fgl_emitter *e, const ir_node *p)
 	sh4_emit_and(&e->cg, FGL_R_T1, FGL_R_XFER);
 	sh4_emit_or(&e->cg, s1, FGL_R_XFER);
 	sh4_emit_mov_l_store(&e->cg, FGL_R_XFER, s0);
+
+	/* SWL and SWR write inside ONE aligned word, which is exactly what one
+	 * table entry covers, so the aligned address this path already built
+	 * is the right thing to invalidate and no third scratch is needed --
+	 * both of these are dead the instant the merge is stored. */
+	emit_invalidate(e, p, s0, s1);
 }
 
 /* ---------------------------------------------------------------- */
@@ -992,7 +1092,7 @@ static void emit_hw_load(fgl_emitter *e, const ir_node *p)
 	/* The address is the shim's first argument, so it is built in r1 and
 	 * r0 is the spare -- the opposite of the direct path, which keeps r0
 	 * for the address it is about to dereference. */
-	emit_addr(e, p, FGL_R_T1, FGL_R_XFER);
+	emit_addr_raw(e, p, FGL_R_T1, FGL_R_XFER);
 	emit_const(e, fn, FGL_R_XFER);
 	emit_const(e, e->tgt->shim_call, rs);
 	sh4_emit_jsr(&e->cg, rs);
@@ -1035,7 +1135,7 @@ static void emit_hw_store(fgl_emitter *e, const ir_node *p)
 		sh4_emit_mov_reg(&e->cg, rt, FGL_R_XFER);
 	sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_SHIM_ARG);
 
-	emit_addr(e, p, FGL_R_T1, FGL_R_XFER);
+	emit_addr_raw(e, p, FGL_R_T1, FGL_R_XFER);
 	emit_const(e, fn, FGL_R_XFER);
 	emit_const(e, e->tgt->shim_call_st, rs);
 	sh4_emit_jsr(&e->cg, rs);
@@ -1328,6 +1428,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 			e->unsupported_op = p->op;
 			return;
 		}
+		emit_invalidate(e, p, FGL_R_T1, p->sc[0]);
 		break;
 
 	case IR_LOAD_UN:
@@ -1349,6 +1450,22 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
 		else
 			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+		break;
+
+	case IR_MTC_C:
+		/* The same call shape as IR_RW, and flushed the same way --
+		 * C reads the source register out of the state block. */
+		rs = p->sc[0];
+		if (!e->tgt || !e->tgt->shim_call || !e->tgt->mtc || !rs) {
+			e->unsupported = 1;
+			e->unsupported_op = p->op;
+			break;
+		}
+		emit_const(e, e->tgt->mtc, FGL_R_XFER);
+		emit_const(e, p->imm, FGL_R_T1);   /* the guest instruction */
+		emit_const(e, e->tgt->shim_call, rs);
+		sh4_emit_jsr(&e->cg, rs);
+		sh4_emit_nop(&e->cg);              /* delay slot */
 		break;
 
 	case IR_MTC0:
@@ -1652,9 +1769,26 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	 * follows it.  An `rts` can never be linked to anything.
 	 *
 	 * A block that consumed no guest instructions charges nothing, which
-	 * is entry 0 of the table and still a correct load. */
-	if (n_ops > FGL_CYCLE_ENTRIES - 1)
-		n_ops = FGL_CYCLE_ENTRIES - 1;
+	 * is entry 0 of the table and still a correct load.
+	 *
+	 * A BLOCK CAN BE LONGER THAN THE TABLE.  `IR_MAX_NODES` bounds the IR,
+	 * not the guest instructions behind it: a constant fold (front.c's
+	 * `movi_step`) turns a LUI/ORI pair into no nodes at all, and BIOS
+	 * init code is largely made of those.  Blocks of fifty guest ops
+	 * against a forty-node budget are ordinary.  This used to CLAMP, which
+	 * silently charged 33 ops for all of them -- the block at `bfc001f0`
+	 * is 63 ops, and fgl billed it 57 cycles against the interpreter's
+	 * 110.  A guest clock that runs slow is invisible to a register
+	 * comparison until an interrupt lands on a different instruction.
+	 *
+	 * So charge in whole table-loads and then the remainder.  Two extra
+	 * instructions per 33 ops, on the epilogue of a long block only. */
+	while (n_ops > FGL_CYCLE_ENTRIES - 1) {
+		sh4_emit_mov_l_load_gbr(&e->cg,
+					(int)(FGL_AT_CYCLES + FGL_CYCLE_ENTRIES - 1));
+		sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
+		n_ops -= FGL_CYCLE_ENTRIES - 1;
+	}
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
 	sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
 

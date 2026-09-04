@@ -111,6 +111,11 @@ FGL_ASSERT(COP0_SR == 12 && COP0_CAUSE == 13 && COP0_EPC == 14, cop0_regs);
 #include "fgl.h"
 #include "front.h"
 #include "shim.h"
+
+#include <arch/irq.h>
+#include <arch/arch.h>
+
+#include "blockcache.h"
 /* Declared rather than included: `gte_fpu.h` pulls in libpcsxcore's headers,
  * which this translation unit has no other need of and which the host layout
  * check cannot see. lightrec's own emitter declared it the same way and for
@@ -176,6 +181,97 @@ void fgl_rw(u32 opcode, struct lightrec_state *state)
 	}
 }
 
+/* A write to COP0 Status or Cause.  `lightrec_mtc_cb`'s job, minus its LWC2
+ * branch, which is a COP2 path and cannot arrive here: only `ir_mtc_needs_c`
+ * builds the node and it tests for MTC0.
+ *
+ * The whole reason this is a call and not two instructions is bit 16 of
+ * Status.  See ir.h on IR_MTC_C. */
+void fgl_mtc(u32 opcode, struct lightrec_state *state)
+{
+	union code op = { .opcode = opcode };
+
+	lightrec_mtc(state, op, op.r.rd, state->regs.gpr[op.r.rt]);
+}
+
+/* ---------------------------------------------------------------- */
+/* Faults inside emitted code                                        */
+/* ---------------------------------------------------------------- */
+
+/* WHAT A CRASH IN GENERATED CODE LOOKS LIKE WITHOUT THIS.
+ *
+ * KOS prints the SH-4 register file and a stack trace, and the trace stops at
+ * `lightrec_execute` because the frame that faulted was written by fgl and is
+ * in no symbol table.  The PC is a bare address in the code buffer.  That is
+ * enough to know the fault was in emitted code and nothing else -- not which
+ * guest instruction, not which lowering.
+ *
+ * So the reporter resolves the address back through the block cache and
+ * prints the guest PC it was compiled from, together with the SH-4 words
+ * around the fault.  The instruction form alone usually names the emit path:
+ * a `mov.l Rm,@Rn` is an ordinary store, a `mov.l Rm,@(R0,Rn)` is the code-LUT
+ * invalidation, and so on.
+ *
+ * It handles the four data faults a bad address can raise and nothing else;
+ * everything KOS already explains is left to KOS. */
+static struct lightrec_state *fgl_crash_state;
+
+static void fgl_crash_report(irq_t code, irq_context_t *ctx, void *data)
+{
+	uintptr_t pc = (uintptr_t) ctx->pc;
+	const uint16_t *insn = (const uint16_t *) (pc & ~1u);
+	struct block *block = NULL;
+	int i;
+
+	(void) data;
+
+	if (fgl_crash_state)
+		block = lightrec_find_block_from_code(fgl_crash_state->block_cache, pc);
+
+	fprintf(stderr, "\nfgl: fault %04x at %08x\n", (unsigned) code,
+		(unsigned) pc);
+
+	if (block) {
+		fprintf(stderr, "fgl: in the block compiled from guest pc "
+			"%08x (%u ops), %u bytes into %u\n",
+			(unsigned) block->pc, (unsigned) block->nb_ops,
+			(unsigned) (pc - (uintptr_t) block->function),
+			(unsigned) block->code_size);
+	} else {
+		fprintf(stderr, "fgl: no block owns that address -- the fault "
+			"is not in emitted code\n");
+	}
+
+	for (i = -4; i <= 2; i++)
+		fprintf(stderr, "fgl: %s %08x  %04x\n", i ? "  " : "->",
+			(unsigned) (pc + 2 * i), insn[i]);
+
+	fprintf(stderr, "fgl: r0-r7  %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3],
+		ctx->r[4], ctx->r[5], ctx->r[6], ctx->r[7]);
+	fprintf(stderr, "fgl: r8-r15 %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		ctx->r[8], ctx->r[9], ctx->r[10], ctx->r[11],
+		ctx->r[12], ctx->r[13], ctx->r[14], ctx->r[15]);
+
+	arch_abort();
+}
+
+static void fgl_crash_handler_once(struct lightrec_state *state)
+{
+	static int installed;
+
+	fgl_crash_state = state;
+
+	if (installed)
+		return;
+	installed = 1;
+
+	irq_set_handler(EXC_DATA_ADDRESS_READ, fgl_crash_report, NULL);
+	irq_set_handler(EXC_DATA_ADDRESS_WRITE, fgl_crash_report, NULL);
+	irq_set_handler(EXC_DTLB_PV_READ, fgl_crash_report, NULL);
+	irq_set_handler(EXC_DTLB_PV_WRITE, fgl_crash_report, NULL);
+}
+
 /* WHERE THE SERVICES LIVE, as data rather than as link-time references.
  *
  * `fgl.h` explains why the emitter is told these instead of naming them: the
@@ -211,6 +307,7 @@ static void fgl_targets_once(void)
 	fgl_dc_targets.hw_store[MEM_W] = (u32)(uintptr_t)lightrec_hw_sw;
 
 	fgl_dc_targets.rw       = (u32)(uintptr_t)fgl_rw;
+	fgl_dc_targets.mtc      = (u32)(uintptr_t)fgl_mtc;
 	fgl_dc_targets.gte_body = fgl_gte_body;
 
 	/* Last, and it is what the guard above tests: nothing may observe a
@@ -261,7 +358,9 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 		why = &dummy_why;
 	*why = -EINVAL;                 /* a hole in fgl until proven otherwise */
 
+
 	fgl_targets_once();
+	fgl_crash_handler_once(cstate->state);
 
 	memset(&info, 0, sizeof info);
 	n = fgl_front(block->opcode_list, block->nb_ops, block->pc,
@@ -330,16 +429,8 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	if (state->ops.code_inv)
 		state->ops.code_inv(code, size);
 
-	{	/* TEMPORARY DIAGNOSTIC */
-		static unsigned n, total, biggest;
-		n++; total += size;
-		if (size > biggest) biggest = size;
-		if (n <= 20 || (n % 500) == 0)
-			fprintf(stderr, "fgl: block %u pc=%08x ops=%u nodes=%d "
-			       "size=%u total=%u big=%u\n",
-			       n, (unsigned)block->pc, info.n_ops, n2,
-			       size, total, biggest);
-	}
+
+
 
 	*code_size = size;
 	return code;

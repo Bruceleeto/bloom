@@ -41,6 +41,30 @@ struct block * lightrec_find_block(struct blockcache *cache, u32 pc)
 	return NULL;
 }
 
+/* Which block does this host code address belong to?
+ *
+ * A linear walk of the whole cache, which is exactly what it looks like and
+ * is fine: the only caller is the crash reporter, and by then the run is
+ * over.  It buys the one thing a register dump cannot give -- the guest PC
+ * behind a fault inside emitted code. */
+struct block * lightrec_find_block_from_code(struct blockcache *cache,
+					     uintptr_t addr)
+{
+	struct block *block;
+	unsigned int i;
+
+	for (i = 0; i < LUT_SIZE; i++) {
+		for (block = cache->lut[i]; block; block = block->next) {
+			uintptr_t fn = (uintptr_t) block->function;
+
+			if (fn && addr >= fn && addr < fn + block->code_size)
+				return block;
+		}
+	}
+
+	return NULL;
+}
+
 struct block * lightrec_find_block_from_lut(struct blockcache *cache,
 					    u16 lut_entry, u32 addr_in_block)
 {

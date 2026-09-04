@@ -58,6 +58,9 @@ void ir_emit_set(ir_ctx *c, uint32_t pc, unsigned rd, uint32_t v);
  * genuinely is more than one operation. */
 void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc);
 
+/* Is this an MTC0 that C has to perform?  See ir.h on IR_MTC_C. */
+int ir_mtc_needs_c(uint32_t insn);
+
 /* Is this instruction a control transfer -- a branch, a jump, or a trap? */
 int ir_is_transfer(uint32_t insn);
 

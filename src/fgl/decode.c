@@ -205,6 +205,20 @@ static void emit_alu_imm(ir_ctx *c, uint32_t pc, unsigned sub,
 /* An ordinary instruction — anything that is not a control transfer.  Called
  * for the delay slot too, which is why it is a function rather than inline in
  * the loop. */
+/* Is this an MTC0 whose destination C has to see?  Status, because of the
+ * cache-isolation bit, and Cause, because only its two software-interrupt
+ * bits are writable and a write to them can raise one.  See ir.h on
+ * IR_MTC_C. */
+int ir_mtc_needs_c(uint32_t insn)
+{
+        unsigned rd = (insn >> 11) & 31;
+
+        if ((insn >> 26) != 0x10 || ((insn >> 21) & 31) != 0x04)
+                return 0;
+
+        return rd == 12 || rd == 13;
+}
+
 void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
 {
         unsigned op = insn >> 26;
@@ -360,6 +374,14 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                         return;
                 }
                 if (rs == 0x04) {                       /* MTC0 rt,rd */
+                        /* Status and Cause are C's; see ir.h on IR_MTC_C. */
+                        if (ir_mtc_needs_c(insn)) {
+                                p = ir_node_new(c, IR_MTC_C, pc);
+                                if (!p)
+                                        return;
+                                p->imm = insn;
+                                return;
+                        }
                         p = ir_node_new(c, IR_MTC0, pc);
                         if (!p)
                                 return;

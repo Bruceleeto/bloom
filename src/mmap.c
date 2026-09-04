@@ -96,6 +96,11 @@ int lightrec_init_mmap(void)
 
 	/* Map BIOS using eight 64 KiB pages */
 	for (i = 0; i < 8; i++) {
+		/* RDONLY, and it has to become MMU_KERNEL_RDWR for an HLE build:
+		 * the HLE BIOS is not a ROM.  psxBiosInit writes a fake
+		 * SCPH1001 signature into psxR (psxbios.c:3966) because games
+		 * look for it, and against a read-only mapping that is a Data
+		 * TLB protection violation before the guest runs at all. */
 		err = mmu_page_map_static(OFFSET + 0x1fc00000 + i * 0x10000,
 					  (uintptr_t)psxR + i * 0x10000,
 					  PAGE_SIZE_64K, MMU_KERNEL_RDONLY, true);

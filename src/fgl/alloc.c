@@ -527,6 +527,8 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                                 scratch(&s, p, 2);
                         else if (p->io == FGL_IO_HW)
                                 scratch(&s, p, 1);      /* the `jsr` target */
+                        else if (ir_store_invalidates(p))
+                                scratch(&s, p, 1);      /* the table offset */
                         break;
 
                 case IR_LOAD_UN:
@@ -568,6 +570,7 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         scratch(&s, p, 1);
                         break;
 
+                case IR_MTC_C:
                 case IR_RW:
                         /* C performs the whole access against the state
                          * block, so every guest register the allocator is
