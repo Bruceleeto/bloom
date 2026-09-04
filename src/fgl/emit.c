@@ -373,6 +373,352 @@ static void alu_ri(fgl_emitter *e, int sub, int rd, int rs, uint32_t imm)
 }
 
 /* ---------------------------------------------------------------- */
+/* COP2 register traffic                                             */
+/* ---------------------------------------------------------------- */
+
+/* MFC2/CFC2/MTC2/CTC2/LWC2/SWC2 -- the moves only.  The geometry
+ * commands themselves are IR_GTE and are not lowered here.
+ *
+ * `imm` IS ALREADY THE STATE-BLOCK WORD INDEX of the coprocessor
+ * register, resolved by the decoder (`cop2_disp`, decode.c:59).  Data
+ * and control are one contiguous 64-entry file at cp2d = word 66 and
+ * cp2c = word 98 (fgl_state.h), so the highest index any of these can
+ * name is 129 -- byte 516, inside `mov.l @(disp,GBR)`'s 1020 -- and no
+ * address is ever computed for a coprocessor register.  Nothing below
+ * needs to know which half of the file it is touching.
+ *
+ * LWC2 AND SWC2 KEEP THE MEMORY DISPLACEMENT IN `imm2`, NOT `imm`
+ * (decode.c:419, 428), which is the reverse of every other memory
+ * node.  `emit_addr` reads `imm`, so it is handed a node with the
+ * fields the way round it expects; getting this wrong would address
+ * off a coprocessor register number and the fault would look like a
+ * bad base register rather than a swapped field. */
+static void emit_cop2_addr(fgl_emitter *e, const ir_node *p, int dst, int other)
+{
+	ir_node q = *p;
+
+	q.imm = p->imm2;
+	emit_addr(e, &q, dst, other);
+}
+
+/* ---------------------------------------------------------------- */
+/* Exceptions                                                        */
+/* ---------------------------------------------------------------- */
+
+#define CP0_AT(r) ((int)(FGL_AT_COP0 + (unsigned)(r)))
+
+/* THE GUEST'S GENERAL EXCEPTION VECTOR, BEV=0.
+ *
+ * `tools/docs/cpuspecifications.md`, "Exception Vectors": General is
+ * 80000080h with BEV clear and BFC00180h with it set, and the same section
+ * states the PSX uses only the BEV=0 vectors -- the BIOS ROM does not contain
+ * the BEV=1 ones at all.  So the constant is emitted unconditionally and the
+ * SR bit 22 test is not.  THAT IS THE CONDITION on this sequence: a guest that
+ * sets BEV and then traps goes to the wrong place.
+ *
+ * The 80000040h "COP0 Break" vector in that same table is the COP0 debug
+ * breakpoint unit (BPC/BDA), not the BREAK opcode; BREAK raises excode 09h
+ * through the general vector like any other exception.  `psxException`
+ * (deps/pcsx_rearmed/libpcsxcore/r3000a.c:113) is the runtime we have to agree
+ * with and it makes no distinction either. */
+#define GUEST_EXC_VECTOR     0x80000080u
+#define GUEST_EXC_VECTOR_BEV 0xbfc00180u
+
+/* Replace a field of a COP0 word with three instructions and no third
+ * register.
+ *
+ * `and #imm` and `or #imm` exist only for r0, so the obvious "load, mask with
+ * a materialised constant, or in the new bits" wants a register we do not
+ * have and a literal we do not want.  Instead: with `a` in r0 and a copy in
+ * r1, and `b` a value whose bits outside the field are don't-care,
+ *
+ *      x = a ^ b ; y = x & field ; z = a ^ y
+ *
+ * gives z = (a & ~field) | (b & field).  Bits outside the field xor with zero
+ * twice; bits inside come out as b.  Two xors and an `and #imm` -- and it is
+ * the `and #imm` that lets the caller be sloppy about b's high bits. */
+static void merge_low_field(fgl_emitter *e, int field)
+{
+	sh4_emit_xor(&e->cg, FGL_R_T1, FGL_R_XFER);
+	sh4_emit_and_imm(&e->cg, field);
+	sh4_emit_xor(&e->cg, FGL_R_T1, FGL_R_XFER);
+}
+
+/* The mode stack push an exception performs: SR bits 3:0 move up to 5:2, and
+ * 1:0 come in zero -- kernel mode, interrupts off.  Bits 5:4 (the OLD pair)
+ * are pushed off the end and lost.
+ *
+ * `cpuspecifications.md`, cop0r12: bit0 IEc / bit1 KUc are current, bit2 IEp /
+ * bit3 KUp previous, bit4 IEo / bit5 KUo old.  The runtime writes exactly
+ * `SR = (SR & ~0x3f) | ((SR & 0x0f) << 2)` (r3000a.c:139), and
+ * `(SR << 2) & 0x3f` is that same value -- the field mask does the `& 0x0f`,
+ * so the shift stands alone. */
+static void emit_sr_push(fgl_emitter *e)
+{
+	sh4_emit_mov_l_load_gbr(&e->cg, CP0_AT(COP0_SR));
+	sh4_emit_mov_reg(&e->cg, FGL_R_XFER, FGL_R_T1);
+	sh4_emit_shll2(&e->cg, FGL_R_XFER);
+	merge_low_field(e, 0x3f);
+	sh4_emit_mov_l_store_gbr(&e->cg, CP0_AT(COP0_SR));
+}
+
+/* CAUSE for a synchronous exception taken outside a delay slot.
+ *
+ * `CAUSE = (CAUSE & 0x700) | (code << 2)`, which is `psxException` verbatim
+ * (r3000a.c:136, with bdt = 0).  Bits 10:8 are the two software interrupt
+ * bits and the hardware one and MUST survive -- a trap that cleared them
+ * would lose an interrupt the guest has not looked at yet.  Everything else,
+ * BD and BT at 31:30 included, is written zero, which is correct here because
+ * SYSCALL and BREAK reach this emitter only outside a delay slot: `is_transfer`
+ * counts them as terminators (decode.c:654) and the decoder does not call
+ * `decode_transfer` for a delay slot.
+ *
+ * Three instructions rather than a masked literal: shifting the field down to
+ * the bottom brings it inside `and #imm`'s reach, and `or #imm` then supplies
+ * the ExcCode -- 0x20 for Sys, 0x24 for Bp, both 8-bit. */
+static void emit_cause(fgl_emitter *e, unsigned excode)
+{
+	sh4_emit_mov_l_load_gbr(&e->cg, CP0_AT(COP0_CAUSE));
+	sh4_emit_shlr8(&e->cg, FGL_R_XFER);
+	sh4_emit_and_imm(&e->cg, 0x07);
+	sh4_emit_shll8(&e->cg, FGL_R_XFER);
+	sh4_emit_or_imm(&e->cg, (int)(excode << 2));
+	sh4_emit_mov_l_store_gbr(&e->cg, CP0_AT(COP0_CAUSE));
+}
+
+/* ---------------------------------------------------------------- */
+/* Multiply and divide                                               */
+/* ---------------------------------------------------------------- */
+
+/* Where one half of the pair ends up.  A host register means a move and no
+ * host register means a store, like any other destination -- but there are
+ * two of them and neither is `p->rd`, so this is not the
+ * `st_guest(e, p->rd, rd)` tail every other node ends with. */
+static void st_pair(fgl_emitter *e, int host, unsigned g, int src)
+{
+	if (host < 0) {
+		st_guest(e, g, src);
+		return;
+	}
+	if (host != src)
+		sh4_emit_mov_reg(&e->cg, src, host);
+}
+
+/* THE 32-STEP DIVIDE, UNSIGNED, AND THE ONLY PART OF THIS THAT IS HARDWARE.
+ *
+ * `div0u` clears M, Q and T; then each `rotcl`/`div1` pair shifts one bit of
+ * the dividend into the partial remainder and one quotient bit back in at the
+ * bottom, the partial remainder's 33rd bit living in Q.  After 32 pairs the
+ * dividend register holds the quotient bar its last bit, which the trailing
+ * `rotcl` supplies.
+ *
+ * The divisor must be non-zero.  A divide by zero here does not fault, it
+ * produces a number, and MIPS wants a specific different one -- the caller
+ * tests for it.
+ *
+ * `dividend` is destroyed and becomes the quotient, `rem` is written from
+ * scratch and becomes the remainder, `divisor` is only read.
+ *
+ * THE SEQUENCE IS NON-RESTORING, so a step that subtracts too much is not
+ * undone -- it is compensated by the next step adding.  After the last step
+ * there is no next one, so the remainder is left one divisor low exactly when
+ * that last subtraction failed.  T already IS that answer, because it is also
+ * the quotient's last bit.  The quotient comes out right either way, which is
+ * why the correction is easy to leave out and hard to notice: only code that
+ * reads HI ever sees it.  Neither `bt` nor `add` writes T, so the trailing
+ * `rotcl` still gets the bit it came for.
+ *
+ * 69 words, and there is no shorter form: a loop would have to carry T across
+ * the back edge, and every loop-control instruction on this machine writes
+ * it. */
+static void emit_div_core(fgl_emitter *e, int dividend, int divisor, int rem)
+{
+	int i, exact;
+
+	sh4_emit_mov_imm(&e->cg, 0, rem);
+	sh4_emit_div0u(&e->cg);
+	for (i = 0; i < 32; i++) {
+		sh4_emit_rotcl(&e->cg, dividend);
+		sh4_emit_div1(&e->cg, divisor, rem);
+	}
+
+	exact = bt_fwd(e);
+	sh4_emit_add_reg(&e->cg, divisor, rem);
+	patch_fwd8(e, exact);
+
+	sh4_emit_rotcl(&e->cg, dividend);
+}
+
+/* |Rn|, in place, with no second register and no constant. */
+static void emit_abs(fgl_emitter *e, int rn)
+{
+	int pos;
+
+	sh4_emit_cmppz(&e->cg, rn);
+	pos = bt_fwd(e);
+	sh4_emit_neg(&e->cg, rn, rn);
+	patch_fwd8(e, pos);
+}
+
+/* Negate `rn` when `sign` is negative: the fixup that turns an unsigned
+ * result back into a signed one. */
+static void emit_neg_if(fgl_emitter *e, int sign, int rn)
+{
+	int pos;
+
+	sh4_emit_cmppz(&e->cg, sign);
+	pos = bt_fwd(e);
+	sh4_emit_neg(&e->cg, rn, rn);
+	patch_fwd8(e, pos);
+}
+
+/* MULT, MULTU, DIV, DIVU.
+ *
+ * The multiplies are three instructions.  The divides are a hundred, because
+ * SH-4 has no divide and the architecture's own sequence is 32 unrolled
+ * steps; see NOTES for the service routine that lifts them out of the call
+ * site once fgl has somewhere to put one.
+ *
+ * The dividend has to be somewhere the core may destroy that is not the
+ * allocator's, so it is copied to r1.  The remainder needs a third register,
+ * which is the scratch alloc.c already grants this node.  The divisor stays
+ * where the allocator left it for DIVU -- the core only reads it -- and is
+ * copied to r0 for DIV, which negates it.
+ *
+ * DIVIDE BY ZERO IS NOT A TRAP ON THIS GUEST.  It has defined results, and
+ * they are produced here rather than left to whatever the sequence happens to
+ * do:
+ *
+ *      DIVU, d == 0:   LO = 0xffffffff             r3000a.h:363-364
+ *                      HI = n
+ *      DIV,  d == 0:   LO = n >= 0 ? 0xffffffff : 1
+ *                      HI = n                      r3000a.h:348-350
+ *
+ * The other special case needs no code at all.  `0x80000000 / -1` is defined
+ * as LO = 0x80000000, HI = 0 (r3000a.h:351-353), and that is what falls out:
+ * |n| is 0x80000000 and |d| is 1, the core divides them to 0x80000000
+ * remainder 0, and the quotient's sign `n ^ d` has its top bit clear so
+ * nothing is negated.
+ *
+ * THE TWO SIGN WORDS GO ON THE STACK, NOT IN THE STATE BLOCK'S TEMP WORD.
+ * That word is the parking slot for a deferred load (ir.h, THE LOAD SHADOW),
+ * and a divide is allowed to BE the shadow instruction sitting between an
+ * IR_LOAD and its IR_TEMP_GET -- writing it here would eat the parked value.
+ * Both pushes are past the divide-by-zero branch, so every path through this
+ * node pops exactly what it pushed.
+ */
+static void emit_muldiv(fgl_emitter *e, const ir_node *p)
+{
+	int dividend = FGL_R_T1;
+	int rem = p->sc[0];
+	int divisor;
+	int to_zero, done;
+	int a, b;
+
+	if (p->sub == MD_MULT || p->sub == MD_MULTU) {
+		/* `dmuls.l`/`dmulu.l` leave the whole 64-bit product in
+		 * MACH:MACL, MACL the low half -- which is LO, MACH being HI.
+		 * `mul.l` would save nothing here and leaves MACH undefined,
+		 * so it is only usable where HI is dead; the IR does not say
+		 * that, so it is not used. */
+		a = operand(e, p->hs, p->rs, FGL_R_T1);
+		b = operand(e, p->ht, p->rt, FGL_R_XFER);
+		if (p->sub == MD_MULT)
+			sh4_emit_dmuls_l(&e->cg, a, b);
+		else
+			sh4_emit_dmulu_l(&e->cg, a, b);
+
+		/* Both halves sit in MAC until they are read, so the order is
+		 * free and LO goes first to match the reference's. */
+		a = p->hd >= 0 ? p->hd : FGL_R_XFER;
+		sh4_emit_sts_macl(&e->cg, a);
+		st_pair(e, p->hd, GUEST_LO, a);
+
+		a = p->hx >= 0 ? p->hx : FGL_R_XFER;
+		sh4_emit_sts_mach(&e->cg, a);
+		st_pair(e, p->hx, GUEST_HI, a);
+		return;
+	}
+
+	if (p->sub != MD_DIV && p->sub != MD_DIVU) {
+		e->unsupported = 1;
+		e->unsupported_op = p->op;
+		return;
+	}
+
+	if (!rem) {
+		e->overflow = 1;
+		return;
+	}
+
+	/* The dividend is taken first: loading it from the state block goes
+	 * through r0, which is where the divisor is about to live. */
+	a = operand(e, p->hs, p->rs, FGL_R_T1);
+	if (a != dividend)
+		sh4_emit_mov_reg(&e->cg, a, dividend);
+
+	if (p->sub == MD_DIVU && p->ht >= 0) {
+		divisor = p->ht;                /* read-only: no copy needed */
+	} else {
+		divisor = FGL_R_XFER;
+		b = operand(e, p->ht, p->rt, FGL_R_XFER);
+		if (b != divisor)
+			sh4_emit_mov_reg(&e->cg, b, divisor);
+	}
+
+	sh4_emit_tst(&e->cg, divisor, divisor);
+	to_zero = bt_fwd(e);
+
+	if (p->sub == MD_DIVU) {
+		emit_div_core(e, dividend, divisor, rem);
+		done = bra_fwd(e);
+
+		patch_fwd8(e, to_zero);
+		sh4_emit_mov_reg(&e->cg, dividend, rem);        /* HI = n  */
+		sh4_emit_mov_imm(&e->cg, -1, dividend);         /* LO = -1 */
+		patch_fwd12(e, done);
+	} else {
+		int nonneg;
+
+		/* The quotient takes the sign of the operands' exclusive or
+		 * and the remainder the sign of the dividend -- C's
+		 * truncating division, which is what `n / d` and `n % d` mean
+		 * at r3000a.h:354-355, not a floor.  Neither sign survives
+		 * the core: both operands are made positive, and `rem` is
+		 * built by the core itself. */
+		sh4_emit_mov_reg(&e->cg, dividend, rem);
+		sh4_emit_xor(&e->cg, divisor, rem);             /* n ^ d */
+		sh4_emit_mov_l_store_dec(&e->cg, rem, 15);
+		sh4_emit_mov_l_store_dec(&e->cg, dividend, 15);
+
+		emit_abs(e, dividend);
+		emit_abs(e, divisor);
+
+		emit_div_core(e, dividend, divisor, rem);
+
+		/* r0 holds the divisor, which the core's own correction was
+		 * the last reader of, so the sign words come back into it. */
+		sh4_emit_mov_l_load_inc(&e->cg, 15, FGL_R_XFER);   /* n     */
+		emit_neg_if(e, FGL_R_XFER, rem);
+		sh4_emit_mov_l_load_inc(&e->cg, 15, FGL_R_XFER);   /* n ^ d */
+		emit_neg_if(e, FGL_R_XFER, dividend);
+		done = bra_fwd(e);
+
+		patch_fwd8(e, to_zero);
+		sh4_emit_mov_reg(&e->cg, dividend, rem);        /* HI = n */
+		sh4_emit_mov_imm(&e->cg, -1, dividend);
+		sh4_emit_cmppz(&e->cg, rem);
+		nonneg = bt_fwd(e);
+		sh4_emit_mov_imm(&e->cg, 1, dividend);
+		patch_fwd8(e, nonneg);
+		patch_fwd12(e, done);
+	}
+
+	st_pair(e, p->hd, GUEST_LO, dividend);
+	st_pair(e, p->hx, GUEST_HI, rem);
+}
+
+/* ---------------------------------------------------------------- */
 /* The unaligned four                                                */
 /* ---------------------------------------------------------------- */
 
@@ -683,6 +1029,175 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 
 	case IR_STORE_UN:
 		emit_store_un(e, p);
+		break;
+
+	case IR_MFC0:
+		/* COP0 sits inside GBR's reach like everything else, so a
+		 * coprocessor read is the same one instruction an ordinary
+		 * state access is -- no address computation, no second file. */
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_COP0 + (p->imm & 31)));
+		if (p->defer)
+			sh4_emit_mov_l_store_gbr(&e->cg, FGL_AT_TEMP_REG);
+		else if (p->hd >= 0)
+			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
+		else
+			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+		break;
+
+	case IR_MTC0:
+		rs = operand(e, p->hs, p->rs, FGL_R_XFER);
+		if (rs != FGL_R_XFER)
+			sh4_emit_mov_reg(&e->cg, rs, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)(FGL_AT_COP0 + (p->imm & 31)));
+		break;
+
+	case IR_STOP:
+		/* AN EXCEPTION IS AN ORDINARY BLOCK EXIT.
+		 *
+		 * Taking one is four state writes and a change of PC, and the
+		 * block can do all five itself: EPC, CAUSE and SR into the
+		 * state block, and the vector into the exit register, which
+		 * the epilogue publishes to `next_pc` like any other
+		 * destination.  So no service routine, no call out of
+		 * generated code, and nothing in the runtime that has to know
+		 * this block ended differently from a `j` -- the dispatcher
+		 * compiles the handler at the vector the way it compiles any
+		 * other address, and a guest that installed its own handler
+		 * there gets it.
+		 *
+		 * The allocation pass has already flushed every live guest
+		 * register (alloc.c, IR_STOP), so the handler's block sees
+		 * coherent state.
+		 *
+		 * EPC first, SR last: the SR read has to see the value from
+		 * BEFORE the push, and anything added here later that wants
+		 * the old SR (a BEV test, say) finds it still in r1. */
+		emit_const(e, p->imm, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, CP0_AT(COP0_EPC));
+
+		emit_cause(e, p->sub);
+		emit_sr_push(e);
+
+		/* WHICH VECTOR, AND WHY IT IS TESTED RATHER THAN ASSUMED.
+		 *
+		 * SR bit 22 (BEV) picks the bootstrap vector at bfc00180h
+		 * over the normal one at 80000080h. It is tempting to skip
+		 * the test on the grounds that the PSX never sets BEV -- but
+		 * the runtime we are keeping does test it (`psxException`,
+		 * deps/pcsx_rearmed/libpcsxcore/r3000a.c:135), and a guest
+		 * that sets BEV and then traps would otherwise be sent
+		 * somewhere the interpreter would not send it. Ten
+		 * instructions on a path that runs once per BIOS call is not
+		 * where this project's time goes.
+		 *
+		 * `emit_sr_push` leaves the OLD SR in r1, which is what the
+		 * test needs -- the push clears BEV's neighbours but not BEV,
+		 * so either copy would do; taking the old one means nothing
+		 * here depends on that staying true.
+		 *
+		 * Bit 22 is brought to bit 31 by two shifts and read with
+		 * `cmp/pz`, rather than masked: `tst #imm` reaches only the
+		 * low byte. */
+		{
+			int bev, over;
+
+			sh4_emit_mov_reg(&e->cg, FGL_R_T1, FGL_R_XFER);
+			sh4_emit_shll8(&e->cg, FGL_R_XFER);
+			sh4_emit_shll(&e->cg, FGL_R_XFER);
+			sh4_emit_cmppz(&e->cg, FGL_R_XFER);
+			bev = bf_fwd(e);                /* T clear = BEV set */
+			emit_const(e, GUEST_EXC_VECTOR, FGL_R_EXIT);
+			over = bra_fwd(e);
+			patch_fwd8(e, bev);
+			emit_const(e, GUEST_EXC_VECTOR_BEV, FGL_R_EXIT);
+			patch_fwd12(e, over);
+		}
+		break;
+
+	case IR_RFE:
+		/* Pop the same stack: SR bits 5:2 copied down to 3:0, bits 5:4
+		 * left alone -- so the top pair ends up duplicated.
+		 * `cpuspecifications.md`, "cop0cmd=10h - RFE opcode": "bit2-3
+		 * are copied to bit0-1, and bit4-5 are copied to bit2-3, all
+		 * other bits (including bit4-5) are left unchanged".  Both
+		 * moves at once are `(SR >> 2) & 0x0f` into the low nibble,
+		 * which is lightrec's `rec_cp0_RFE` (deps/lightrec/emitter.c:
+		 * 3226) as well.
+		 *
+		 * RFE does NOT jump to EPC -- the handler does that with its
+		 * own `jr`, and this instruction is what sits in that jump's
+		 * delay slot.  So there is nothing to write to the exit
+		 * register here. */
+		sh4_emit_mov_l_load_gbr(&e->cg, CP0_AT(COP0_SR));
+		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, FGL_R_T1);
+		sh4_emit_shlr2(&e->cg, FGL_R_XFER);
+		merge_low_field(e, 0x0f);
+		sh4_emit_mov_l_store_gbr(&e->cg, CP0_AT(COP0_SR));
+		break;
+
+	case IR_MFC2:
+		/* One load and one move.  No sign extension on the way out:
+		 * the sixteen-bit registers are narrowed on the way IN
+		 * (see IR_MTC2), so what is in the state block is already
+		 * the value a read must hand back -- r3000a.h:483-484 reads
+		 * `cp2[]` raw for exactly that reason. */
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)p->imm);
+		if (p->defer)
+			sh4_emit_mov_l_store_gbr(&e->cg, FGL_AT_TEMP_REG);
+		else if (p->hd >= 0)
+			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
+		else
+			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+		break;
+
+	case IR_MTC2:
+		/* `imm2` IS THE HALFWORD FLAG HERE, not a displacement
+		 * (decode.c:406) -- the field is used for one thing on this
+		 * node and something else entirely on IR_LWC2/IR_SWC2.
+		 *
+		 * Nine of the sixty-four registers keep only the low
+		 * halfword of a write and hand back its sign extension
+		 * (decode.c:64-104; nocash GTE section, "Writing 32bit
+		 * values to 16bit GTE registers by software does not
+		 * trigger saturation").  The decoder has already worked out
+		 * WHICH register this is; narrowing it is still the
+		 * emitter's job, and it is one `exts.w` because the
+		 * register number was known at compile time.  The reference
+		 * does the same narrowing on the write side,
+		 * `r3k_cop2_in` (r3000a.h:279-286). */
+		rs = operand(e, p->hs, p->rs, FGL_R_XFER);
+		if (rs != FGL_R_XFER)
+			sh4_emit_mov_reg(&e->cg, rs, FGL_R_XFER);
+		if (p->imm2)
+			sh4_emit_exts_w(&e->cg, FGL_R_XFER, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)p->imm);
+		break;
+
+	case IR_LWC2:
+		/* Address in r0 with r1 free for a wide displacement, the
+		 * same pairing IR_LOAD uses, and the loaded word goes
+		 * straight back out through r0 -- so the whole node holds
+		 * nothing live across the state access.
+		 *
+		 * No narrowing, deliberately: the reference stores the full
+		 * word (r3000a.h:518), and matching it is what the oracle
+		 * compares against.  See NOTES. */
+		emit_cop2_addr(e, p, FGL_R_XFER, FGL_R_T1);
+		sh4_emit_mov_l_load(&e->cg, FGL_R_XFER, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)p->imm);
+		break;
+
+	case IR_SWC2:
+		/* Address in r1 first, as in IR_STORE: r0 has to stay free
+		 * to carry the coprocessor register out of the state block,
+		 * and there is no other register that can. */
+		emit_cop2_addr(e, p, FGL_R_T1, FGL_R_XFER);
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)p->imm);
+		sh4_emit_mov_l_store(&e->cg, FGL_R_XFER, FGL_R_T1);
+		break;
+
+	case IR_MULDIV:
+		emit_muldiv(e, p);
 		break;
 
 	case IR_JUMP:

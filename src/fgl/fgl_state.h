@@ -46,7 +46,7 @@
 #define GUEST_AT(g) ((unsigned)(g))
 
 /* Word indices of the coprocessor files. */
-#define FGL_AT_CP0  34u         /* +136 */
+#define FGL_AT_COP0 34u         /* +136 */
 #define FGL_AT_CP2D 66u         /* +264 */
 #define FGL_AT_CP2C 98u         /* +392 */
 

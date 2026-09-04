@@ -446,8 +446,14 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         break;
 
                 case IR_SET:
-                case IR_MFC0:
                         p->hd = host_dst(&s, p->rd);
+                        break;
+
+                case IR_MFC0:
+                        /* A coprocessor read carries the same shadow as a
+                         * memory load, so it defers the same way: parked
+                         * value, no destination claimed here. */
+                        p->hd = p->defer ? -1 : host_dst(&s, p->rd);
                         break;
 
                 case IR_ALU:
@@ -528,7 +534,9 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         break;
 
                 case IR_MFC2:
-                        p->hd = host_dst(&s, p->rd);
+                        /* Deferred, it claims no destination -- the same
+                         * shadow an ordinary load has. */
+                        p->hd = p->defer ? -1 : host_dst(&s, p->rd);
                         break;
 
                 case IR_STOP:

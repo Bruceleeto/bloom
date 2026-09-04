@@ -561,16 +561,34 @@ int ir_reads(uint32_t insn, unsigned r)
         }
 }
 
-/* Does this instruction write memory?  The stores and the two unaligned
- * store forms -- everything whose write could land on a word another
- * instruction is reading. */
-static int mips_writes_mem(uint32_t insn)
+/* Does this instruction write state that a load in front of it might read?
+ *
+ * Not just memory. The rotation below moves a load's READ past this
+ * instruction's WRITE, so anything the load could have read matters -- and a
+ * coprocessor read is a load too:
+ *
+ *      mfc0 r22, cop0r20
+ *      mtc0 r22, cop0r20       <- reads old r22, writes the register just read
+ *
+ * Rotating puts the mtc0 first and the mfc0 then reads what it wrote. Memory
+ * and the two coprocessor files are the whole of what a load reads, so they
+ * are the whole of this list. */
+static int mips_writes_state(uint32_t insn)
 {
         unsigned op = insn >> 26;
+        unsigned rs = (insn >> 21) & 31;
 
-        return op == 0x28 || op == 0x29 || op == 0x2a ||        /* SB SH SWL */
-               op == 0x2b || op == 0x2e ||                      /* SW SWR    */
-               op == 0x3a;                                      /* SWC2      */
+        if (op == 0x28 || op == 0x29 || op == 0x2a ||           /* SB SH SWL */
+            op == 0x2b || op == 0x2e ||                         /* SW SWR    */
+            op == 0x3a)                                         /* SWC2      */
+                return 1;
+
+        if (op == 0x10)                                         /* MTC0      */
+                return rs == 0x04;
+        if (op == 0x12)                                         /* MTC2 CTC2 */
+                return !(insn & (1u << 25)) && (rs == 0x04 || rs == 0x06);
+
+        return op == 0x32;                                      /* LWC2      */
 }
 
 /* Did `insn` decode into exactly one load node, sitting at index `mark`?  Only
@@ -578,6 +596,19 @@ static int mips_writes_mem(uint32_t insn)
 static int shadow_pending(const ctx *c, uint32_t insn, int mark)
 {
         unsigned op = insn >> 26;
+        unsigned rs = (insn >> 21) & 31;
+
+        /* A COPROCESSOR READ HAS THE SAME SHADOW AS A MEMORY LOAD. "When
+         * reading from a coprocessor register, the next opcode cannot use the
+         * destination register as operand (much the same as the Load Delays
+         * that occur when reading from memory)" -- tools/docs/
+         * cpuspecifications.md, Caution - Load Delay, COP section. Both MFC0
+         * and MFC2/CFC2 decode to a single node, so both can be deferred the
+         * same way an ordinary load is. */
+        if (op == 0x10 && rs == 0x00)
+                return c->n == mark + 1 ? mark : -1;
+        if (op == 0x12 && !(insn & (1u << 25)) && (rs == 0x00 || rs == 0x02))
+                return c->n == mark + 1 ? mark : -1;
 
         if (op != 0x20 && op != 0x21 && op != 0x22 &&
             op != 0x23 && op != 0x24 && op != 0x25 && op != 0x26)
@@ -611,9 +642,9 @@ static int shadow_fix(ctx *c, int pend, uint32_t load, uint32_t insn, int mark)
          * last -- which also runs its memory read last, and the hardware does
          * not: the read happens at the load and only the register write is
          * delayed (`ir.h`, `defer`). If the shadow instruction writes memory,
-         * it may write the very word the load is about to read, so the load is
-         * split in place instead: read now, write the register afterwards. */
-        if (mips_writes_mem(insn)) {
+         * it may write the very thing the load is about to read, so the load
+         * is split in place instead: read now, write the register after. */
+        if (mips_writes_state(insn)) {
                 ir_node *ld = &c->out[pend];
                 ir_node *get;
                 unsigned dest = ld->rd;
