@@ -72,9 +72,6 @@ if (WITH_FASTMEM)
 	link_libraries(fastmem)
 endif(WITH_FASTMEM)
 
-set(LIGHTREC_DIR deps/lightrec CACHE STRING "Lightrec directory")
-file(REAL_PATH ${LIGHTREC_DIR} LIGHTREC_REAL_DIR EXPAND_TILDE)
-
 set(PCSX_DIR deps/pcsx_rearmed CACHE STRING "PCSX directory")
 file(REAL_PATH ${PCSX_DIR} PCSX_REAL_DIR EXPAND_TILDE)
 
@@ -83,9 +80,6 @@ set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
 set(ENABLE_CODE_BUFFER ON CACHE INTERNAL "" FORCE)
 
 # Include Lightrec's own CMake file
-add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
-
-
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
 math(EXPR CODEBUF_SIZE "0x100000 * ${CODE_BUFFER_SIZE_MB}")
 if (NOT CODEBUF_SIZE)
@@ -124,7 +118,6 @@ add_library(libpcsxcore STATIC
 	${PCSX_REAL_DIR}/libpcsxcore/socket.c
 	${PCSX_REAL_DIR}/libpcsxcore/spu.c
 	${PCSX_REAL_DIR}/libpcsxcore/new_dynarec/emu_if.c
-	${PCSX_REAL_DIR}/libpcsxcore/lightrec/plugin.c
 	${PCSX_REAL_DIR}/plugins/gpulib/gpu.c
 	${PCSX_REAL_DIR}/plugins/gpulib/prim.c
 	${PCSX_REAL_DIR}/plugins/gpulib/vout_pl.c
@@ -137,16 +130,16 @@ target_include_directories(libpcsxcore PUBLIC
 	${PCSX_REAL_DIR}/include
 	${PCSX_REAL_DIR}
 )
-target_include_directories(libpcsxcore PRIVATE ${LIGHTREC_REAL_DIR})
 target_include_directories(libpcsxcore INTERFACE ${PCSX_REAL_DIR})
 target_compile_definitions(libpcsxcore PUBLIC
+	DRC_DISABLE
+	# The custom memory map is bloom's, not the recompiler's: the MMU
+	# pages, the embedded BIOS and the scratchpad all live there, and the
+	# interpreter needs them exactly as much as generated code did.
 	LIGHTREC
 	LIGHTREC_CUSTOM_MAP
-	LIGHTREC_CODE_INV
 	NO_SOCKET
-	DISABLE_MEM_LUTS
 	CODE_BUFFER_SIZE=${CODEBUF_SIZE}
-	LIGHTREC_PROG_NAME="/rd/dummy.elf"
 	USE_ASYNC_CDROM
 	USE_C11_THREADS
 	HAVE_CDROM
@@ -154,7 +147,7 @@ target_compile_definitions(libpcsxcore PUBLIC
 )
 target_include_directories(libpcsxcore PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(libpcsxcore PRIVATE -Wno-format)
-target_link_libraries(libpcsxcore PUBLIC lightrec zlib)
+target_link_libraries(libpcsxcore PUBLIC zlib)
 
 if (NOT GPU_PLUGIN)
 	set(GPU_PLUGIN PVR CACHE STRING "GPU plugin" FORCE)
@@ -371,6 +364,7 @@ endif()
 
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
 set(WITH_GAME_PATH "" CACHE PATH "If set, auto-boot the CD image at the given path")
+set(WITH_BOOT_SSTATE "/rd/gt.sav" CACHE PATH "If set, load this savestate at boot")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
 set(WITH_MCD2_PATH "/dev/mcd1" CACHE PATH "Runtime path to the second memory card image")

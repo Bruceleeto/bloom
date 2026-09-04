@@ -12,7 +12,16 @@
 #include <kos.h>
 
 #include <libpcsxcore/psxmem.h>
-#include <libpcsxcore/lightrec/mem.h>
+
+/*
+ * This was lightrec's custom memory map, and it outlives it: the map is what
+ * gives the guest its RAM, BIOS, scratchpad and parallel port, whoever
+ * executes the code. The two entry points keep their names so the call sites
+ * do not care which it is.
+ */
+int lightrec_init_mmap(void);
+void lightrec_free_mmap(void);
+void *code_buffer;
 
 #define OFFSET 0x0
 
