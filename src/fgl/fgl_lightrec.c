@@ -121,6 +121,7 @@ FGL_ASSERT(COP0_SR == 12 && COP0_CAUSE == 13 && COP0_EPC == 14, cop0_regs);
  * check cannot see. lightrec's own emitter declared it the same way and for
  * the same reason. */
 extern void *gte_fpu_resolve(u32 op);
+extern uint32_t psxCP2CtrlGen;
 
 /* HOW BIG A BLOCK CAN GET BEFORE IT IS MEASURED.
  *
@@ -192,6 +193,27 @@ void fgl_mtc(u32 opcode, struct lightrec_state *state)
 	union code op = { .opcode = opcode };
 
 	lightrec_mtc(state, op, op.r.rd, state->regs.gpr[op.r.rt]);
+}
+
+/* A COP2 read that is not a load: `IRGB` and `ORGB`.  `lightrec_mfc2`'s job,
+ * and it is exported, so this is only the argument order and the destination
+ * write -- the same shape `fgl_rw` has for the same reason. */
+void fgl_mfc(u32 opcode, struct lightrec_state *state)
+{
+	union code op = { .opcode = opcode };
+
+	if (op.r.rt)
+		state->regs.gpr[op.r.rt] = lightrec_mfc(state, op);
+}
+
+/* Returning from an exception.  `lightrec_rfe` pops the interrupt-enable
+ * stack and writes Status back through `lightrec_mtc0`, which is where the
+ * pending-interrupt check lives.  See ir.h on IR_RFE. */
+void fgl_rfe(u32 unused, struct lightrec_state *state)
+{
+	(void) unused;
+
+	lightrec_rfe(state);
 }
 
 /* ---------------------------------------------------------------- */
@@ -308,6 +330,9 @@ static void fgl_targets_once(void)
 
 	fgl_dc_targets.rw       = (u32)(uintptr_t)fgl_rw;
 	fgl_dc_targets.mtc      = (u32)(uintptr_t)fgl_mtc;
+	fgl_dc_targets.mfc      = (u32)(uintptr_t)fgl_mfc;
+	fgl_dc_targets.rfe      = (u32)(uintptr_t)fgl_rfe;
+	fgl_dc_targets.cp2_ctrl_gen = (u32)(uintptr_t)&psxCP2CtrlGen;
 	fgl_dc_targets.gte_body = fgl_gte_body;
 
 	/* Last, and it is what the guard above tests: nothing may observe a

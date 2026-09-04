@@ -80,7 +80,15 @@ enum {
          * the coprocessor register, already resolved by the decoder — data and
          * control are one contiguous file, so there is no second opcode and
          * nothing downstream has to know which half it is in. */
-        IR_MFC2,        /* rd = cop2[imm]              */
+        IR_MFC2,        /* rd = cop2[imm], narrowed by `sub`  */
+
+        /* A COP2 READ C HAS TO PERFORM: `IRGB` and `ORGB`, which are not
+         * storage at all.  Both are computed from `IR1`-`IR3` on every read --
+         * each shifted down seven and clamped to five bits, then packed --
+         * so there is no word to load.  `imm` is the guest instruction word;
+         * C reads and writes the state block, so the allocation pass flushes
+         * around it exactly as for IR_RW. */
+        IR_MFC2_C,
         IR_MTC2,        /* cop2[imm] = rs              */
         IR_LWC2,        /* cop2[imm] = mem[rs + imm2]  */
         IR_SWC2,        /* mem[rs + imm2] = cop2[imm]  */
@@ -138,6 +146,18 @@ enum { MD_MULT, MD_MULTU, MD_DIV, MD_DIVU };
 enum { MEM_B, MEM_BU, MEM_H, MEM_HU, MEM_W };
 enum { UN_LWL, UN_LWR, UN_SWL, UN_SWR };
 enum { CC_EQ, CC_NE, CC_LEZ, CC_GTZ, CC_LTZ, CC_GEZ };
+
+/* HOW WIDE A COP2 READ REALLY IS.  `IR_MFC2`'s `sub`.
+ *
+ * A third of the geometry file is sixteen bits wide, and `gte_fpu.c` writes
+ * those registers through a halfword member -- `D_SZ3` is
+ * `CP2D.p[19].w.l`, `D_OTZ` is `CP2D.p[7].w.l`, `D_IR0`-`D_IR3` are
+ * `.sw.l`.  The other half of each word is whatever was there before, so a
+ * thirty-two bit read of one hands the guest the low half it wanted with
+ * stale bits above it.  Narrowing on the way in cannot help: the writer is
+ * the C body, not an `mtc2`.  So the read narrows, exactly as lightrec's
+ * `lightrec_mfc2` does. */
+enum { CP2_RAW, CP2_SX, CP2_ZX };
 
 typedef struct {
         uint8_t  op;

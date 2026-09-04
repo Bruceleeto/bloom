@@ -1539,24 +1539,37 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		break;
 
 	case IR_RFE:
-		/* Pop the same stack: SR bits 5:2 copied down to 3:0, bits 5:4
-		 * left alone -- so the top pair ends up duplicated.
-		 * `cpuspecifications.md`, "cop0cmd=10h - RFE opcode": "bit2-3
-		 * are copied to bit0-1, and bit4-5 are copied to bit2-3, all
-		 * other bits (including bit4-5) are left unchanged".  Both
-		 * moves at once are `(SR >> 2) & 0x0f` into the low nibble,
-		 * which is lightrec's `rec_cp0_RFE` (deps/lightrec/emitter.c:
-		 * 3226) as well.
+		/* THE BIT SHUFFLE IS THE EASY HALF, AND IT WAS THE ONLY HALF.
 		 *
-		 * RFE does NOT jump to EPC -- the handler does that with its
-		 * own `jr`, and this instruction is what sits in that jump's
-		 * delay slot.  So there is nothing to write to the exit
-		 * register here. */
-		sh4_emit_mov_l_load_gbr(&e->cg, CP0_AT(COP0_SR));
-		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, FGL_R_T1);
-		sh4_emit_shlr2(&e->cg, FGL_R_XFER);
-		merge_low_field(e, 0x0f);
-		sh4_emit_mov_l_store_gbr(&e->cg, CP0_AT(COP0_SR));
+		 * Popping the interrupt-enable stack is four instructions and
+		 * fgl used to emit them: SR bits 5:2 copied down to 3:0.  What
+		 * it did not do is what `lightrec_rfe` (lightrec.c) does with
+		 * the result -- write it back THROUGH `lightrec_mtc0`, which
+		 * raises `LIGHTREC_EXIT_CHECK_INTERRUPT` when the restored
+		 * Status unmasks an interrupt that is already pending.
+		 *
+		 * RFE is the last instruction of every interrupt handler, so
+		 * that is the moment a second pending interrupt becomes
+		 * deliverable.  Without the flag the emulator does not learn
+		 * of it until the timeslice ends, and every interrupt after
+		 * the first arrives late.
+		 *
+		 * lightrec's own emitter inlines a partial version of this --
+		 * it sets the flag for a pending SOFTWARE interrupt only, and
+		 * misses the hardware case its interpreter handles.  fgl calls
+		 * the interpreter's function rather than copying the emitter's
+		 * shortcut, so there is one behaviour and it is the complete
+		 * one. */
+		rs = p->sc[0];
+		if (!e->tgt || !e->tgt->shim_call || !e->tgt->rfe || !rs) {
+			e->unsupported = 1;
+			e->unsupported_op = p->op;
+			break;
+		}
+		emit_const(e, e->tgt->rfe, FGL_R_XFER);
+		emit_const(e, e->tgt->shim_call, rs);
+		sh4_emit_jsr(&e->cg, rs);
+		sh4_emit_nop(&e->cg);
 		break;
 
 	case IR_MFC2:
@@ -1566,12 +1579,31 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		 * the value a read must hand back -- r3000a.h:483-484 reads
 		 * `cp2[]` raw for exactly that reason. */
 		sh4_emit_mov_l_load_gbr(&e->cg, (int)p->imm);
+		if (p->sub == CP2_SX)
+			sh4_emit_exts_w(&e->cg, FGL_R_XFER, FGL_R_XFER);
+		else if (p->sub == CP2_ZX)
+			sh4_emit_extu_w(&e->cg, FGL_R_XFER, FGL_R_XFER);
 		if (p->defer)
 			sh4_emit_mov_l_store_gbr(&e->cg, FGL_AT_TEMP_REG);
 		else if (p->hd >= 0)
 			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
 		else
 			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+		break;
+
+	case IR_MFC2_C:
+		/* The IR_RW call shape again; see IR_MTC_C. */
+		rs = p->sc[0];
+		if (!e->tgt || !e->tgt->shim_call || !e->tgt->mfc || !rs) {
+			e->unsupported = 1;
+			e->unsupported_op = p->op;
+			break;
+		}
+		emit_const(e, e->tgt->mfc, FGL_R_XFER);
+		emit_const(e, p->imm, FGL_R_T1);
+		emit_const(e, e->tgt->shim_call, rs);
+		sh4_emit_jsr(&e->cg, rs);
+		sh4_emit_nop(&e->cg);
 		break;
 
 	case IR_MTC2:
@@ -1595,6 +1627,33 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		if (p->imm2)
 			sh4_emit_exts_w(&e->cg, FGL_R_XFER, FGL_R_XFER);
 		sh4_emit_mov_l_store_gbr(&e->cg, (int)p->imm);
+
+		/* A CONTROL WRITE HAS A SECOND DESTINATION.
+		 *
+		 * `gte_fpu.c` keeps the control file's derived form -- the
+		 * matrices as floats, the projection offsets -- in caches it
+		 * validates against `psxCP2CtrlGen`, and nothing else ever
+		 * invalidates them.  Storing the register without bumping the
+		 * counter leaves the geometry unit transforming with whatever
+		 * was loaded before the first command, for the rest of the
+		 * run: right at first, then progressively wrong as scenes load
+		 * new matrices, and flat once `OFX`/`OFY` are stale.
+		 *
+		 * lightrec pays this on its CTC2 path too (lightrec.c:614).
+		 * Four instructions on an instruction that runs a handful of
+		 * times per object, against a cache that saves the matrix
+		 * rebuild on every vertex. */
+		if (p->sub) {
+			if (!e->tgt || !e->tgt->cp2_ctrl_gen) {
+				e->unsupported = 1;
+				e->unsupported_op = p->op;
+				break;
+			}
+			emit_const(e, e->tgt->cp2_ctrl_gen, FGL_R_XFER);
+			sh4_emit_mov_l_load(&e->cg, FGL_R_XFER, FGL_R_T1);
+			sh4_emit_add_imm(&e->cg, 1, FGL_R_T1);
+			sh4_emit_mov_l_store(&e->cg, FGL_R_T1, FGL_R_XFER);
+		}
 		break;
 
 	case IR_LWC2:

@@ -99,6 +99,30 @@ static int cop2_is_half(unsigned reg, int control)
         return reg >= 8u && reg <= 11u; /* IR0-IR3 */
 }
 
+/* HOW A COP2 DATA READ HAS TO BE NARROWED.  See ir.h on CP2_RAW.
+ *
+ * The list is `lightrec_mfc2`'s (lightrec.c), which is the same list the
+ * hardware has: `VZ0`-`VZ2` and `IR0`-`IR3` read back sign-extended, `OTZ`
+ * and `SZ0`-`SZ3` zero-extended, and everything else is a whole word.
+ *
+ * Control reads are not here.  `cfc2` hands back the word as stored, and the
+ * sixteen-bit control registers are already narrowed on the way in by
+ * `cop2_is_half` -- a convention fgl chose deliberately and measured against
+ * hardware, and the C body reads them through `.sw.l` either way. */
+static int cop2_read_kind(unsigned reg)
+{
+        switch (reg) {
+        case 1: case 3: case 5:                 /* VZ0 VZ1 VZ2 */
+        case 8: case 9: case 10: case 11:       /* IR0 IR1 IR2 IR3 */
+                return CP2_SX;
+        case 7:                                 /* OTZ */
+        case 16: case 17: case 18: case 19:     /* SZ0 SZ1 SZ2 SZ3 */
+                return CP2_ZX;
+        default:
+                return CP2_RAW;
+        }
+}
+
 static void emit_move(ir_ctx *c, uint32_t pc, unsigned rd, unsigned rs)
 {
         ir_node *p;
@@ -418,11 +442,32 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                 case 0x02:                              /* CFC2 rt,rd */
                         if (rt == 0)
                                 return;
+
+                        if (rs == 0x00) {
+                                /* IRGB and ORGB are computed, not stored. */
+                                if (rd == 28u || rd == 29u) {
+                                        p = ir_node_new(c, IR_MFC2_C, pc);
+                                        if (!p)
+                                                return;
+                                        p->imm = insn;
+                                        return;
+                                }
+
+                                /* SXYP IS AN ALIAS FOR SXY2, not a register.
+                                 * A read of 15 returns 14; a write to it
+                                 * pushes the screen FIFO, which is the other
+                                 * half of this and lives in IR_MTC2. */
+                                if (rd == 15u)
+                                        rd = 14u;
+                        }
+
                         p = ir_node_new(c, IR_MFC2, pc);
                         if (!p)
                                 return;
                         p->rd = (uint8_t)rt;
                         p->imm = cop2_disp(rd, rs == 0x02);
+                        p->sub = (uint8_t)(rs == 0x02 ? CP2_RAW
+                                                      : cop2_read_kind(rd));
                         return;
                 case 0x04:                              /* MTC2 rt,rd */
                 case 0x06:                              /* CTC2 rt,rd */
@@ -432,6 +477,7 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                         p->rs = (uint8_t)rt;
                         p->imm = cop2_disp(rd, rs == 0x06);
                         p->imm2 = (uint32_t)cop2_is_half(rd, rs == 0x06);
+                        p->sub = (uint8_t)(rs == 0x06);  /* CTC2, not MTC2 */
                         return;
                 default:
                         c->unknown = 1;

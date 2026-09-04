@@ -131,6 +131,31 @@ typedef struct {
 	 * instruction word, the state block)`.  See ir.h on IR_MTC_C. */
 	uint32_t mtc;
 
+	/* The computed COP2 reads, same call shape again.  See ir.h on
+	 * IR_MFC2_C. */
+	uint32_t mfc;
+
+	/* Returning from an exception.  `f(ignored, the state block)`, the
+	 * same shape again.  See ir.h on IR_RFE. */
+	uint32_t rfe;
+
+	/* THE ADDRESS OF `psxCP2CtrlGen`, and why a code generator has to
+	 * know about it.
+	 *
+	 * `gte_fpu.c` does not read the COP2 control file on every command.
+	 * It caches what it derives from it -- the three 3x3 matrices in
+	 * float form, and the projection offsets -- and decides whether a
+	 * cache is still good by comparing a generation counter
+	 * (`gte_fpu.c:342,391,472,502,976`).  `lightrec_ctc2` bumps that
+	 * counter on every control write (lightrec.c:614), which is the only
+	 * thing that ever invalidates them.
+	 *
+	 * A back end that writes the control register and not the counter
+	 * therefore transforms every vertex for the rest of the run with the
+	 * matrix and the projection offsets that happened to be loaded before
+	 * the first GTE command.  See ir.h on IR_MTC2. */
+	uint32_t cp2_ctrl_gen;
+
 	/* The C body that runs one COP2 command, given the guest instruction
 	 * word.  Resolved AT COMPILE TIME -- the command is a constant in the
 	 * block, so there is no runtime dispatch and nothing decodes it twice.

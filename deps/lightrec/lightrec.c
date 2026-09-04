@@ -1202,6 +1202,17 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	block->function = new_fn;
 	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
 
+	/* THE ACCOUNTING GNU LIGHTNING USED TO DO.  `lightrec_print_info`
+	 * reports MEM_FOR_CODE and divides it by MEM_FOR_MIPS_CODE to get the
+	 * average instructions-per-instruction -- the expansion factor of the
+	 * compiler, and the one number that says whether a change to the
+	 * emitter made the code bigger or smaller.  Without this the figure is
+	 * "CODE 0 KiB, avg. IPI 0.000000" and the total is short by the whole
+	 * of the emitted code.  Paired with the two unregisters that were
+	 * already here: the one below for the block being replaced, and the
+	 * one in `lightrec_free_block`. */
+	lightrec_register(MEM_FOR_CODE, block->code_size);
+
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
 

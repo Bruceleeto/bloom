@@ -571,6 +571,8 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         break;
 
                 case IR_MTC_C:
+                case IR_MFC2_C:
+                case IR_RFE:
                 case IR_RW:
                         /* C performs the whole access against the state
                          * block, so every guest register the allocator is
