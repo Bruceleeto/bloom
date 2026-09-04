@@ -72,44 +72,15 @@ if (WITH_FASTMEM)
 	link_libraries(fastmem)
 endif(WITH_FASTMEM)
 
-set(LIGHTNING_DIR deps/lightning CACHE STRING "GNU Lightning directory")
-file(REAL_PATH ${LIGHTNING_DIR} LIGHTNING_REAL_DIR EXPAND_TILDE)
-
 set(LIGHTREC_DIR deps/lightrec CACHE STRING "Lightrec directory")
 file(REAL_PATH ${LIGHTREC_DIR} LIGHTREC_REAL_DIR EXPAND_TILDE)
 
 set(PCSX_DIR deps/pcsx_rearmed CACHE STRING "PCSX directory")
 file(REAL_PATH ${PCSX_DIR} PCSX_REAL_DIR EXPAND_TILDE)
 
-set(MAYBE_INCLUDE_STDINT_H "#include <stdint.h>")
-configure_file(${LIGHTNING_REAL_DIR}/include/lightning.h.in include/lightning.h @ONLY)
-
-add_library(lightning STATIC
-	${LIGHTNING_REAL_DIR}/lib/lightning.c
-	${LIGHTNING_REAL_DIR}/lib/jit_disasm.c
-	${LIGHTNING_REAL_DIR}/lib/jit_fallback.c
-	${LIGHTNING_REAL_DIR}/lib/jit_memory.c
-	${LIGHTNING_REAL_DIR}/lib/jit_names.c
-	${LIGHTNING_REAL_DIR}/lib/jit_note.c
-	${LIGHTNING_REAL_DIR}/lib/jit_print.c
-	${LIGHTNING_REAL_DIR}/lib/jit_rewind.c
-	${LIGHTNING_REAL_DIR}/lib/jit_size.c
-	${CMAKE_BINARY_DIR}/include/lightning.h
-)
-target_include_directories(lightning PUBLIC
-	${CMAKE_BINARY_DIR}/include
-	${LIGHTNING_REAL_DIR}/include
-)
-target_compile_definitions(lightning PRIVATE HAVE_MMAP=0 SH_HAS_FPU=0)
-target_compile_options(lightning PRIVATE -Wno-unused-function -Wno-unused-variable -Wno-parentheses -Wno-format)
-
 # Force these two options to get Bloom to build and work properly
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
 set(ENABLE_CODE_BUFFER ON CACHE INTERNAL "" FORCE)
-
-# Point Lightrec to Lightning's lib and include directories
-set(LIBLIGHTNING lightning)
-set(LIBLIGHTNING_INCLUDE_DIR $<TARGET_PROPERTY:lightning,INTERFACE_INCLUDE_DIRECTORIES>)
 
 # Include Lightrec's own CMake file
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
@@ -410,20 +381,8 @@ if (LOG_LEVEL STREQUAL "Debug")
 	find_library(SFRAME_LIBRARIES sframe REQUIRED)
 	find_library(IBERTY_LIBRARIES iberty REQUIRED)
 
-	target_compile_definitions(lightning PRIVATE
-		DISASSEMBLER
-		BINUTILS_2_38
-		BINUTILS_2_29
-		HAVE_DISASSEMBLE_INIT_FOR_TARGET
-		PACKAGE_VERSION
-	)
-	target_link_libraries(lightning PUBLIC
-		${OPCODES_LIBRARIES}
-		${BFD_LIBRARIES}
-		${SFRAME_LIBRARIES}
-		${IBERTY_LIBRARIES}
-		zlib
-	)
+	# The disassembler was Lightning's. binutils stays found for whatever
+	# wants it next.
 
 	set(WITH_CACHED_STDIO ON)
 endif()
