@@ -253,7 +253,28 @@ static void emit_addr(fgl_emitter *e, const ir_node *p, int dst, int other)
 		}
 	}
 
-	sh4_emit_and(&e->cg, FGL_R_MASK, dst);
+	/* THE MASK, AND THE ONE PROOF THAT LETS IT GO.
+	 *
+	 * Every guest address is masked into the window, and it costs one
+	 * instruction on every load and every store -- which, at six and
+	 * five-and-a-half SH-4 instructions per guest access, is real money on
+	 * the two hottest classes there are.
+	 *
+	 * It comes off only where the optimiser established that the WHOLE
+	 * possible range of this address already lands inside one region:
+	 * `lightrec_get_constprop_map` requires the minimum and maximum
+	 * computed address to agree in their top three bits before it will
+	 * name a region at all (constprop.c:745), and NO_MASK is set on top of
+	 * that. The raw-word front end never sets it, so the oracle's default
+	 * path still masks and this is a strictly-added fast path rather than
+	 * a changed one.
+	 *
+	 * If that proof is ever wrong the failure is a store through a wild
+	 * address, which is the worst kind of bug this project can produce --
+	 * so it is driven by the flag alone and never by anything inferred
+	 * here. */
+	if (!(p->hint & FGL_H_NO_MASK))
+		sh4_emit_and(&e->cg, FGL_R_MASK, dst);
 }
 
 /* ---------------------------------------------------------------- */
@@ -614,6 +635,13 @@ static void emit_muldiv(fgl_emitter *e, const ir_node *p)
 	int divisor;
 	int to_zero, done;
 	int a, b;
+	/* A half nothing reads is a half nothing computes. The allocator is
+	 * told the same thing (alloc.c) and gives the dead half no register,
+	 * so there is nothing holding a stale value for the block's writeback
+	 * to publish. */
+	int no_lo = (p->hint & FGL_H_NO_LO) != 0;
+	int no_hi = (p->hint & FGL_H_NO_HI) != 0;
+	int check_zero = !(p->hint & FGL_H_NO_DIV_CHK);
 
 	if (p->sub == MD_MULT || p->sub == MD_MULTU) {
 		/* `dmuls.l`/`dmulu.l` leave the whole 64-bit product in
@@ -623,20 +651,32 @@ static void emit_muldiv(fgl_emitter *e, const ir_node *p)
 		 * that, so it is not used. */
 		a = operand(e, p->hs, p->rs, FGL_R_T1);
 		b = operand(e, p->ht, p->rt, FGL_R_XFER);
-		if (p->sub == MD_MULT)
+
+		/* `mul.l` computes only the low 32 bits and leaves MACH
+		 * undefined, so it is usable exactly when the optimiser has
+		 * shown nothing reads HI. That is the whole of what NO_HI buys
+		 * here, and it is why the comment above says the IR does not
+		 * say that -- now it does. */
+		if (no_hi)
+			sh4_emit_mul_l(&e->cg, a, b);
+		else if (p->sub == MD_MULT)
 			sh4_emit_dmuls_l(&e->cg, a, b);
 		else
 			sh4_emit_dmulu_l(&e->cg, a, b);
 
 		/* Both halves sit in MAC until they are read, so the order is
 		 * free and LO goes first to match the reference's. */
-		a = p->hd >= 0 ? p->hd : FGL_R_XFER;
-		sh4_emit_sts_macl(&e->cg, a);
-		st_pair(e, p->hd, GUEST_LO, a);
+		if (!no_lo) {
+			a = p->hd >= 0 ? p->hd : FGL_R_XFER;
+			sh4_emit_sts_macl(&e->cg, a);
+			st_pair(e, p->hd, GUEST_LO, a);
+		}
 
-		a = p->hx >= 0 ? p->hx : FGL_R_XFER;
-		sh4_emit_sts_mach(&e->cg, a);
-		st_pair(e, p->hx, GUEST_HI, a);
+		if (!no_hi) {
+			a = p->hx >= 0 ? p->hx : FGL_R_XFER;
+			sh4_emit_sts_mach(&e->cg, a);
+			st_pair(e, p->hx, GUEST_HI, a);
+		}
 		return;
 	}
 
@@ -666,17 +706,35 @@ static void emit_muldiv(fgl_emitter *e, const ir_node *p)
 			sh4_emit_mov_reg(&e->cg, b, divisor);
 	}
 
-	sh4_emit_tst(&e->cg, divisor, divisor);
-	to_zero = bt_fwd(e);
+	/* THE DIVIDE-BY-ZERO PATH, AND WHEN IT IS NOT THERE.
+	 *
+	 * A zero divisor is defined on the R3000A rather than trapping -- the
+	 * quotient is -1 or 1 by the sign of the dividend and the remainder is
+	 * the dividend -- so the check is part of the instruction, not a
+	 * safety net, and it is emitted unless the optimiser proved the
+	 * divisor cannot be zero. `LIGHTREC_NO_DIV_CHECK` is that proof, and
+	 * nothing here infers it: an inferred one would remove a defined
+	 * result and the wrong answer would be a plausible number.
+	 *
+	 * Note what is NOT skipped with it: the signed path's sign handling
+	 * stays exactly as it was. Only the zero test and its branch go. */
+	if (check_zero) {
+		sh4_emit_tst(&e->cg, divisor, divisor);
+		to_zero = bt_fwd(e);
+	} else {
+		to_zero = 0;
+	}
 
 	if (p->sub == MD_DIVU) {
 		emit_div_core(e, dividend, divisor, rem);
-		done = bra_fwd(e);
 
-		patch_fwd8(e, to_zero);
-		sh4_emit_mov_reg(&e->cg, dividend, rem);        /* HI = n  */
-		sh4_emit_mov_imm(&e->cg, -1, dividend);         /* LO = -1 */
-		patch_fwd12(e, done);
+		if (check_zero) {
+			done = bra_fwd(e);
+			patch_fwd8(e, to_zero);
+			sh4_emit_mov_reg(&e->cg, dividend, rem);   /* HI = n  */
+			sh4_emit_mov_imm(&e->cg, -1, dividend);    /* LO = -1 */
+			patch_fwd12(e, done);
+		}
 	} else {
 		int nonneg;
 
@@ -702,20 +760,28 @@ static void emit_muldiv(fgl_emitter *e, const ir_node *p)
 		emit_neg_if(e, FGL_R_XFER, rem);
 		sh4_emit_mov_l_load_inc(&e->cg, 15, FGL_R_XFER);   /* n ^ d */
 		emit_neg_if(e, FGL_R_XFER, dividend);
-		done = bra_fwd(e);
 
-		patch_fwd8(e, to_zero);
-		sh4_emit_mov_reg(&e->cg, dividend, rem);        /* HI = n */
-		sh4_emit_mov_imm(&e->cg, -1, dividend);
-		sh4_emit_cmppz(&e->cg, rem);
-		nonneg = bt_fwd(e);
-		sh4_emit_mov_imm(&e->cg, 1, dividend);
-		patch_fwd8(e, nonneg);
-		patch_fwd12(e, done);
+		if (check_zero) {
+			done = bra_fwd(e);
+
+			patch_fwd8(e, to_zero);
+			sh4_emit_mov_reg(&e->cg, dividend, rem);   /* HI = n */
+			sh4_emit_mov_imm(&e->cg, -1, dividend);
+			sh4_emit_cmppz(&e->cg, rem);
+			nonneg = bt_fwd(e);
+			sh4_emit_mov_imm(&e->cg, 1, dividend);
+			patch_fwd8(e, nonneg);
+			patch_fwd12(e, done);
+		}
 	}
 
-	st_pair(e, p->hd, GUEST_LO, dividend);
-	st_pair(e, p->hx, GUEST_HI, rem);
+	/* The core computes both halves whatever happens -- a 32-step divide
+	 * produces its remainder on the way to its quotient -- so a dead half
+	 * saves the store, not the work. */
+	if (!no_lo)
+		st_pair(e, p->hd, GUEST_LO, dividend);
+	if (!no_hi)
+		st_pair(e, p->hx, GUEST_HI, rem);
 }
 
 /* ---------------------------------------------------------------- */
@@ -1204,6 +1270,42 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		emit_const(e, p->imm, FGL_R_EXIT);
 		break;
 
+	/* LEAVING FOR C, WHICH IS DONE BY ARITHMETIC AND NOT BY A BRANCH.
+	 *
+	 * lightrec has no "return to the caller" instruction in a block. What
+	 * it has is one budget test in the dispatcher, so a block that wants
+	 * out reconciles the absolute counters and sets the delta to zero;
+	 * the dispatcher regains control by the ordinary path, finds the
+	 * budget spent and returns to C, which reads `exit_flags` to find out
+	 * that this was a request rather than a timeout.
+	 *
+	 * The reconciliation is `current = target = target - delta`, which is
+	 * what `rec_exit_early` does (emitter.c) -- the delta being what is
+	 * left unspent, so subtracting it from the target is what the machine
+	 * actually reached.
+	 *
+	 * The block still runs its own epilogue after this, which charges for
+	 * the instructions and publishes the exit PC. That charge lands on a
+	 * delta that is now zero and makes it negative, which is harmless:
+	 * the test is `<= 0` and the counters C reads were already written.
+	 *
+	 * Seven instructions, and every exit code is a power of two below 64,
+	 * so the flag is an immediate and costs no literal. */
+	case IR_EXIT:
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_TARGET_CYCLE);
+		sh4_emit_sub(&e->cg, FGL_R_CYCLE, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_TARGET_CYCLE);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_CURRENT_CYCLE);
+		sh4_emit_mov_imm(&e->cg, 0, FGL_R_CYCLE);
+
+		sh4_emit_mov_imm(&e->cg, (int)p->imm, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_EXIT_FLAGS);
+
+		/* Where C resumes. The epilogue publishes it like any other
+		 * exit, so there is nothing further to do here. */
+		emit_const(e, p->imm2, FGL_R_EXIT);
+		break;
+
 	case IR_CAPTURE:
 		rs = operand(e, p->hs, p->rs, FGL_R_XFER);
 		if (rs != FGL_R_EXIT)
@@ -1252,7 +1354,8 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 	}
 }
 
-uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a)
+uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
+		  unsigned n_ops)
 {
 	uint32_t entry;
 	int i, f = 0;
@@ -1272,11 +1375,43 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a)
 	while (f < a->n_fix)
 		emit_fixup(e, &a->fix[f++]);
 
-	/* The block publishes where it goes and returns. */
-	sh4_emit_mov_reg(&e->cg, FGL_R_EXIT, FGL_R_XFER);
-	sh4_emit_mov_l_store_gbr(&e->cg, FGL_AT_NEXT_PC);
-	sh4_emit_rts(&e->cg);
-	sh4_emit_nop(&e->cg);
+	/* THE EPILOGUE: CHARGE FOR THE BLOCK, AND LEAVE THROUGH THE DISPATCHER.
+	 *
+	 * Five instructions.  The block does not return -- it jumps to the
+	 * address in the state block, carrying the guest PC it is leaving for
+	 * in r2, which is where the exit register has held it all along.
+	 *
+	 * IT USED TO BE `rts`, AND THAT WAS ONE INSTRUCTION CHEAPER-LOOKING
+	 * AND STRICTLY WORSE.  Returning means PR holds the block's return
+	 * address for the block's entire life, so PR silently joins the
+	 * register contract and every service routine called from inside a
+	 * block has to save and restore it -- while fgl.h says a service may
+	 * clobber "r0 and r1 and nothing else" and does not mention PR.  The
+	 * `rts` form also filled its delay slot usefully, with the store of
+	 * the exit PC to `next_pc`, so it looked like it was getting that
+	 * publication for free.  It was not free; it was unnecessary.  The
+	 * dispatcher reads r2.
+	 *
+	 * So: same five instructions, PR is nobody's, and `next_pc` is written
+	 * only on the paths where C actually reads it.  The `nop` is forced --
+	 * `mov.l @(disp,GBR),Rn` exists only for R0, so the dispatch address
+	 * has to land in r0, and an instruction in a `jmp`'s delay slot may
+	 * not modify the jump's target register.
+	 *
+	 * The last thing this buys is the one that matters later: a jump
+	 * through a slot can be PATCHED into a direct branch to the block that
+	 * follows it.  An `rts` can never be linked to anything.
+	 *
+	 * A block that consumed no guest instructions charges nothing, which
+	 * is entry 0 of the table and still a correct load. */
+	if (n_ops > FGL_CYCLE_ENTRIES - 1)
+		n_ops = FGL_CYCLE_ENTRIES - 1;
+	sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
+	sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
+
+	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
+	sh4_emit_jmp(&e->cg, FGL_R_XFER);
+	sh4_emit_nop(&e->cg);                                  /* delay slot */
 
 	emit_pool(e);
 
@@ -1295,5 +1430,5 @@ uint32_t fgl_emit_block(fgl_emitter *e, const uint32_t *words, uint32_t pc)
 	if (n <= 0)
 		return 0;
 	ir_allocate(ir, n, &a);
-	return fgl_emit(e, ir, n, &a);
+	return fgl_emit(e, ir, n, &a, (unsigned)ir_block_length(words));
 }

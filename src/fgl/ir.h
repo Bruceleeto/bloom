@@ -64,7 +64,21 @@ enum {
          * `defer` below. */
         IR_TEMP_GET,
 
-        IR_STOP         /* SYSCALL / BREAK — sub is the exception code */
+        IR_STOP,        /* SYSCALL / BREAK — sub is the exception code */
+
+        /* LEAVE FOR C, AND SAY WHY.  `imm` is lightrec's exit flag, `imm2` the
+         * guest PC to resume at.
+         *
+         * Not an error path.  The emulator delivers its HLE BIOS calls by
+         * marking an opcode unknown and letting the block exit with
+         * LIGHTREC_EXIT_UNKNOWN_OP, so a code generator with no way to express
+         * this cannot run the BIOS at all -- the block simply fails to build.
+         *
+         * The mechanism is lightrec's and it is indirect: there is no return
+         * instruction here. The block reconciles the absolute cycle counters,
+         * ZEROES THE DELTA so the dispatcher's one budget test fires the
+         * moment it regains control, and leaves normally. */
+        IR_EXIT
 };
 
 enum { ALU_ADD, ALU_SUB, ALU_AND, ALU_OR, ALU_XOR, ALU_NOR, ALU_SLT, ALU_SLTU };
@@ -119,7 +133,36 @@ typedef struct {
          * allocator does not model, and this pair is rare enough that two
          * extra instructions cost nothing. */
         uint8_t  defer;
+
+        /* WHAT THE FRONT END KNEW AND THE EMITTER CANNOT WORK OUT.
+         *
+         * Zero on every node the raw-word decoder builds, and zero is the
+         * conservative answer everywhere it is read -- "assume nothing, emit
+         * the general form".  Only `front.c` sets these, from what lightrec's
+         * optimiser proved about the block, and the emitter is entitled to
+         * treat a nonzero value as fact.
+         *
+         * `io` is the memory region a load or store reaches (FGL_IO_*); `hint`
+         * carries the rest of the per-node facts as FGL_H_* bits. */
+        uint8_t  io;
+        uint8_t  hint;
 } ir_node;
+
+/* Memory regions, as the optimiser labels them. UNKNOWN is not a region but
+ * an admission, and it is what the raw-word decoder produces for everything. */
+enum { FGL_IO_UNKNOWN, FGL_IO_DIRECT, FGL_IO_HW, FGL_IO_RAM,
+       FGL_IO_BIOS, FGL_IO_SCRATCH, FGL_IO_DIRECT_HW };
+
+/* Per-node facts that are not a region. */
+enum {
+        FGL_H_NO_MASK   = 1u << 0,   /* address is already in range         */
+        FGL_H_NO_LO     = 1u << 1,   /* mul/div: nothing reads LO           */
+        FGL_H_NO_HI     = 1u << 2,   /* mul/div: nothing reads HI           */
+        FGL_H_NO_DIV_CHK = 1u << 3,  /* divisor is provably nonzero         */
+        FGL_H_ALIGN     = 1u << 4    /* LWL/LWR/SWL/SWR byte offset known;
+                                      * the offset itself is in `sub`'s
+                                      * upper bits -- see front.c */
+};
 
 /* A block is at most 32 guest instructions, and a transfer expands to at most
  * three nodes, so this has headroom over anything the decoder can produce. */

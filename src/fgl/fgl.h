@@ -13,9 +13,9 @@
  *          hold a live value in r0 across a state access.
  *   r1     the emitter's second working register.
  *   r2     the exit register: the guest PC the block leaves for. Written
- *          before the delay slot runs, read by the epilogue -- so nothing
- *          between those two points may touch it, including anything the
- *          block calls.
+ *          before the delay slot runs and carried out of the block into the
+ *          dispatcher, which reads it -- so nothing from the write to the end
+ *          of the block may touch it, including anything the block calls.
  *   r3-r12 the allocator's pool. A node needing a third working register is
  *          given one here by the allocation pass, in `sc[]`.
  *   r13    the guest address mask. Held permanently, never written.
@@ -26,6 +26,24 @@
  * NOTHING ELSE. r2 carries the exit PC and r3-r12 carry guest values not yet
  * written back. A compiled C function is not callable from inside a block at
  * all: it knows nothing about GBR or r13.
+ *
+ * PR IS NOT IN THIS CONTRACT, AND THAT IS DELIBERATE. A block does not
+ * return -- it ends by jumping through FGL_AT_DISPATCH -- so nothing in a
+ * block owns PR and a service may use it freely for its own call. The
+ * alternative, an `rts` epilogue, costs the same five instructions and
+ * silently makes PR live for the whole of every block, which would put a save
+ * and a restore around every service call for no gain. See the note on
+ * FGL_AT_DISPATCH in fgl_state.h.
+ *
+ * WHAT A C-ABI CALL ACTUALLY COSTS, WHICH IS LESS THAN IT LOOKS. r8-r15 are
+ * callee-saved on SH-4, so r8-r12 of the guest pool, the mask in r13 and the
+ * cycle delta in r14 all survive a compiled C function on their own. Only
+ * r2-r7 need saving, and to the STACK rather than to the state block: a
+ * GBR-relative spill of a register that is not r0 costs two instructions each
+ * way instead of one, and a fixed shim has no access to the allocator's model
+ * of which registers are dirty. GBR itself is the SH-4 TLS pointer and is NOT
+ * callee-saved -- it survives only because nothing in the linked image uses
+ * TLS, which is a property to assert at link time rather than to assume.
  */
 
 #ifndef FGL_H
@@ -41,6 +59,26 @@
 #define FGL_R_T1    1
 #define FGL_R_EXIT  2
 #define FGL_R_MASK  13
+
+/* THE CYCLE DELTA, AND WHY IT IS r14.
+ *
+ * lightrec keeps `target_cycle - current_cycle` as a signed quantity in a
+ * register for the whole of a run, not per block: every block subtracts what
+ * it cost, and the DISPATCHER, not the block, tests whether it has gone
+ * negative. So a block never branches on it and never reloads it -- it
+ * subtracts once and leaves.
+ *
+ * r14 is the only general register the contract had not already spoken for.
+ * It is the frame pointer in the SH-4 C ABI, which costs nothing here: it is
+ * callee-saved, so the dispatcher saves it once on the way in from C and
+ * restores it on the way out, and no compiled C runs inside a block to want
+ * it. Two instructions per `lightrec_execute`, not per block.
+ *
+ * A service routine may clobber r0 and r1 AND NOTHING ELSE, so it may not
+ * touch this either. The oracle has always checked r14 unchanged across a
+ * block; it now checks the charge instead, which is the same property with a
+ * known answer. */
+#define FGL_R_CYCLE 14
 
 #define FGL_MAX_LITERALS 64
 
@@ -80,7 +118,14 @@ uint32_t fgl_size(const fgl_emitter *e);
 
 /* Emit one already-decoded, already-allocated block. Returns its entry
  * address, or 0 if the emitter overflowed or met something it cannot lower. */
-uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a);
+/* Emit one block. `n_ops` is the number of GUEST INSTRUCTIONS it covers, delay
+ * slot included -- not the node count, which folding and transfer expansion
+ * both move. It is what the block charges the cycle counter for, so getting it
+ * wrong desynchronises the machine without producing a single wrong register:
+ * `fgl_front` reports it as `info.n_ops`, and the raw-word path takes it from
+ * `ir_block_length`. */
+uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
+		  unsigned n_ops);
 
 /* Decode, allocate and emit in one call: `words` is a window of guest
  * instructions (see ir.h -- it must hold IR_MAX_INSNS + 1 of them) and `pc`

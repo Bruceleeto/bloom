@@ -6,11 +6,9 @@
 #ifndef __LIGHTREC_PRIVATE_H__
 #define __LIGHTREC_PRIVATE_H__
 
-#include "lightning-wrapper.h"
 #include "lightrec-config.h"
 #include "disassembler.h"
 #include "lightrec.h"
-#include "regcache.h"
 
 #if ENABLE_THREADED_COMPILER
 #include <stdatomic.h>
@@ -94,6 +92,12 @@
 #define REG_HI 33
 #define REG_TEMP (offsetof(struct lightrec_state, temp_reg) / sizeof(u32))
 
+/* One precomputed product per possible block length: cycle_table[k] is
+ * k * cycles_per_op.  A block's charge is then a load whose displacement is
+ * its instruction count.  Sized for the longest block fgl will emit plus the
+ * inclusive end -- kept in step with FGL_CYCLE_ENTRIES. */
+#define LIGHTREC_CYCLE_ENTRIES 34
+
 /* Definition of jit_state_t (avoids inclusion of <lightning.h>) */
 struct jit_node;
 struct jit_state;
@@ -165,17 +169,37 @@ struct lightrec_cstate {
 	_Bool no_load_delay;
 };
 
+/* THE ORDER OF THE FIRST FIELDS IS THE CODE GENERATOR'S ABI, NOT A STYLE
+ * CHOICE.  GBR points at this struct and generated code reaches every one of
+ * them with a single `mov.l @(disp,GBR),r0`, whose displacement is a compile
+ * time constant baked into the instruction word.  Those constants are
+ * declared in src/fgl/fgl_state.h and checked against this struct by the
+ * static assertions in src/fgl/fgl_lightrec.c.  Moving a field here without
+ * moving it there does not fail to build and does not crash: generated code
+ * reads the neighbouring field and the machine desynchronises quietly.
+ *
+ * `dispatch` is the host address a finished block jumps to.  It is a u32 and
+ * not a `void *` on purpose: every field above it is four bytes wide, so the
+ * struct has the same layout on this machine and on the workstation that
+ * compiles the layout assertions, and the assertions therefore mean something.
+ *
+ * `cycle_table` is the reason a block charges its cycles in two instructions
+ * with no literal pool entry -- see fgl_state.h.  It has to sit immediately
+ * behind next_pc so that its displacement does not depend on anything below
+ * it, and the three counters follow it for the same reason. */
 struct lightrec_state {
-	struct lightrec_registers regs;
-	u32 temp_reg;
-	u32 curr_pc;
-	u32 next_pc;
-	uintptr_t wrapper_regs[NUM_TEMPS];
-	uintptr_t wrapper_cycle;
+	struct lightrec_registers regs;		/* +0   */
+	u32 temp_reg;				/* +520 */
+	u32 curr_pc;				/* +524 */
+	u32 next_pc;				/* +528 */
+	u32 cycle_table[LIGHTREC_CYCLE_ENTRIES];/* +532 */
+	u32 current_cycle;			/* +668 */
+	u32 target_cycle;			/* +672 */
+	u32 exit_flags;				/* +676 */
+	u32 dispatch;				/* +680 */
+	u32 lut_base;				/* +684 */
+	u32 addr_mask;				/* +688 */
 	u8 in_delay_slot_n;
-	u32 current_cycle;
-	u32 target_cycle;
-	u32 exit_flags;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
 	void *c_wrapper;
@@ -402,9 +426,15 @@ get_delay_slot(const struct opcode *list, u16 i)
 	return op_flag_no_ds(list[i].flags) ? &list[i - 1] : &list[i + 1];
 }
 
+/* Whether a block hands its next PC over through memory rather than in a
+ * register.  Under GNU Lightning this was a register-pressure question and
+ * the answer varied by architecture.  fgl does not have the choice and does
+ * not want it: the block's `rts` needs a delay slot filled, and the store of
+ * next_pc fills it, so publishing the PC costs nothing and the dispatcher
+ * reads it from the state block.  Always. */
 static inline _Bool lightrec_store_next_pc(void)
 {
-	return NUM_REGS + NUM_TEMPS <= 4;
+	return 1;
 }
 
 #endif /* __LIGHTREC_PRIVATE_H__ */

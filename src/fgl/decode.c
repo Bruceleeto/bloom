@@ -19,14 +19,9 @@
 
 #include "ir.h"
 #include "fgl_state.h"
+#include "decode_int.h"
 
-typedef struct {
-        ir_node *out;
-        int      n;
-        int      max;
-} ctx;
-
-static ir_node *node(ctx *c, int op, uint32_t pc)
+ir_node *ir_node_new(ir_ctx *c, int op, uint32_t pc)
 {
         ir_node *p;
 
@@ -43,6 +38,8 @@ static ir_node *node(ctx *c, int op, uint32_t pc)
         p->hd = p->hs = p->ht = p->hx = -1;
         p->sc[0] = p->sc[1] = 0;
         p->defer = 0;
+        p->io = FGL_IO_UNKNOWN;
+        p->hint = 0;
         return p;
 }
 
@@ -102,26 +99,26 @@ static int cop2_is_half(unsigned reg, int control)
         return reg >= 8u && reg <= 11u; /* IR0-IR3 */
 }
 
-static void emit_move(ctx *c, uint32_t pc, unsigned rd, unsigned rs)
+static void emit_move(ir_ctx *c, uint32_t pc, unsigned rd, unsigned rs)
 {
         ir_node *p;
 
         if (rd == 0 || rd == rs)
                 return;
-        p = node(c, IR_MOVE, pc);
+        p = ir_node_new(c, IR_MOVE, pc);
         if (!p)
                 return;
         p->rd = (uint8_t)rd;
         p->rs = (uint8_t)rs;
 }
 
-static void emit_set(ctx *c, uint32_t pc, unsigned rd, uint32_t v)
+void ir_emit_set(ir_ctx *c, uint32_t pc, unsigned rd, uint32_t v)
 {
         ir_node *p;
 
         if (rd == 0)
                 return;
-        p = node(c, IR_SET, pc);
+        p = ir_node_new(c, IR_SET, pc);
         if (!p)
                 return;
         p->rd = (uint8_t)rd;
@@ -129,7 +126,7 @@ static void emit_set(ctx *c, uint32_t pc, unsigned rd, uint32_t v)
 }
 
 /* rd = rs <alu> rt, with the identities that fall out of a zero operand. */
-static void emit_alu(ctx *c, uint32_t pc, unsigned sub,
+static void emit_alu(ir_ctx *c, uint32_t pc, unsigned sub,
                      unsigned rd, unsigned rs, unsigned rt)
 {
         ir_node *p;
@@ -139,7 +136,7 @@ static void emit_alu(ctx *c, uint32_t pc, unsigned sub,
 
         if (rs == 0 && rt == 0) {
                 /* Every one of these is a constant with both inputs zero. */
-                emit_set(c, pc, rd, sub == ALU_NOR ? 0xffffffffu : 0);
+                ir_emit_set(c, pc, rd, sub == ALU_NOR ? 0xffffffffu : 0);
                 return;
         }
         if (rt == 0 && (sub == ALU_ADD || sub == ALU_SUB ||
@@ -152,11 +149,11 @@ static void emit_alu(ctx *c, uint32_t pc, unsigned sub,
                 return;
         }
         if (sub == ALU_AND && (rs == 0 || rt == 0)) {
-                emit_set(c, pc, rd, 0);
+                ir_emit_set(c, pc, rd, 0);
                 return;
         }
 
-        p = node(c, IR_ALU, pc);
+        p = ir_node_new(c, IR_ALU, pc);
         if (!p)
                 return;
         p->sub = (uint8_t)sub;
@@ -167,7 +164,7 @@ static void emit_alu(ctx *c, uint32_t pc, unsigned sub,
 
 /* rd = rs <alu> imm.  `imm` arrives already widened the way the guest
  * instruction widens it, so nothing downstream needs to know which. */
-static void emit_alu_imm(ctx *c, uint32_t pc, unsigned sub,
+static void emit_alu_imm(ir_ctx *c, uint32_t pc, unsigned sub,
                          unsigned rd, unsigned rs, uint32_t imm)
 {
         ir_node *p;
@@ -184,7 +181,7 @@ static void emit_alu_imm(ctx *c, uint32_t pc, unsigned sub,
                 case ALU_SLT: v = (int32_t)0 < (int32_t)imm; break;
                 default:      v = 0u < imm; break;      /* ALU_SLTU */
                 }
-                emit_set(c, pc, rd, v);
+                ir_emit_set(c, pc, rd, v);
                 return;
         }
         if (imm == 0 && (sub == ALU_ADD || sub == ALU_OR || sub == ALU_XOR)) {
@@ -192,11 +189,11 @@ static void emit_alu_imm(ctx *c, uint32_t pc, unsigned sub,
                 return;
         }
         if (imm == 0 && (sub == ALU_AND || sub == ALU_SLTU)) {
-                emit_set(c, pc, rd, 0);
+                ir_emit_set(c, pc, rd, 0);
                 return;
         }
 
-        p = node(c, IR_ALU_IMM, pc);
+        p = ir_node_new(c, IR_ALU_IMM, pc);
         if (!p)
                 return;
         p->sub = (uint8_t)sub;
@@ -208,7 +205,7 @@ static void emit_alu_imm(ctx *c, uint32_t pc, unsigned sub,
 /* An ordinary instruction — anything that is not a control transfer.  Called
  * for the delay slot too, which is why it is a function rather than inline in
  * the loop. */
-static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
+void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
 {
         unsigned op = insn >> 26;
         unsigned rs = (insn >> 21) & 31;
@@ -230,12 +227,12 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                                 /* A zero shift is a move; a zero source is a
                                  * zero result whatever the direction. */
                                 if (rt == 0)
-                                        emit_set(c, pc, rd, 0);
+                                        ir_emit_set(c, pc, rd, 0);
                                 else
                                         emit_move(c, pc, rd, rt);
                                 return;
                         }
-                        p = node(c, IR_SHIFT_IMM, pc);
+                        p = ir_node_new(c, IR_SHIFT_IMM, pc);
                         if (!p)
                                 return;
                         p->sub = (uint8_t)(fn == 0x00 ? SH_LL :
@@ -252,7 +249,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                                 emit_move(c, pc, rd, rt);
                                 return;
                         }
-                        p = node(c, IR_SHIFT_REG, pc);
+                        p = ir_node_new(c, IR_SHIFT_REG, pc);
                         if (!p)
                                 return;
                         p->sub = (uint8_t)(fn == 0x04 ? SH_LL :
@@ -268,7 +265,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 case 0x13: emit_move(c, pc, 32, rs); return;    /* MTLO */
 
                 case 0x18: case 0x19: case 0x1a: case 0x1b:
-                        p = node(c, IR_MULDIV, pc);
+                        p = ir_node_new(c, IR_MULDIV, pc);
                         if (!p)
                                 return;
                         p->sub = (uint8_t)(fn - 0x18);
@@ -287,7 +284,9 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 case 0x2a: emit_alu(c, pc, ALU_SLT, rd, rs, rt); return;
                 case 0x2b: emit_alu(c, pc, ALU_SLTU, rd, rs, rt); return;
 
-                default: return;                        /* skipped, not trapped */
+                default:
+                        c->unknown = 1;         /* skipped, not trapped */
+                        return;
                 }
 
         case 0x08: case 0x09: emit_alu_imm(c, pc, ALU_ADD, rt, rs, simm); return;
@@ -296,12 +295,12 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
         case 0x0c: emit_alu_imm(c, pc, ALU_AND, rt, rs, imm); return;
         case 0x0d: emit_alu_imm(c, pc, ALU_OR, rt, rs, imm); return;
         case 0x0e: emit_alu_imm(c, pc, ALU_XOR, rt, rs, imm); return;
-        case 0x0f: emit_set(c, pc, rt, imm << 16); return;      /* LUI */
+        case 0x0f: ir_emit_set(c, pc, rt, imm << 16); return;      /* LUI */
 
         case 0x20: case 0x21: case 0x23: case 0x24: case 0x25:
                 if (rt == 0)
                         return;
-                p = node(c, IR_LOAD, pc);
+                p = ir_node_new(c, IR_LOAD, pc);
                 if (!p)
                         return;
                 p->sub = (uint8_t)(op == 0x20 ? MEM_B :
@@ -314,7 +313,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 return;
 
         case 0x28: case 0x29: case 0x2b:
-                p = node(c, IR_STORE, pc);
+                p = ir_node_new(c, IR_STORE, pc);
                 if (!p)
                         return;
                 p->sub = (uint8_t)(op == 0x28 ? MEM_B :
@@ -327,7 +326,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
         case 0x22: case 0x26:                                   /* LWL / LWR */
                 if (rt == 0)
                         return;
-                p = node(c, IR_LOAD_UN, pc);
+                p = ir_node_new(c, IR_LOAD_UN, pc);
                 if (!p)
                         return;
                 p->sub = (uint8_t)(op == 0x22 ? UN_LWL : UN_LWR);
@@ -337,7 +336,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 return;
 
         case 0x2a: case 0x2e:                                   /* SWL / SWR */
-                p = node(c, IR_STORE_UN, pc);
+                p = ir_node_new(c, IR_STORE_UN, pc);
                 if (!p)
                         return;
                 p->sub = (uint8_t)(op == 0x2a ? UN_SWL : UN_SWR);
@@ -353,7 +352,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 if (rs == 0x00) {                       /* MFC0 rt,rd */
                         if (rt == 0)
                                 return;
-                        p = node(c, IR_MFC0, pc);
+                        p = ir_node_new(c, IR_MFC0, pc);
                         if (!p)
                                 return;
                         p->rd = (uint8_t)rt;
@@ -361,7 +360,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                         return;
                 }
                 if (rs == 0x04) {                       /* MTC0 rt,rd */
-                        p = node(c, IR_MTC0, pc);
+                        p = ir_node_new(c, IR_MTC0, pc);
                         if (!p)
                                 return;
                         p->rs = (uint8_t)rt;
@@ -369,7 +368,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                         return;
                 }
                 if (rs == 0x10 && fn == 0x10) {         /* RFE */
-                        node(c, IR_RFE, pc);
+                        ir_node_new(c, IR_RFE, pc);
                         return;
                 }
                 return;
@@ -380,7 +379,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                  * a command, clear means a register move, and the move's kind
                  * is the `rs` field.  Same split the reference makes. */
                 if (insn & (1u << 25)) {
-                        p = node(c, IR_GTE, pc);
+                        p = ir_node_new(c, IR_GTE, pc);
                         if (p)
                                 p->imm = insn & 0x1ffffffu;
                         return;
@@ -390,7 +389,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 case 0x02:                              /* CFC2 rt,rd */
                         if (rt == 0)
                                 return;
-                        p = node(c, IR_MFC2, pc);
+                        p = ir_node_new(c, IR_MFC2, pc);
                         if (!p)
                                 return;
                         p->rd = (uint8_t)rt;
@@ -398,7 +397,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                         return;
                 case 0x04:                              /* MTC2 rt,rd */
                 case 0x06:                              /* CTC2 rt,rd */
-                        p = node(c, IR_MTC2, pc);
+                        p = ir_node_new(c, IR_MTC2, pc);
                         if (!p)
                                 return;
                         p->rs = (uint8_t)rt;
@@ -406,12 +405,13 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                         p->imm2 = (uint32_t)cop2_is_half(rd, rs == 0x06);
                         return;
                 default:
+                        c->unknown = 1;
                         return;
                 }
         }
 
         case 0x32:                                      /* LWC2 rt,imm(rs) */
-                p = node(c, IR_LWC2, pc);
+                p = ir_node_new(c, IR_LWC2, pc);
                 if (!p)
                         return;
                 p->rs = (uint8_t)rs;
@@ -420,7 +420,7 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 return;
 
         case 0x3a:                                      /* SWC2 rt,imm(rs) */
-                p = node(c, IR_SWC2, pc);
+                p = ir_node_new(c, IR_SWC2, pc);
                 if (!p)
                         return;
                 p->rs = (uint8_t)rs;
@@ -428,7 +428,9 @@ static void decode_op(ctx *c, uint32_t insn, uint32_t pc)
                 p->imm2 = simm;
                 return;
 
-        default: return;                                /* skipped, not trapped */
+        default:
+                c->unknown = 1;                         /* skipped, not trapped */
+                return;
         }
 }
 
@@ -593,7 +595,7 @@ static int mips_writes_state(uint32_t insn)
 
 /* Did `insn` decode into exactly one load node, sitting at index `mark`?  Only
  * then is there a single node to move, and only loads have a shadow. */
-static int shadow_pending(const ctx *c, uint32_t insn, int mark)
+int ir_shadow_pending(const ir_ctx *c, uint32_t insn, int mark)
 {
         unsigned op = insn >> 26;
         unsigned rs = (insn >> 21) & 31;
@@ -622,7 +624,7 @@ static int shadow_pending(const ctx *c, uint32_t insn, int mark)
  * reads what the pending load writes, move the load node after it.  Returns
  * non-zero if it did, because the array order and the decode order have then
  * parted company and the caller must stop tracking. */
-static int shadow_fix(ctx *c, int pend, uint32_t load, uint32_t insn, int mark)
+int ir_shadow_fix(ir_ctx *c, int pend, uint32_t load, uint32_t insn, int mark)
 {
         unsigned rd = (load >> 16) & 31;        /* the load's destination */
         unsigned rb = (load >> 21) & 31;        /* and its base           */
@@ -650,7 +652,7 @@ static int shadow_fix(ctx *c, int pend, uint32_t load, uint32_t insn, int mark)
                 unsigned dest = ld->rd;
 
                 ld->defer = 1;
-                get = node(c, IR_TEMP_GET, ld->pc);
+                get = ir_node_new(c, IR_TEMP_GET, ld->pc);
                 if (!get)
                         return 0;
                 get->rd = (uint8_t)dest;
@@ -665,7 +667,7 @@ static int shadow_fix(ctx *c, int pend, uint32_t load, uint32_t insn, int mark)
 }
 
 /* Is this a control transfer?  The list the block terminates on. */
-static int is_transfer(uint32_t insn)
+int ir_is_transfer(uint32_t insn)
 {
         unsigned op = insn >> 26, fn = insn & 63;
 
@@ -679,7 +681,7 @@ static int is_transfer(uint32_t insn)
 
 /* The transfer, and only the part of it that has to see pre-delay-slot state.
  * Returns non-zero if a delay slot follows. */
-static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
+int ir_decode_transfer(ir_ctx *c, uint32_t insn, uint32_t pc)
 {
         unsigned op = insn >> 26;
         unsigned rs = (insn >> 21) & 31;
@@ -693,7 +695,7 @@ static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
 
         if (op == 0) {
                 if (fn == 0x0c || fn == 0x0d) {         /* SYSCALL / BREAK */
-                        p = node(c, IR_STOP, pc);
+                        p = ir_node_new(c, IR_STOP, pc);
                         if (p) {
                                 /* R3000A exception codes: Sys is 8, Bp is 9.
                                  * The service has to tell them apart, and only
@@ -707,8 +709,8 @@ static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
                  * jumps to the link value.  The reference does the same; this
                  * is where the two have to agree. */
                 if (fn == 0x09)
-                        emit_set(c, pc, rd, fall);
-                p = node(c, IR_CAPTURE, pc);
+                        ir_emit_set(c, pc, rd, fall);
+                p = ir_node_new(c, IR_CAPTURE, pc);
                 if (p)
                         p->rs = (uint8_t)rs;
                 return 1;
@@ -716,8 +718,8 @@ static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
 
         if (op == 0x02 || op == 0x03) {                 /* J / JAL */
                 if (op == 0x03)
-                        emit_set(c, pc, 31, fall);
-                p = node(c, IR_JUMP, pc);
+                        ir_emit_set(c, pc, 31, fall);
+                p = ir_node_new(c, IR_JUMP, pc);
                 if (p)
                         p->imm = (pc & 0xf0000000u) | ((insn & 0x03ffffffu) << 2);
                 return 1;
@@ -728,7 +730,7 @@ static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
 
                 /* The link forms link unconditionally, before the test. */
                 if (rt == 0x10 || rt == 0x11)
-                        emit_set(c, pc, 31, fall);
+                        ir_emit_set(c, pc, 31, fall);
 
                 if (rt == 0x00 || rt == 0x10)
                         cc = CC_LTZ;
@@ -736,13 +738,13 @@ static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
                         cc = CC_GEZ;
                 else {
                         /* Not a branch at all: never taken, slot still runs. */
-                        p = node(c, IR_JUMP, pc);
+                        p = ir_node_new(c, IR_JUMP, pc);
                         if (p)
                                 p->imm = fall;
                         return 1;
                 }
 
-                p = node(c, IR_COND, pc);
+                p = ir_node_new(c, IR_COND, pc);
                 if (p) {
                         p->sub = (uint8_t)cc;
                         p->rs = (uint8_t)rs;
@@ -752,7 +754,7 @@ static int decode_transfer(ctx *c, uint32_t insn, uint32_t pc)
                 return 1;
         }
 
-        p = node(c, IR_COND, pc);
+        p = ir_node_new(c, IR_COND, pc);
         if (p) {
                 p->sub = (uint8_t)(op == 0x04 ? CC_EQ :
                                    op == 0x05 ? CC_NE :
@@ -770,7 +772,7 @@ int ir_block_length(const uint32_t *words)
         int i;
 
         for (i = 0; i < IR_MAX_INSNS; i++)
-                if (is_transfer(words[i])) {
+                if (ir_is_transfer(words[i])) {
                         unsigned fn = words[i] & 63;
 
                         /* SYSCALL and BREAK have no delay slot: the block
@@ -790,7 +792,7 @@ unsigned ir_delay_slot_load(const uint32_t *words)
                 uint32_t slot;
                 unsigned op, fn;
 
-                if (!is_transfer(words[i]))
+                if (!ir_is_transfer(words[i]))
                         continue;
 
                 fn = words[i] & 63;
@@ -809,7 +811,7 @@ unsigned ir_delay_slot_load(const uint32_t *words)
 
 int ir_decode(const uint32_t *words, uint32_t pc, ir_node *out, int max)
 {
-        ctx c;
+        ir_ctx c;
         int i;
         int pend = -1;                  /* node index of a load in shadow */
         uint32_t pend_insn = 0;
@@ -817,22 +819,23 @@ int ir_decode(const uint32_t *words, uint32_t pc, ir_node *out, int max)
         c.out = out;
         c.n = 0;
         c.max = max;
+        c.unknown = 0;
 
         for (i = 0; i < IR_MAX_INSNS; i++) {
                 uint32_t insn = words[i];
                 uint32_t at = pc + 4u * (uint32_t)i;
                 int mark = c.n;
 
-                if (!is_transfer(insn)) {
-                        decode_op(&c, insn, at);
+                if (!ir_is_transfer(insn)) {
+                        ir_decode_op(&c, insn, at);
                         /* A rotation leaves this instruction's own node behind
                          * the load's, so its index is no longer `mark` and a
                          * second rotation on top of it would be wrong.  One
                          * hazard per pair is the whole of what real code has
                          * anyway. */
-                        pend = shadow_fix(&c, pend, pend_insn, insn, mark)
+                        pend = ir_shadow_fix(&c, pend, pend_insn, insn, mark)
                                        ? -1
-                                       : shadow_pending(&c, insn, mark);
+                                       : ir_shadow_pending(&c, insn, mark);
                         pend_insn = insn;
                         continue;
                 }
@@ -840,11 +843,11 @@ int ir_decode(const uint32_t *words, uint32_t pc, ir_node *out, int max)
                 /* The transfer's own nodes sit ahead of the delay slot, so a
                  * load shadowed by the transfer has to be placed between the
                  * two — which is where this call is. */
-                if (decode_transfer(&c, insn, at)) {
-                        shadow_fix(&c, pend, pend_insn, insn, mark);
-                        decode_op(&c, words[i + 1], at + 4);
+                if (ir_decode_transfer(&c, insn, at)) {
+                        ir_shadow_fix(&c, pend, pend_insn, insn, mark);
+                        ir_decode_op(&c, words[i + 1], at + 4);
                 } else {
-                        shadow_fix(&c, pend, pend_insn, insn, mark);
+                        ir_shadow_fix(&c, pend, pend_insn, insn, mark);
                 }
                 return c.n;
         }
@@ -852,7 +855,7 @@ int ir_decode(const uint32_t *words, uint32_t pc, ir_node *out, int max)
         /* Ran out of block before finding a transfer.  The next block starts
          * at the following instruction; nothing else is different. */
         {
-                ir_node *p = node(&c, IR_JUMP, pc);
+                ir_node *p = ir_node_new(&c, IR_JUMP, pc);
 
                 if (p)
                         p->imm = pc + 4u * IR_MAX_INSNS;

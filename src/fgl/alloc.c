@@ -491,8 +491,20 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                 case IR_MULDIV:
                         p->hs = host_src(&s, p->rs);
                         p->ht = host_src(&s, p->rt);
-                        p->hd = host_dst(&s, GUEST_LO);
-                        p->hx = host_dst(&s, GUEST_HI);
+                        /* A HALF NOTHING READS GETS NO REGISTER.
+                         *
+                         * Not an optimisation -- a correctness requirement
+                         * that comes with the emitter's right to skip a dead
+                         * half. `host_dst` claims a pinned register and the
+                         * block's writeback publishes whatever is in it at the
+                         * end; claim one for a result that is never computed
+                         * and the writeback stores garbage into LO or HI.
+                         * So the two decisions are made from the same flag,
+                         * here and in emit.c's `emit_muldiv`. */
+                        p->hd = (p->hint & FGL_H_NO_LO)
+                                        ? -1 : host_dst(&s, GUEST_LO);
+                        p->hx = (p->hint & FGL_H_NO_HI)
+                                        ? -1 : host_dst(&s, GUEST_HI);
                         /* Division is a service call, and the pointer to it
                          * has to be somewhere neither operand is. */
                         if (p->sub == MD_DIV || p->sub == MD_DIVU)
@@ -540,9 +552,13 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         break;
 
                 case IR_STOP:
+                case IR_EXIT:
                         /* It leaves the block through a service routine, so
                          * everything the guest can see has to be in the state
-                         * block before it goes. */
+                         * block before it goes. IR_EXIT hands control back to
+                         * C, which will read guest registers out of the state
+                         * block and may run an entire BIOS call against them,
+                         * so the same rule applies for the same reason. */
                         flush(&s);
                         break;
 

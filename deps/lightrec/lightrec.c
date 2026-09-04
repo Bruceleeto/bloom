@@ -1911,6 +1911,24 @@ void lightrec_free_cstate(struct lightrec_cstate *cstate)
 	lightrec_free(cstate->state, MEM_FOR_LIGHTREC, sizeof(*cstate), cstate);
 }
 
+/* Fill in the products a block's cycle charge is looked up from.
+ *
+ * A block charges `nb_ops * cycles_per_op`.  `cycles_per_op` is a runtime
+ * value -- the frontend changes it when the guest's clock scaling changes --
+ * so the charge cannot be an immediate, and the obvious lowering puts a
+ * literal in every block's constant pool.  Precomputing the products instead
+ * makes the charge a GBR-relative load whose displacement IS the instruction
+ * count, costing two instructions and no pool word (src/fgl/fgl_state.h).
+ *
+ * Called from everywhere `cycles_per_op` is written, and nowhere else. */
+static void lightrec_fill_cycle_table(struct lightrec_state *state)
+{
+	unsigned int i;
+
+	for (i = 0; i < LIGHTREC_CYCLE_ENTRIES; i++)
+		state->cycle_table[i] = i * state->cycles_per_op;
+}
+
 struct lightrec_state * lightrec_init(char *argv0,
 				      const struct lightrec_mem_map *maps,
 				      size_t nb,
@@ -1967,6 +1985,7 @@ struct lightrec_state * lightrec_init(char *argv0,
 	state->with_32bit_lut = with_32bit_lut;
 	state->in_delay_slot_n = 0xff;
 	state->cycles_per_op = 2;
+	lightrec_fill_cycle_table(state);
 
 	state->block_cache = lightrec_blockcache_init(state);
 	if (!state->block_cache)
@@ -2274,6 +2293,7 @@ void lightrec_set_cycles_per_opcode(struct lightrec_state *state, u32 cycles)
 		return;
 
 	state->cycles_per_op = cycles;
+	lightrec_fill_cycle_table(state);
 
 	if (ENABLE_THREADED_COMPILER) {
 		lightrec_recompiler_pause(state->rec);
