@@ -763,10 +763,33 @@ int ir_shadow_pending(const ir_ctx *c, uint32_t insn, int mark)
  * reads the register the load is about to write nor writes memory the load is
  * about to read -- the two things the rotation in `ir_shadow_fix` would get
  * wrong once the load moves past it. */
-int ir_slot_holds_shadow(uint32_t slot, uint32_t load)
+int ir_slot_holds_shadow(uint32_t slot, uint32_t load, uint32_t branch)
 {
         unsigned rd = (load >> 16) & 31;        /* the load's destination */
         unsigned rb = (load >> 21) & 31;        /* and its base           */
+
+        /* NO ROTATION, NOTHING TO PROTECT AGAINST.
+         *
+         * Everything below guards the load being MOVED -- `ir_shadow_fix`
+         * puts it at the end of the node array, past the slot's nodes as well
+         * as the branch's.  But that only happens if the branch actually
+         * reads what the load writes: `ir_shadow_fix` opens with
+         * `if (!ir_reads(insn, rd)) return 0`, and the branch one entry later
+         * is the `insn` this shadow settles against.
+         *
+         * When the branch does not read `rd` the load never moves, so it
+         * still issues where it stands -- before the slot -- and the slot's
+         * writes to `rb` or to memory cannot reach it.  Refusing those was
+         * costing every MIPS function epilogue in the BIOS: the swap hoists
+         * `addiu $sp,$sp,N` in front of `jr`, the pending load is addressed
+         * off `$sp`, and the write-to-base test fired on a rotation that was
+         * never going to happen.
+         *
+         * Measured: refusals 10 -> 0, and reverting this does NOT fix the
+         * `OPT_SWITCH_DELAY_SLOTS` fault -- that was tested and the crash was
+         * unchanged, so this is not the bug it was once suspected of being. */
+        if (!ir_reads(branch, rd))
+                return 1;
 
         /* The rotation runs the WHOLE load last -- its memory read as well
          * as its register write -- so three separate things have to still be

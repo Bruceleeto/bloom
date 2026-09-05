@@ -654,6 +654,13 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
         int pend = -1;                  /* node index of a load in shadow */
         uint32_t pend_insn = 0;
         movi_state movi;
+        /* Where this block would have to be cut to land BEFORE a swapped
+         * pair rather than between its halves; -1 when not inside one. */
+        int pair_mark = -1;
+        unsigned pair_ops = 0;
+        int pair_pend = -1;
+        uint32_t pair_pend_insn = 0;
+        movi_state pair_movi;
 
         c.out = out;
         c.n = 0;
@@ -733,11 +740,42 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                  * only if it cannot observe or disturb the load. Refusing is
                  * the honest answer to the rest; C runs the instruction. */
                 if (ds_slot && pend >= 0 &&
-                    !ir_slot_holds_shadow(hword, pend_insn)) {
+                    (i + 1 >= nb ||
+                     !ir_slot_holds_shadow(hword, pend_insn,
+                                           hazard_word(&ops[i + 1])))) {
                         note_unsupported(info, op, at);
                         info->stop_reason = FGL_STOP_UNSUPPORTED;
                         info->ended_early = 1;
                         break;
+                }
+
+                /* THE EXIT PC IS A LIST INDEX, AND THE SWAP BROKE THAT.
+                 *
+                 * A block that stops before the list ends leaves through
+                 * `IR_JUMP` with `pc + 4 * n_ops`, which is only the right
+                 * address while index order and machine order agree.
+                 * `lightrec_swap_delay_slots` ends that: the slot sits at
+                 * index j with machine address A+4 and its branch at index
+                 * j+1 with machine address A.  Cutting the block between them
+                 * -- which a capacity break will do on a big block -- emits
+                 * the slot, then leaves for `pc + 4*(j+1)`, the slot's OWN
+                 * address.  The slot runs a second time and the branch at A
+                 * never runs at all, so control falls into whatever follows
+                 * with registers the guest never wrote.
+                 *
+                 * There is no exit PC that describes "the slot has run and
+                 * the branch has not", so the cut is moved instead: rewind to
+                 * the state captured here, before the slot's nodes, and end
+                 * at A with neither half executed.  Both are then re-decoded
+                 * in the next block, in the same swapped order. */
+                if (ds_slot) {
+                        pair_mark = c.n;
+                        pair_ops = info->n_ops;
+                        pair_pend = pend;
+                        pair_pend_insn = pend_insn;
+                        pair_movi = movi;
+                } else if (!op_flag_no_ds(op->flags)) {
+                        pair_mark = -1;
                 }
 
                 if (c.n + 4 > max) {
@@ -1015,7 +1053,20 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
         }
 
         /* Fell off the end of the list without a transfer. The next block
-         * starts at the instruction after the last one lowered. */
+         * starts at the instruction after the last one lowered.
+         *
+         * Unless that landed inside a swapped pair, in which case back out to
+         * before its slot first -- see the capacity check above for why the
+         * address it would otherwise leave for is the slot's own. */
+        if (pair_mark >= 0) {
+                c.n = pair_mark;
+                info->n_ops = pair_ops;
+                pend = pair_pend;
+                pend_insn = pair_pend_insn;
+                movi = pair_movi;
+                (void)pend;
+                (void)pend_insn;
+        }
         {
                 movi_flush(&c, &movi, pc + 4u * info->n_ops);
         }
