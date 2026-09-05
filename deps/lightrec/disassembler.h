@@ -29,6 +29,25 @@
 #define LIGHTREC_NO_MASK	BIT(4)
 #define LIGHTREC_LOAD_DELAY	BIT(5)
 
+/* THE LOAD DELAY IS ALREADY PAID FOR ON THIS OPCODE.
+ *
+ * `lightrec_swap_load_delays` honours a load delay by physically swapping the
+ * load with the instruction standing in its shadow, so the list reads
+ * consumer-then-load while the machine runs load-then-consumer.  Nothing in
+ * the list says so, which is fine for a back end that only reads the list in
+ * order -- and wrong for one that models the shadow itself.  fgl does: it
+ * rotates a load past its consumer for exactly this reason, and applied on top
+ * of the swap that is the delay honoured twice, which is the same as not
+ * honouring it at all.
+ *
+ * So the swap marks the load it moved, and fgl's front end declines to open a
+ * shadow on a marked one.  Nothing else reads this flag; a back end that does
+ * not model the shadow can keep ignoring it.
+ *
+ * Bit 12: bits 2-5 are the load/store flags, 6-8 the I/O mode and 9-11 the
+ * alignment, so this is the first free one. */
+#define LIGHTREC_SWAPPED_LOAD	BIT(12)
+
 /* Byte offset within the 32-bit word for LWL/LWR/SWL/SWR, when constant
  * propagation could work it out: 0 means unknown, otherwise n + 1. */
 #define LIGHTREC_ALIGN_LSB	9
@@ -336,6 +355,11 @@ static inline _Bool op_flag_no_mask(u32 flags)
 static inline _Bool op_flag_load_delay(u32 flags)
 {
 	return OPT_HANDLE_LOAD_DELAYS && (flags & LIGHTREC_LOAD_DELAY);
+}
+
+static inline _Bool op_flag_swapped_load(u32 flags)
+{
+	return OPT_HANDLE_LOAD_DELAYS && (flags & LIGHTREC_SWAPPED_LOAD);
 }
 
 static inline _Bool op_flag_emulate_branch(u32 flags)

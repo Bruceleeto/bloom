@@ -1503,6 +1503,14 @@ static int lightrec_swap_load_delays(struct lightrec_state *state,
 				op = block->opcode_list[i];
 				block->opcode_list[i] = block->opcode_list[i + 1];
 				block->opcode_list[i + 1] = op;
+
+				/* The load now sits behind the instruction it
+				 * shadowed, and the delay is paid.  Say so, so
+				 * that a back end which models the shadow for
+				 * itself does not pay it a second time. */
+				block->opcode_list[i + 1].flags |=
+					LIGHTREC_SWAPPED_LOAD;
+
 				skip_next = true;
 			}
 		}

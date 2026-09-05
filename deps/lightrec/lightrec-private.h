@@ -467,8 +467,33 @@ static inline _Bool lightrec_store_next_pc(void)
  *             what the first fgl boot did.
  *
  * `why` may be NULL if the caller does not care. */
+/* WHERE EACH BASIC BLOCK OF THE LIST LANDED.
+ *
+ * A lightrec block is not a basic block: the optimiser keeps running past a
+ * conditional branch, so one opcode list can hold several.  fgl lowers them
+ * one at a time and concatenates the results into a single function, and this
+ * is the map back -- the guest PC each one starts at, and the host address it
+ * was emitted to.  `lightrec_compile_block` publishes every entry but the
+ * first into the code table, so that a branch landing inside the block finds
+ * compiled code instead of a hole.
+ *
+ * WITHOUT THIS THE BLOCK IS A LIE.  lightrec records the block as `nb_ops`
+ * wide and does its bookkeeping over that whole span -- `find_block_from_lut`
+ * matches any address inside it, `remove_from_code_lut` clears that many
+ * entries.  If fgl only implements the first basic block, every PC in the
+ * rest of the span belongs to a block whose code does not contain it. */
+struct fgl_entry {
+	u32 pc;
+	void *code;
+};
+
+/* Enough for any block lightrec forms; a list needing more is refused rather
+ * than partly compiled. */
+#define FGL_MAX_ENTRIES 32
+
 void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
-			unsigned int *code_size, int *why);
+			unsigned int *code_size, int *why,
+			struct fgl_entry *entries, unsigned int *nb_entries);
 
 /* The code arena, shared with fgl because it places its own blocks. */
 void *lightrec_alloc_code(struct lightrec_state *state, size_t size);

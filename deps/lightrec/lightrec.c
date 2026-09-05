@@ -136,7 +136,6 @@ static void __segfault_cb(struct lightrec_state *state, u32 addr,
 	}
 	if (block)
 		pr_err("Was executing block "PC_FMT"\n", block->pc);
-
 	{	/* DEBUG: everything needed to read this without a second run --
 		 * the blocks that led here, the register file, and the list
 		 * fgl was actually given for the offending block. */
@@ -1209,6 +1208,8 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 			   struct block *block)
 {
 	struct lightrec_state *state = cstate->state;
+	struct fgl_entry entries[FGL_MAX_ENTRIES];
+	unsigned int nb_entries = 0;
 	bool fully_tagged = false;
 	void *old_fn, *new_fn;
 	size_t old_code_size;
@@ -1242,7 +1243,8 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	 * own.  Correct, and slower than it needs to be -- see the note in
 	 * fgl_compile_block.
 	 */
-	new_fn = fgl_compile_block(cstate, block, &block->code_size, &err);
+	new_fn = fgl_compile_block(cstate, block, &block->code_size, &err,
+				   entries, &nb_entries);
 	if (!new_fn) {
 		if (err == -ENOMEM) {
 			if (!ENABLE_THREADED_COMPILER)
@@ -1295,6 +1297,37 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 	/* Add compiled function to the LUT */
 	lut_write(state, lut_offset(block->pc), block->function);
+
+	/* AND EVERY OTHER BASIC BLOCK OF THE LIST, at its own PC.
+	 *
+	 * This is the pass that walked `cstate->targets[]` under GNU lightning,
+	 * back in a form fgl can supply: fgl now emits every basic block of the
+	 * opcode list into one function and hands back where each one landed,
+	 * so a branch into the middle of this block finds compiled code.
+	 *
+	 * It is not an optimisation.  lightrec records this block as `nb_ops`
+	 * wide -- `find_block_from_lut` matches any address inside that span
+	 * and `remove_from_code_lut` clears that many entries -- so leaving the
+	 * inner PCs unpublished means the block claims code it does not have.
+	 * Spyro's SIO drain is where that showed: block 0x34e0 is 48 ops with
+	 * four internal branches, fgl implemented the first five, and a branch
+	 * to 0x35a0 arrived with $k0 still holding the previous iteration's
+	 * pointer because the `lui $k0,1` in between had no compiled form. */
+	/* NOT ENABLED YET, AND THE REASON IS MEASURED, NOT SUSPECTED.
+	 *
+	 * Turning this loop on makes the guest fault inside the BIOS boot at
+	 * around 3.5s, long before anything that used to fail -- so entering a
+	 * concatenated function at a basic block other than its first is not
+	 * yet sound, and publishing the entries is what exposes it.  With the
+	 * loop off, the emitted code is identical in behaviour to before: each
+	 * basic block still leaves through the dispatcher, and only the first
+	 * one is ever entered.
+	 *
+	 *	for (i = 1; i < nb_entries; i++)
+	 *		lut_write(state, lut_offset(entries[i].pc),
+	 *			  entries[i].code);
+	 */
+	(void)nb_entries;
 
 	/* The pass that walked `cstate->targets[]` -- marking blocks covered by
 	 * this one as dead and publishing each internal branch target into the

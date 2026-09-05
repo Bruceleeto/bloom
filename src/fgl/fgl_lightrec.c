@@ -583,8 +583,74 @@ static int dumb_is_load(uint32_t insn)
 }
 #endif
 
+/* Lower and emit every basic block of `block`'s opcode list, in order, into
+ * one emitter -- so the emitted function covers the whole list, exactly as
+ * lightrec's own compiler did and as lightrec's bookkeeping assumes.
+ *
+ * `fgl_front` stops at the first control transfer and reports how far it got
+ * in `info.n_ops`; this is the loop that calls it again from there, which is
+ * what front.h has always asked its caller to do.  Each basic block is
+ * allocated and emitted independently: nothing is pinned across one, so every
+ * guest register is in the state block at each boundary and concatenation is
+ * sound with no fixups between them.
+ *
+ * Returns 1 on success, 0 if a basic block could not be lowered -- and then
+ * `*info` describes the one that failed, for the caller's diagnostic.  There
+ * is no partial success: a function that stops halfway through the list is
+ * the bug this exists to remove. */
+static int fgl_emit_all(fgl_emitter *e, struct block *block, unsigned nb,
+			ir_node *ir, ir_alloc *alloc, fgl_front_info *info,
+			struct fgl_entry *ent, unsigned int *n_ent, int *n_out)
+{
+	unsigned at = 0, k = 0;
+
+	while (at < nb) {
+		uint32_t entry;
+		int n;
+
+		memset(info, 0, sizeof *info);
+		n = fgl_front(block->opcode_list + at, nb - at,
+			      block->pc + 4u * at, ir, IR_MAX_NODES, info);
+		if (n <= 0 || info->unsupported) {
+			*n_out = n;
+			return 0;
+		}
+
+		/* A basic block that consumed nothing would loop forever. */
+		if (!info->n_ops) {
+			*n_out = n;
+			info->stop_reason = FGL_STOP_UNSUPPORTED;
+			return 0;
+		}
+
+		if (k >= FGL_MAX_ENTRIES) {
+			*n_out = n;
+			info->stop_reason = FGL_STOP_FULL;
+			return 0;
+		}
+
+		ir_allocate(ir, n, alloc);
+		entry = fgl_emit(e, ir, n, alloc, info->n_ops);
+		if (!entry) {
+			*n_out = n;
+			return 0;
+		}
+
+		ent[k].pc = block->pc + 4u * at;
+		ent[k].code = (void *)(uintptr_t)entry;
+		k++;
+
+		at += info->n_ops;
+	}
+
+	*n_ent = k;
+	*n_out = 0;
+	return 1;
+}
+
 void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
-			unsigned int *code_size, int *why)
+			unsigned int *code_size, int *why,
+			struct fgl_entry *entries, unsigned int *nb_entries)
 {
 	struct lightrec_state *state = cstate->state;
 	static uint8_t scratch[FGL_SCRATCH_BYTES];
@@ -599,7 +665,7 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	fgl_emitter e;
 	unsigned size;
 	void *code;
-	int n, n2;
+	int n;
 	unsigned nb;
 
 	if (!why)
@@ -650,11 +716,21 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 			nb = block->nb_ops;
 	}
 #endif
-	n = fgl_front(block->opcode_list, nb, block->pc,
-		      ir, IR_MAX_NODES, &info);
+	/* First pass: into scratch, to measure.
+	 *
+	 * THE BASE MUST NOT BE ZERO, and it is not arbitrary that it is the
+	 * scratch buffer's own address. `fgl_emit` reports failure by returning
+	 * 0 and success by returning the block's ENTRY ADDRESS -- so a block
+	 * emitted at base 0 succeeds and says 0, which is indistinguishable
+	 * from having refused. Every block then looks unlowerable, with
+	 * `overflow` and `unsupported` both clear to prove nothing was actually
+	 * wrong. test_reloc had this same bug and was fixed for it; this is the
+	 * same mistake one layer down. */
+	fgl_init(&e, scratch, sizeof scratch, (u32)(uintptr_t)scratch);
+	fgl_set_targets(&e, &fgl_dc_targets);
 
-
-	if (n <= 0 || info.unsupported) {
+	if (!fgl_emit_all(&e, block, nb, ir, &alloc, &info,
+			  entries, nb_entries, &n)) {
 		static unsigned f, by_reason[8], by_op[64];
 		unsigned k;
 		f++;
@@ -675,27 +751,7 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 		return NULL;
 	}
 
-	/* First pass: into scratch, to measure.
-	 *
-	 * THE BASE MUST NOT BE ZERO, and it is not arbitrary that it is the
-	 * scratch buffer's own address. `fgl_emit` reports failure by returning
-	 * 0 and success by returning the block's ENTRY ADDRESS -- so a block
-	 * emitted at base 0 succeeds and says 0, which is indistinguishable
-	 * from having refused. Every block then looks unlowerable, with
-	 * `overflow` and `unsupported` both clear to prove nothing was actually
-	 * wrong. test_reloc had this same bug and was fixed for it; this is the
-	 * same mistake one layer down. */
-	fgl_init(&e, scratch, sizeof scratch, (u32)(uintptr_t)scratch);
-	fgl_set_targets(&e, &fgl_dc_targets);
-	ir_allocate(ir, n, &alloc);
-	if (!fgl_emit(&e, ir, n, &alloc, info.n_ops)) {
-		fprintf(stderr, "fgl: FIRST PASS REFUSED pc=%08x n=%d ops=%u "
-			"ovf=%d unsup=%d op=%u\n", (unsigned)block->pc, n,
-			info.n_ops, e.overflow, e.unsupported, e.unsupported_op);
-		return NULL;
-	}
 	size = fgl_size(&e);
-	n2 = n;
 
 	code = lightrec_alloc_code(state, size);
 	if (!code) {
@@ -707,7 +763,8 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	 * again: its result depends on the IR, not on where the code lands. */
 	fgl_init(&e, code, size, (u32)(uintptr_t)code);
 	fgl_set_targets(&e, &fgl_dc_targets);
-	if (!fgl_emit(&e, ir, n, &alloc, info.n_ops) || fgl_size(&e) != size) {
+	if (!fgl_emit_all(&e, block, nb, ir, &alloc, &info,
+			  entries, nb_entries, &n) || fgl_size(&e) != size) {
 		fprintf(stderr, "fgl: SECOND PASS DIFFERS pc=%08x %u vs %u "
 			"ovf=%d unsup=%d\n", (unsigned)block->pc,
 			fgl_size(&e), size, e.overflow, e.unsupported);

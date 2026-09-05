@@ -599,7 +599,7 @@ static uint32_t hazard_word(const struct opcode *op)
  * against the instruction just lowered, then decide whether that instruction
  * leaves a load pending itself. */
 static int shadow_step(ir_ctx *c, int pend, uint32_t *pend_insn,
-                       uint32_t insn, int mark, int hold)
+                       uint32_t insn, int mark, int hold, uint32_t flags)
 {
         int settled;
 
@@ -617,6 +617,22 @@ static int shadow_step(ir_ctx *c, int pend, uint32_t *pend_insn,
         settled = ir_shadow_fix(c, pend, *pend_insn, insn, mark);
 
         *pend_insn = insn;
+
+        /* THE OPTIMISER ALREADY PAID THIS ONE.
+         *
+         * `lightrec_swap_load_delays` honours a load delay by moving the load
+         * behind the instruction that stood in its shadow, and marks the load
+         * it moved.  The entry after a marked load is the instruction that was
+         * two after it in the guest, which the hardware DOES let see the loaded
+         * value -- so there is no shadow left to model.  Rotating here would
+         * apply the delay a second time and hand that instruction the pre-load
+         * value, which is the bug this flag exists to prevent.
+         *
+         * A marked load still settles a shadow it stands in itself, which is
+         * why only the `pending` half is skipped. */
+        if (op_flag_swapped_load(flags))
+                return -1;
+
         return settled ? -1 : ir_shadow_pending(c, insn, mark);
 }
 
@@ -683,6 +699,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                 uint32_t hword = hazard_word(op);
                 int ds_slot;
                 int mark = c.n;
+
 
                 /* A SWAPPED DELAY SLOT IS NOT WHERE THE LOAD DELAY THINKS.
                  *
@@ -751,7 +768,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot,
+                                            op->flags);
                         info->n_ops = i + 1;
                         continue;
                 }
@@ -764,7 +782,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot,
+                                            op->flags);
                         info->n_ops = i + 1;
                         continue;
                 }
@@ -778,7 +797,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot,
+                                            op->flags);
                         info->n_ops = i + 1;
                         continue;
                 }
@@ -811,7 +831,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                  * the load exactly where it already is, which
                                  * is what one instruction of delay means. */
                                 pend = shadow_step(&c, pend, &pend_insn,
-                                                   hword, mark, ds_slot);
+                                                   hword, mark, ds_slot,
+                                                   op->flags);
                                 info->n_ops = i + 1;
                                 continue;
                         }
@@ -851,7 +872,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot,
+                                            op->flags);
                         info->n_ops = i + 1;
 
                         /* A STATUS OR CAUSE WRITE ENDS THE BLOCK.
