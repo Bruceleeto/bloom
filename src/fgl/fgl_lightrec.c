@@ -93,6 +93,29 @@ FGL_ASSERT(FGL_STATE_WORDS <= 256, gbr_reach);
 /* And the COP0 registers fgl actually keeps. */
 FGL_ASSERT(COP0_SR == 12 && COP0_CAUSE == 13 && COP0_EPC == 14, cop0_regs);
 
+/* THE INTERPRETER RUNS GUEST CODE TOO, AND IT DOES NOT MODEL THE LOAD DELAY.
+ *
+ * `ENABLE_FIRST_PASS` makes `fgl_get_next_block` interpret a block once before
+ * it is compiled, so lightrec's interpreter executes every instruction fgl
+ * ever sees at least once.  fgl pays the MIPS load delay itself -- the shadow
+ * rotation in `decode.c` -- but that only covers code fgl EMITTED.  The
+ * interpreter's only source of load-delay handling is
+ * `lightrec_handle_load_delays` tagging the opcodes, which `OPT_HANDLE_LOAD_
+ * DELAYS` gates.
+ *
+ * With the pass off and the first pass on, nothing anywhere pays the delay
+ * during interpretation: the instruction standing in a load's shadow reads the
+ * loaded value instead of the previous one.  That is not a subtle drift.  It
+ * cost a day here on Spyro's memcard load, where `lw $k0` / `addu $at,$k0` at
+ * 0x35a4 handed the store four instructions later a pointer for a base and
+ * faulted at 0x5ffffc54 -- with fgl's own emitted code for the block correct
+ * and never executed, which is exactly what made it hard to find.
+ *
+ * So the two are tied together here rather than left to whoever next flips an
+ * option.  If you want `OPT_HANDLE_LOAD_DELAYS` off, turn `ENABLE_FIRST_PASS`
+ * off in the same breath and fgl becomes the only thing running guest code. */
+FGL_ASSERT(!ENABLE_FIRST_PASS || OPT_HANDLE_LOAD_DELAYS, first_pass_load_delay);
+
 /* ------------------------------------------------------------------ */
 /* The seam itself                                                     */
 /* ------------------------------------------------------------------ */
@@ -598,52 +621,46 @@ static int dumb_is_load(uint32_t insn)
  * `*info` describes the one that failed, for the caller's diagnostic.  There
  * is no partial success: a function that stops halfway through the list is
  * the bug this exists to remove. */
+/* ONE BASIC BLOCK, WHICH IS ALL LIGHTREC CAN REACH.
+ *
+ * `fgl_front` stops at the first control transfer, so a lightrec block holding
+ * several basic blocks needs several calls to cover it.  This used to make
+ * them all, concatenating the code into one function -- and it was wasted
+ * work: lightrec publishes ONE entry per block (`lut_write(lut_offset(
+ * block->pc), block->function)`), so basic blocks 2..N were unreachable.  On
+ * Spyro's block at 0x34e0 that was 664 bytes emitted against 40 reachable,
+ * and on the 200-op blocks in level load it overran `FGL_MAX_ENTRIES` and
+ * refused the block outright rather than compiling its first block.
+ *
+ * The entry array stays because publishing the rest is the real answer, and
+ * the type is the contract for it -- but the loop does not come back until
+ * `lightrec.c` can write those entries into the LUT without the BIOS boot
+ * faulting.  A partially reachable function is worse than a short one. */
 static int fgl_emit_all(fgl_emitter *e, struct block *block, unsigned nb,
 			ir_node *ir, ir_alloc *alloc, fgl_front_info *info,
 			struct fgl_entry *ent, unsigned int *n_ent, int *n_out)
 {
-	unsigned at = 0, k = 0;
+	uint32_t entry;
+	int n;
 
-	while (at < nb) {
-		uint32_t entry;
-		int n;
-
-		memset(info, 0, sizeof *info);
-		n = fgl_front(block->opcode_list + at, nb - at,
-			      block->pc + 4u * at, ir, IR_MAX_NODES, info);
-		if (n <= 0 || info->unsupported) {
-			*n_out = n;
-			return 0;
-		}
-
-		/* A basic block that consumed nothing would loop forever. */
-		if (!info->n_ops) {
-			*n_out = n;
-			info->stop_reason = FGL_STOP_UNSUPPORTED;
-			return 0;
-		}
-
-		if (k >= FGL_MAX_ENTRIES) {
-			*n_out = n;
-			info->stop_reason = FGL_STOP_FULL;
-			return 0;
-		}
-
-		ir_allocate(ir, n, alloc);
-		entry = fgl_emit(e, ir, n, alloc, info->n_ops);
-		if (!entry) {
-			*n_out = n;
-			return 0;
-		}
-
-		ent[k].pc = block->pc + 4u * at;
-		ent[k].code = (void *)(uintptr_t)entry;
-		k++;
-
-		at += info->n_ops;
+	memset(info, 0, sizeof *info);
+	n = fgl_front(block->opcode_list, nb, block->pc, ir, IR_MAX_NODES,
+		      info);
+	if (n <= 0 || info->unsupported) {
+		*n_out = n;
+		return 0;
 	}
 
-	*n_ent = k;
+	ir_allocate(ir, n, alloc);
+	entry = fgl_emit(e, ir, n, alloc, info->n_ops);
+	if (!entry) {
+		*n_out = n;
+		return 0;
+	}
+
+	ent[0].pc = block->pc;
+	ent[0].code = (void *)(uintptr_t)entry;
+	*n_ent = 1;
 	*n_out = 0;
 	return 1;
 }
