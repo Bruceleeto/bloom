@@ -734,30 +734,6 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                  * branch has already absorbed, and a load that IS the slot
                  * does not have its shadow settled against a branch that in
                  * truth ran before it. */
-                /* A BRANCH IN A DELAY SLOT IS THE INTERPRETER'S.
-                 *
-                 * `lightrec_detect_impossible_branches` marks a branch whose
-                 * own delay slot is another branch (or an mfc, or an rfe) with
-                 * LIGHTREC_EMULATE_BRANCH.  The hardware's behaviour there is
-                 * not "run both": lightrec models it by running the branch in
-                 * the interpreter and resuming at pc + 8 (interpreter.c:416),
-                 * and a backend is expected to hand the whole thing over
-                 * rather than compile it.
-                 *
-                 * fgl has no notion of a transfer inside a transfer, so it
-                 * refuses -- the same refusal it uses for every other opcode
-                 * it cannot lower, which puts the block on C.  The shape is
-                 * pathological and rare, so paying a dispatch for it costs
-                 * nothing; compiling it as an ordinary branch, which is what
-                 * fgl did while it ignored this flag, silently runs the slot's
-                 * branch as a straight-line instruction. */
-                if (op_flag_emulate_branch(op->flags)) {
-                        note_unsupported(info, op, at);
-                        info->stop_reason = FGL_STOP_UNSUPPORTED;
-                        info->ended_early = 1;
-                        break;
-                }
-
                 ds_slot = op_flag_no_ds(op->flags) && !ir_is_transfer(word);
 
                 /* The slot may be stepped over with a shadow still pending
@@ -800,6 +776,69 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                         pair_movi = movi;
                 } else if (!op_flag_no_ds(op->flags)) {
                         pair_mark = -1;
+                }
+
+                /* A BRANCH IN A DELAY SLOT IS THE INTERPRETER'S, BUT ONLY
+                 * THE BRANCH.
+                 *
+                 * `lightrec_detect_impossible_branches` marks three shapes
+                 * with LIGHTREC_EMULATE_BRANCH: a branch whose delay slot is
+                 * another branch, an mfc, or an rfe.  Only the first is
+                 * impossible.  The other two are marked because lightrec's
+                 * emitter issues the delay slot AHEAD of the branch's register
+                 * read, so a slot with cop0 side effects comes out in the
+                 * wrong order -- fgl issues the transfer's nodes first, off
+                 * pre-slot state, and then the slot, so it does not have that
+                 * problem and must not inherit the workaround.
+                 *
+                 * Honouring the mark on all three cost real ground: fgl lowers
+                 * rfe natively (IR_RFE), so `jr $k0` / `rfe` -- the last two
+                 * instructions of the PSX kernel's exception return, on every
+                 * interrupt -- compiled fine until this flag was read, and
+                 * then started being handed to C.  The flag's own interpreter
+                 * semantics say the same thing: `return pc + 8` applies to a
+                 * branch NOT taken (interpreter.c:416), and a `jr` is always
+                 * taken, so there is nothing here for it to change.
+                 *
+                 * So the test is on the slot, not on the mark alone.
+                 *
+                 * What it can do is stop rather than refuse.  Cutting the
+                 * block here compiles everything ahead of the branch and
+                 * leaves for the branch's own address, where lightrec builds a
+                 * two-instruction block that C takes.  Refusing instead threw
+                 * away the other 29 opcodes of the PSX kernel's exception
+                 * return, which runs on every interrupt -- and each refusal is
+                 * not just interpreted work but another entry into C, which is
+                 * where pinned guest registers have to be spilled and
+                 * reloaded.  Entries into C are the thing to minimise, so a
+                 * block that ends early beats a block that is handed over.
+                 *
+                 * Nothing to cut back to at i == 0: the block would be empty
+                 * and its exit PC its own, which is a dispatcher loop.  That
+                 * one is still refused.
+                 *
+                 * Tested on a transfer and nowhere else, because `flags` is a
+                 * union keyed on the opcode class and BIT(2) is spoken for
+                 * four times over: LIGHTREC_MOVI on lui/ori/addiu,
+                 * LIGHTREC_SMC on loads and stores, LIGHTREC_NO_LO on
+                 * mult/div, and only on a branch does it mean this.  Asking
+                 * every opcode refused a block for every mult whose LO was
+                 * dead -- which `lightrec_flag_mults_divs` marks on nearly all
+                 * of them -- and that is most blocks in the game.  Only
+                 * LIGHTREC_NO_DS and LIGHTREC_SYNC, bits 0 and 1, are global
+                 * and safe to read off anything. */
+                if (ir_is_transfer(word) && op_flag_emulate_branch(op->flags) &&
+                    i + 1 < nb && ir_is_transfer(ops[i + 1].opcode)) {
+                        if (info->n_ops == 0) {
+                                note_unsupported(info, op, at);
+                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                info->ended_early = 1;
+                                break;
+                        }
+                        movi_flush(&c, &movi, at);
+                        info->stop_reason = FGL_STOP_TRANSFER;
+                        info->ended_early = 1;
+                        break;
                 }
 
                 if (c.n + 4 > max) {
