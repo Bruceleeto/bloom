@@ -79,6 +79,12 @@ Rcnt rcnts[4];
  * a link error rather than quietly merging. */
 #if LIGHTREC_CUSTOM_MAP
 extern void* code_buffer;
+
+/* The lockstep verifier lives in lightrec.c; plugin.c only turns it on and
+ * steps it.  Declared here rather than through lightrec-private.h, which
+ * plugin.c deliberately does not include. */
+extern u32 fgl_lockstep_on;
+u32 fgl_lockstep(struct lightrec_state *state, u32 pc);
 #else
 void* code_buffer;
 #endif
@@ -526,7 +532,7 @@ static int lightrec_plugin_init(void)
 	/* TEMP A/B: 1 = lightrec's C interpreter only, no fgl code runs at all.
 	 * There is no environment on the Dreamcast, so this is a recompile
 	 * rather than a variable.  Restore the getenv when done. */
-	use_lightrec_interpreter = 0;
+	use_lightrec_interpreter = 1;
 
 #ifdef LIGHTREC_DEBUG
 	char *cycles = getenv("LIGHTREC_BEGIN_CYCLES");
@@ -542,11 +548,21 @@ static int lightrec_plugin_init(void)
 			lightrec_map, ARRAY_SIZE(lightrec_map),
 			&lightrec_ops);
 
-	// fprintf(stderr, "M=0x%lx, P=0x%lx, R=0x%lx, H=0x%lx\n",
-	// 		(uintptr_t) psxM,
-	// 		(uintptr_t) psxP,
-	// 		(uintptr_t) psxR,
-	// 		(uintptr_t) psxH);
+	/* WHERE THE GUEST REGISTERS LIVE, so a store watchpoint can be aimed
+	 * at one.  fgl keeps a guest register in a host register inside a
+	 * block and writes it back to this array at every block boundary, so
+	 * `-watch-write <gpr + 4*N>:4` under testcast logs every write to
+	 * guest register N together with the SH-4 PC that made it -- which is
+	 * how a register that turns into a wild pointer gets traced back to
+	 * the block that wrote it. */
+	{
+		struct lightrec_registers *r =
+			lightrec_get_registers(lightrec_state);
+
+		fprintf(stderr, "STATE gpr=%p cp0=%p cp2d=%p cp2c=%p\n",
+			(void *) r->gpr, (void *) r->cp0,
+			(void *) r->cp2d, (void *) r->cp2c);
+	}
 
 #ifndef _WIN32
 	signal(SIGPIPE, exit);
@@ -693,6 +709,19 @@ static void lightrec_plugin_execute_internal(bool block_only)
 			uint32_t saved_gbr;
 			__asm__ __volatile__("stc gbr, %0" : "=r"(saved_gbr));
 #endif
+			if (unlikely(fgl_lockstep_on)) {
+				/* One block at a time, each one verified
+				 * against the interpreter.  See fgl_lockstep
+				 * in lightrec.c. */
+				u32 end = lightrec_current_cycle_count(lightrec_state)
+					+ cycles_lightrec;
+
+				do {
+					psxRegs.pc = fgl_lockstep(lightrec_state,
+								  psxRegs.pc);
+				} while (lightrec_current_cycle_count(lightrec_state) < end
+					 && !lightrec_exit_flags(lightrec_state));
+			} else
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
 #ifdef __sh__

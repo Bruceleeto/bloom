@@ -23,6 +23,8 @@
 #include "lightrec-private.h"
 
 #include "fgl_state.h"
+#include "fgl.h"
+#include "decode_int.h"
 
 #define FGL_ASSERT(cond, name) \
 	typedef char fgl_layout_##name[(cond) ? 1 : -1]
@@ -236,7 +238,145 @@ void fgl_rfe(u32 unused, struct lightrec_state *state)
  *
  * It handles the four data faults a bad address can raise and nothing else;
  * everything KOS already explains is left to KOS. */
+/* DEBUG: the dispatcher's ring of guest block PCs.  Slot 0 is the index,
+ * then 64 two-word slots -- the guest PC and guest $v1 as the block was
+ * entered -- youngest at index.  Written by eight
+ * instructions in `dispatch.S` at every block entry; read only here. */
+u32 fgl_pc_ring[1 + 64 * 4];
+
 static struct lightrec_state *fgl_crash_state;
+
+/* A window of guest RAM, for reading against a register that should have
+ * been a pointer into it. */
+void fgl_dump_mem_pub(u32 addr, unsigned words);
+static void fgl_dump_mem(u32 addr, unsigned words)
+{
+	const struct lightrec_mem_map *ram =
+		&fgl_crash_state->maps[PSX_MAP_KERNEL_USER_RAM];
+	u32 base = (kunseg(addr) & ~15u) - ram->pc;
+	const u32 *w;
+	unsigned k;
+
+	if (base >= ram->length)
+		return;
+
+	w = (const u32 *)((u8 *)ram->address + base);
+
+	for (k = 0; k < words; k++)
+		fprintf(stderr, "fgl: mem %08x  %08x\n",
+			(unsigned)((addr & ~15u) + 4u * k), w[k]);
+}
+
+/* The last 64 block entries, oldest first. */
+void fgl_dump_ring(void)
+{
+	unsigned idx = fgl_pc_ring[0] & 63u;
+	unsigned k;
+
+	for (k = 0; k < 64; k++) {
+		unsigned e = (idx + 1u + k) & 63u;
+
+		if (fgl_pc_ring[1 + 4 * e])
+			fprintf(stderr, "fgl: came from %08x  $v1=%08x "
+				"sp0=%08x $s8=%08x\n",
+				fgl_pc_ring[1 + 4 * e],
+				fgl_pc_ring[2 + 4 * e],
+				fgl_pc_ring[3 + 4 * e],
+				fgl_pc_ring[4 + 4 * e]);
+	}
+}
+
+/* One block's guest instructions, straight out of guest RAM. */
+static void fgl_dump_guest(const struct block *b, unsigned max)
+{
+	const struct lightrec_mem_map *ram =
+		&fgl_crash_state->maps[PSX_MAP_KERNEL_USER_RAM];
+	u32 off = kunseg(b->pc) - ram->pc;
+	const u32 *w;
+	unsigned k;
+
+	if (off >= ram->length)
+		return;
+
+	w = (const u32 *)((u8 *)ram->address + off);
+
+	for (k = 0; k < b->nb_ops && k < max; k++)
+		fprintf(stderr, "fgl: guest %08x  %08x\n",
+			(unsigned)(b->pc + 4u * k), w[k]);
+
+	/* AND WHAT FGL WAS ACTUALLY GIVEN, which is not the same thing.
+	 *
+	 * fgl compiles lightrec's optimised opcode list, not guest RAM: the
+	 * optimiser folds constants, rewrites base registers, substitutes meta
+	 * opcodes and swaps delay slots, and it hangs the region and hazard
+	 * flags off each entry.  Reproducing a miscompile from the RAM words
+	 * reproduces a different block. */
+	if (block_has_flag(b, BLOCK_NO_OPCODE_LIST) || !b->opcode_list)
+		return;
+
+	for (k = 0; k < b->nb_ops && k < max; k++)
+		fprintf(stderr, "fgl: op %2u  %08x flags=%08x\n", k,
+			b->opcode_list[k].c.opcode, b->opcode_list[k].flags);
+}
+
+
+
+/* DEBUG: an emitted store computed an address outside guest RAM and outside
+ * the scratchpad.  Whatever base register it used is wrong, and the ring
+ * still holds the blocks that produced it. */
+void fgl_wild_store(void)
+{
+	static int said;
+
+	if (said)
+		return;
+	said = 1;
+
+	fprintf(stderr, "\nfgl: WILD STORE addr=%08x\n",
+		fgl_crash_state ?
+		((const u32 *)fgl_crash_state)[FGL_AT_TEMP_REG] : 0);
+	fgl_dump_ring();
+	arch_abort();
+}
+
+/* DEBUG: the dispatcher calls this the first time the watched table word
+ * holds something that is neither null nor a pointer.  The ring still has
+ * the block that wrote it. */
+/* The watch is only meaningful once the game is drawing: during boot that
+ * word is ordinary data and the test fires on every block, which turns the
+ * dispatcher into a C call per block and the guest into a crawl.  pvr.c
+ * arms it after the renderer has been busy for a while. */
+u32 fgl_ot_armed;
+
+void fgl_bad_ot(void)
+{
+	static int said;
+
+	if (said)
+		return;
+	said = 1;
+
+	fprintf(stderr, "\nfgl: table word 80070754 became %08x\n",
+		*(volatile u32 *)0x00070754u);
+	fgl_dump_ring();
+	arch_abort();
+}
+
+/* DEBUG: the dispatcher calls this the first time guest $v1 reaches the
+ * display-list block as neither null nor a pointer. */
+void fgl_bad_v1(void)
+{
+	static int said;
+
+	if (said)
+		return;
+	said = 1;
+
+	fprintf(stderr, "\nfgl: FIRST bad $v1 = %08x at 80024ff8\n",
+		fgl_crash_state ? fgl_crash_state->regs.gpr[3] : 0);
+	fgl_dump_ring();
+	arch_abort();
+}
 
 static void fgl_crash_report(irq_t code, irq_context_t *ctx, void *data)
 {
@@ -267,6 +407,63 @@ static void fgl_crash_report(irq_t code, irq_context_t *ctx, void *data)
 	for (i = -4; i <= 2; i++)
 		fprintf(stderr, "fgl: %s %08x  %04x\n", i ? "  " : "->",
 			(unsigned) (pc + 2 * i), insn[i]);
+
+	fgl_dump_ring();
+
+	{
+		unsigned idx = fgl_pc_ring[0] & 63u;
+		unsigned k;
+
+		/* And the code of the last few, because when the path turns
+		 * out to be the normal one the answer is in what those blocks
+		 * computed, not in the order they ran. */
+		for (k = 4; k >= 1; k--) {
+			unsigned e = (idx + 1u - k) & 63u;
+			u32 bpc = fgl_pc_ring[1 + 4 * e];
+			struct block *b;
+
+			if (!bpc)
+				continue;
+			b = lightrec_find_block(fgl_crash_state->block_cache,
+						bpc);
+			if (!b)
+				continue;
+			fgl_dump_guest(b, 20);
+		}
+	}
+
+	/* THE GUEST SIDE, WHICH IS THE SIDE THAT EXPLAINS ANYTHING.
+	 *
+	 * The SH-4 words above say what fgl emitted; they cannot say what the
+	 * guest asked for.  A wild address in emitted code is almost always a
+	 * guest register that was already wrong when the block started, so
+	 * the instructions the block was compiled from and the register file
+	 * it ran against are what a fault has to be read against. */
+	if (block && fgl_crash_state)
+		fgl_dump_guest(block, 24);
+
+	if (fgl_crash_state) {
+
+		/* The registers that are supposed to be pointers, and what
+		 * guest memory actually holds there. */
+		/* A wide window of the table the load reads from.  Whether the
+		 * bad entries are scattered or periodic, and whether they look
+		 * like truncated pointers, says who wrote them. */
+		fgl_dump_mem(fgl_crash_state->regs.gpr[19], 32);
+		fgl_dump_mem(fgl_crash_state->regs.gpr[2] - 64u, 48);
+
+		for (i = 0; i < 32; i += 8)
+			fprintf(stderr, "fgl: $%-2d %08x %08x %08x %08x "
+				"%08x %08x %08x %08x\n", i,
+				fgl_crash_state->regs.gpr[i + 0],
+				fgl_crash_state->regs.gpr[i + 1],
+				fgl_crash_state->regs.gpr[i + 2],
+				fgl_crash_state->regs.gpr[i + 3],
+				fgl_crash_state->regs.gpr[i + 4],
+				fgl_crash_state->regs.gpr[i + 5],
+				fgl_crash_state->regs.gpr[i + 6],
+				fgl_crash_state->regs.gpr[i + 7]);
+	}
 
 	fprintf(stderr, "fgl: r0-r7  %08x %08x %08x %08x %08x %08x %08x %08x\n",
 		ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3],
@@ -333,6 +530,7 @@ static void fgl_targets_once(void)
 	fgl_dc_targets.mfc      = (u32)(uintptr_t)fgl_mfc;
 	fgl_dc_targets.rfe      = (u32)(uintptr_t)fgl_rfe;
 	fgl_dc_targets.cp2_ctrl_gen = (u32)(uintptr_t)&psxCP2CtrlGen;
+	fgl_dc_targets.wild     = (u32)(uintptr_t)fgl_wild_store;
 	fgl_dc_targets.gte_body = fgl_gte_body;
 
 	/* Last, and it is what the guard above tests: nothing may observe a
@@ -361,6 +559,30 @@ static void fgl_targets_once(void)
  * existed to avoid, so it is the first thing to revisit once local branches
  * are worth optimising.
  */
+#if FGL_DUMB_BLOCKS
+/* DOES A BLOCK ENDING HERE ORPHAN A LOAD'S SHADOW?
+ *
+ * Only dumb mode has to ask.  A MIPS load's register write lands one
+ * instruction late, and fgl carries that shadow inside a block -- so a block
+ * that ends immediately after a load leaves a write owed that the next block
+ * knows nothing about, and the value appears an instruction too early.  The
+ * normal build never hits it: lightrec's blocks end at transfers, and the
+ * transfer standing in a load's shadow is inside the block with it.  Dumb
+ * mode cuts every two instructions, so it must check. */
+static int dumb_is_load(uint32_t insn)
+{
+	switch (insn >> 26) {
+	case OP_LB: case OP_LH: case OP_LWL: case OP_LW:
+	case OP_LBU: case OP_LHU: case OP_LWR:
+	case OP_LWC2:
+	case OP_META_LWU:
+		return 1;
+	default:
+		return 0;
+	}
+}
+#endif
+
 void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 			unsigned int *code_size, int *why)
 {
@@ -378,6 +600,7 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	unsigned size;
 	void *code;
 	int n, n2;
+	unsigned nb;
 
 	if (!why)
 		why = &dummy_why;
@@ -388,8 +611,49 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	fgl_crash_handler_once(cstate->state);
 
 	memset(&info, 0, sizeof info);
-	n = fgl_front(block->opcode_list, block->nb_ops, block->pc,
+	nb = block->nb_ops;
+#if FGL_DUMB_BLOCKS
+	if (nb > 1) {
+		/* ONE INSTRUCTION, OR TWO WHEN THE FIRST IS A TRANSFER.
+		 *
+		 * A branch and its delay slot are one unit of guest
+		 * behaviour, not two -- cutting between them would change
+		 * what the machine does rather than only how it is compiled,
+		 * and the point of dumb mode is to remove fgl's cleverness
+		 * without removing the guest's semantics.  Everything else
+		 * gets a block to itself. */
+		/* TWO, NOT ONE, AND THE REASON IS THE LOAD SHADOW.
+		 *
+		 * A MIPS load's result is not visible to the instruction
+		 * after it, and fgl tracks that shadow inside a block.  Ending
+		 * a block immediately after a load orphans it: the next block
+		 * has no idea a write is still owed, so the value lands one
+		 * instruction too early.  Measured -- one instruction per
+		 * block reported divergences in four BIOS loops that the
+		 * normal build gets right, every one of them a load followed
+		 * by its consumer.
+		 *
+		 * Two instructions is the smallest block that still holds a
+		 * load and the instruction standing in its shadow, and it
+		 * removes just as much of the block formation as one did.  A
+		 * transfer landing on the second slot takes a third, because
+		 * a branch without its delay slot is not the same program. */
+		nb = 2u;
+		/* Never end on a load (the shadow), never end on a transfer
+		 * (the delay slot).  Either takes another instruction, and a
+		 * load in a delay slot wants both. */
+		while (nb < block->nb_ops &&
+		       (dumb_is_load(block->opcode_list[nb - 1u].opcode) ||
+			ir_is_transfer(block->opcode_list[nb - 1u].opcode)))
+			nb++;
+		if (nb > block->nb_ops)
+			nb = block->nb_ops;
+	}
+#endif
+	n = fgl_front(block->opcode_list, nb, block->pc,
 		      ir, IR_MAX_NODES, &info);
+
+
 	if (n <= 0 || info.unsupported) {
 		static unsigned f, by_reason[8], by_op[64];
 		unsigned k;
@@ -459,4 +723,10 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 
 	*code_size = size;
 	return code;
+}
+
+/* DEBUG: reachable from lightrec.c's segfault reporter. */
+void fgl_dump_mem_pub(u32 addr, unsigned words)
+{
+	fgl_dump_mem(addr, words);
 }

@@ -265,6 +265,36 @@ if (WITH_GTE_RTP_SELFTEST)
 	target_compile_definitions(bloom PRIVATE GTE_RTP_SELFTEST=1)
 endif()
 
+# A ring of the last 64 guest block PCs, written by the dispatcher on every
+# block entry.  A fault inside emitted code names the block it happened in and
+# nothing about how the machine got there, which is useless when the bug is
+# that the block should never have run -- so `__segfault_cb` and the crash
+# handler read this to print the predecessor chain.
+#
+# It is off by default because it costs ~22 SH-4 instructions, four loads and
+# four stores on the single hottest path there is.  Turn it on to diagnose,
+# off to measure.
+option(WITH_FGL_DEBUG_CP "fgl: call fgl_checkpoint on every block entry (cross-engine comparator)" OFF)
+if (WITH_FGL_DEBUG_CP)
+	target_compile_definitions(lightrec PRIVATE FGL_DEBUG_CP=1)
+endif()
+option(WITH_FGL_DEBUG_RING "Record the last 64 guest block PCs for crash reports" OFF)
+if (WITH_FGL_DEBUG_RING)
+	target_compile_definitions(lightrec PRIVATE FGL_DEBUG_RING=1)
+endif()
+
+# DUMB MODE: fgl with its two clever parts switched off, to bisect a fault to
+# one half of the emitter.  See the comment on FGL_DUMB_REGS in src/fgl/fgl.h.
+# Both are far slower than the normal build and neither is a shipping config.
+option(WITH_FGL_DUMB_REGS "fgl: no register allocation, every operand through the state block" OFF)
+option(WITH_FGL_DUMB_BLOCKS "fgl: one guest instruction per block" OFF)
+if (WITH_FGL_DUMB_REGS)
+	target_compile_definitions(lightrec PRIVATE FGL_DUMB_REGS=1)
+endif()
+if (WITH_FGL_DUMB_BLOCKS)
+	target_compile_definitions(lightrec PRIVATE FGL_DUMB_BLOCKS=1)
+endif()
+
 target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#lightning lightrec libpcsxcore gpu spu
 	#${ZLIB_LIBRARIES} tsunami parallax

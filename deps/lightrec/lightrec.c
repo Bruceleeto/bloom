@@ -12,6 +12,8 @@
 #include "lightrec.h"
 #include "memmanager.h"
 #include "reaper.h"
+
+#define LS_BLOCK_CAP 0u	/* DEBUG: 0 = unlimited */
 #include "recompiler.h"
 #include "optimizer.h"
 #include "tlsf/tlsf.h"
@@ -127,8 +129,71 @@ static void __segfault_cb(struct lightrec_state *state, u32 addr,
 	lightrec_set_exit_flags(state, LIGHTREC_EXIT_SEGFAULT);
 	pr_err("Segmentation fault in recompiled code: invalid "
 	       "load/store at address "PC_FMT"\n", addr);
+	{	/* DEBUG: the ordering table the walk was following, and the
+		 * scratchpad word that heads it. */
+		extern void fgl_dump_mem_pub(u32 addr, unsigned words);
+		fgl_dump_mem_pub(0x8004bec4u, 24);
+	}
 	if (block)
 		pr_err("Was executing block "PC_FMT"\n", block->pc);
+
+	{	/* DEBUG: everything needed to read this without a second run --
+		 * the blocks that led here, the register file, and the list
+		 * fgl was actually given for the offending block. */
+		int i;
+
+		fgl_dump_ring();
+
+		for (i = 0; i < 32; i += 8)
+			fprintf(stderr, "SEG $%-2u %08x %08x %08x %08x "
+				"%08x %08x %08x %08x\n", i,
+				state->regs.gpr[i + 0], state->regs.gpr[i + 1],
+				state->regs.gpr[i + 2], state->regs.gpr[i + 3],
+				state->regs.gpr[i + 4], state->regs.gpr[i + 5],
+				state->regs.gpr[i + 6], state->regs.gpr[i + 7]);
+
+		/* The offending block, and the four before it: a wild base
+		 * register was written somewhere upstream, not here. */
+		for (i = 5; i >= 1; i--) {
+			unsigned idx = fgl_pc_ring[0] & 63u;
+			unsigned e = (idx + 1u - i) & 63u;
+			u32 bpc = fgl_pc_ring[1 + 4 * e];
+			struct block *b;
+			u16 k;
+
+			if (!bpc)
+				continue;
+			b = lightrec_find_block(state->block_cache, bpc);
+			fprintf(stderr, "SEG --- block %08x, %u ops\n", bpc,
+				b ? b->nb_ops : 0);
+
+			if (b && !block_has_flag(b, BLOCK_NO_OPCODE_LIST) &&
+			    b->opcode_list) {
+				for (k = 0; k < b->nb_ops && k < 32; k++)
+					fprintf(stderr, "SEG op %2u  %08x "
+						"flags=%08x\n", k,
+						b->opcode_list[k].c.opcode,
+						b->opcode_list[k].flags);
+				continue;
+			}
+
+			/* The optimised list is gone once the block is
+			 * compiled; guest RAM still has the instructions. */
+			{
+				const struct lightrec_mem_map *ram =
+					&state->maps[PSX_MAP_KERNEL_USER_RAM];
+				u32 off = kunseg(bpc) - ram->pc;
+				const u32 *w;
+
+				if (off >= ram->length)
+					continue;
+				w = (const u32 *)((u8 *)ram->address + off);
+				for (k = 0; k < (b ? b->nb_ops : 24) && k < 24; k++)
+					fprintf(stderr, "SEG raw %08x  %08x\n",
+						bpc + 4u * k, w[k]);
+			}
+		}
+	}
 }
 
 static void lightrec_swl(struct lightrec_state *state,
@@ -964,6 +1029,12 @@ static unsigned int lightrec_get_mips_block_len(const u32 *src)
 
 		if (is_unconditional_jump(c))
 			return i + 1;
+
+		/* DEBUG: cap the block length so the lockstep compares at a
+		 * useful granularity.  Never cut straight after a branch --
+		 * its delay slot has to stay in the same block. */
+		if (LS_BLOCK_CAP && i >= LS_BLOCK_CAP && !has_delay_slot(c))
+			return i;
 	}
 }
 
@@ -1188,8 +1259,17 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		 * and flushes again.  Interpreting the block instead keeps the
 		 * machine alive long enough for the message above to be read
 		 * and the hole to be filled. */
-		pr_err("fgl cannot lower the block at "PC_FMT" -- interpreting "
-		       "it; this is a hole in fgl, not a design\n", block->pc);
+		{	/* Capped: a refusal is worth seeing, a thousand of the
+			 * same refusal is worth nothing and drowns the log. */
+			static unsigned said;
+
+			if (said < 20) {
+				said++;
+				pr_err("fgl cannot lower the block at "PC_FMT
+				       " -- interpreting it; this is a hole in "
+				       "fgl, not a design\n", block->pc);
+			}
+		}
 		block_set_flags(block, BLOCK_NEVER_COMPILE);
 		return -EINVAL;
 	}
@@ -1302,6 +1382,388 @@ u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg)
 	return lightrec_check_load_delay(state, pc, reg);
 }
 
+/* ---------------------------------------------------------------- */
+/* The lockstep verifier                                             */
+/* ---------------------------------------------------------------- */
+
+/* RUN EVERY BLOCK TWICE AND COMPARE.
+ *
+ * Once with fgl, then rewind the machine and run the same block through the
+ * C interpreter, then diff.  The first disagreement names the block, and
+ * says whether it was the exit PC, a register, or memory -- which is the
+ * whole question that a crash two minutes downstream cannot answer.
+ *
+ * WHY MEMORY IS COMPARED AND NOT JUST REGISTERS.  The bug being hunted
+ * corrupts a word of guest RAM while every register involved stays correct,
+ * so a register-only comparison would run straight past it.  Snapshotting
+ * all of guest RAM per block is far too slow, so a fixed window is copied
+ * instead; `LS_BASE`/`LS_WORDS` pick it.
+ *
+ * WHAT RUNNING TWICE COSTS.  Stores land twice.  Writing the same value to
+ * the same address twice is harmless, which covers ordinary RAM traffic, but
+ * device registers with side effects and the GTE's FIFO pushes are not
+ * idempotent -- so this is a debugging mode that perturbs the machine, not
+ * something to leave on.  It is armed late (see `fgl_lockstep_on`) so that
+ * boot, which is full of device traffic, runs untouched.
+ *
+ * The interpreter's result is discarded and fgl's kept, so the run continues
+ * exactly as it would have without the verifier. */
+#define LS_MEM_BASE  0x00000000u
+#define LS_MEM_BYTES 0x1000u
+#define LS_BASE  0x00070000u
+#define LS_WORDS 4096u
+
+u32 fgl_lockstep_on = 0;	/* DEBUG: probe */
+u32 fgl_probe_only = 1;	/* DEBUG: checkpoint only */
+
+/* CHECKPOINTS, BECAUSE THE DIVERGENCE IS IN MEMORY.
+ *
+ * Register lockstep found nothing: both engines agree on every register, yet
+ * one faults.  So the wrong value arrives through guest RAM, and comparing
+ * that per block is what costs two thousand times the throughput.
+ *
+ * Instead each engine hashes all of guest RAM every N blocks and prints it.
+ * Run fgl once, the interpreter once, diff the two logs: the first differing
+ * checkpoint bounds the culprit to N blocks, and N can then be dropped to
+ * close in.  Two runs instead of twenty, and it works for the interpreter
+ * too, which lockstep cannot. */
+/* IN GUEST CYCLES, NOT BLOCKS.
+ *
+ * The two engines do not agree on what a block is -- fgl ends one at the first
+ * control transfer, lightrec runs on to its own end -- so "every N blocks"
+ * counts different amounts of work on the two sides and the logs would not
+ * line up.  The guest cycle counter is the one clock both keep and both agree
+ * on, so keying the checkpoint to it makes checkpoint number k mean the same
+ * moment in both runs. */
+#define CP_EVERY 20u
+
+/* A WINDOW, SO THAT NARROWING DOES NOT MEAN A HUGE LOG.
+ *
+ * Halving CP_EVERY over a whole run multiplies every checkpoint, almost all
+ * of them outside the range already known to be innocent.  Once a coarse pass
+ * has bounded the fault, the next pass only has to look inside that bound --
+ * so the interval drops and the range narrows together, and each pass prints
+ * about the same number of lines as the last. */
+#define CP_GRAIN  0x100u
+#define CP_STRIDE 1u
+
+void fgl_checkpoint(struct lightrec_state *state, u32 pc)
+{
+	/* A HASH OF THE GUEST AT EVERY BLOCK ENTRY, FOR COMPARING TWO ENGINES.
+	 *
+	 * Called from the dispatcher for fgl (dispatch.S, under FGL_DEBUG_CP)
+	 * and from lightrec_run_interpreter for the interpreter, so both logs
+	 * are sampled by the same guest-defined rule.  Run once per engine and
+	 * diff.
+	 *
+	 * Two cautions learnt the hard way.  Sample only where C is entered
+	 * once per BLOCK: fgl_lockstep is entered once per dispatch, and
+	 * matching one log against the other then reports a divergence that is
+	 * only the two granularities disagreeing.  And neither log is a
+	 * subsequence of the other -- fgl ends a block at the first transfer
+	 * and lightrec's runs on -- so line-for-line diffing is wrong too.
+	 * What survives both objections is a per-frame comparison of what the
+	 * guest DREW, which is where the Spyro allocator bug was found.
+	 *
+	 * Off unless fgl_lockstep_on says otherwise; costs a call per block. */
+	u32 h = 2166136261u;
+	unsigned i;
+
+	if (!fgl_lockstep_on)
+		return;
+
+	for (i = 0; i < 34; i++)
+		h = (h ^ state->regs.gpr[i]) * 16777619u;
+	for (i = 0; i < 32; i++)
+		h = (h ^ state->regs.cp2d[i]) * 16777619u;
+	for (i = 0; i < 32; i++)
+		h = (h ^ state->regs.cp2c[i]) * 16777619u;
+
+	fprintf(stderr, "CP %08x %08x\n", pc, h);
+}
+
+
+/* What the block was, once a disagreement has named it. */
+static void fgl_lockstep_report(const struct block *block)
+{
+	u16 k;
+
+	fprintf(stderr, "LS block "PC_FMT" %u ops\n", block->pc,
+		block->nb_ops);
+
+	if (block_has_flag(block, BLOCK_NO_OPCODE_LIST) || !block->opcode_list)
+		return;
+
+	for (k = 0; k < block->nb_ops; k++)
+		fprintf(stderr, "LS  op %2u  %08x flags=%08x\n", k,
+			block->opcode_list[k].c.opcode,
+			block->opcode_list[k].flags);
+}
+
+/* A DEVICE READ CANNOT BE DONE TWICE.
+ *
+ * A status register, a timer, a FIFO: the second read returns something the
+ * first one did not, so the two runs disagree over the machine rather than
+ * over the compiler.  The optimiser has already tagged every access with the
+ * region it proved, so the blocks to leave alone are exactly the ones
+ * carrying an access it could not prove to be memory. */
+/* A BLOCK THAT WRITES MEMORY CANNOT BE RE-RUN.
+ *
+ * The verifier runs the block twice and restores guest RAM in between, but it
+ * only restores a window -- so a block that stores outside the window leaves
+ * fgl's write in place for the interpreter's run to read back.  That is how
+ * the ordering-table insert at 0x80010e04 came to "diverge": `lwl $v1,2($a0)`
+ * on the second pass read what `swl $v0,2($a0)` had written on the first.
+ *
+ * Restoring all 2MB per block is sound and far too slow, so the honest
+ * alternative is to verify only the blocks that write nothing.  It gives up
+ * coverage, and in exchange every divergence it does report is real. */
+static bool block_writes_memory(const struct block *block)
+{
+	u16 k;
+
+	if (block_has_flag(block, BLOCK_NO_OPCODE_LIST) || !block->opcode_list)
+		return true;
+
+	for (k = 0; k < block->nb_ops; k++) {
+		union code c = block->opcode_list[k].c;
+
+		switch (c.i.op) {
+		case OP_SB: case OP_SH: case OP_SW:
+		case OP_SWL: case OP_SWR: case OP_SWC2:
+		case OP_META_SWU:
+			return true;
+		default:
+			break;
+		}
+	}
+	return false;
+}
+
+static bool block_touches_device(const struct block *block)
+{
+	u16 k;
+
+	if (block_has_flag(block, BLOCK_NO_OPCODE_LIST) || !block->opcode_list)
+		return true;                    /* cannot tell: do not touch */
+
+	for (k = 0; k < block->nb_ops; k++) {
+		const struct opcode *op = &block->opcode_list[k];
+		u8 io;
+
+		/* The IO field is only meaningful on an access; `opcode_is_io`
+		 * is the optimiser's own test for that. */
+		if (!opcode_is_io(op->c))
+			continue;
+
+		io = LIGHTREC_FLAGS_GET_IO_MODE(op->flags);
+		if (io == LIGHTREC_IO_HW || io == LIGHTREC_IO_DIRECT_HW)
+			return true;   /* a device read changes under us too */
+	}
+
+	return false;
+}
+
+u32 fgl_lockstep(struct lightrec_state *state, u32 pc)
+{
+	static struct lightrec_registers before, after;
+	static int reported;
+	int was = 0;
+	static u8 mem_before[LS_MEM_BYTES], mem_fgl[LS_MEM_BYTES];
+	struct block *block;
+	u32 pc_fgl, pc_int, cyc0, cyc_fgl;
+	void *ram;
+	static u32 trail[16];
+	unsigned n_trail;
+	unsigned i;
+
+	/* The fgl-side checkpoint is NOT taken here: C is entered once per
+	 * dispatch, not once per block.  It lives in dispatch.S at .Lrun,
+	 * under FGL_DEBUG_CP, which is the true per-block entry. */
+	if (fgl_probe_only || reported >= 40)
+		return lightrec_execute(state, pc, state->current_cycle);
+
+
+	cyc0 = state->current_cycle;
+	before = state->regs;
+	ram = state->maps[PSX_MAP_KERNEL_USER_RAM].address;
+
+	memcpy(mem_before, ram, LS_MEM_BYTES);
+
+	/* ALIGNING TWO DIFFERENT IDEAS OF "A BLOCK".
+	 *
+	 * fgl ends a block at the first control transfer; lightrec's block
+	 * runs on through local branches to its own end.  Comparing one of
+	 * each compares different amounts of work -- a `strcpy` loop reports
+	 * a divergence on its very first iteration, because fgl has stopped
+	 * at the loop branch and the interpreter has run the whole loop and
+	 * returned.  So step fgl until the guest PC leaves the address range
+	 * lightrec's block covers, which is exactly where the interpreter
+	 * will stop too.
+	 *
+	 * A target equal to the current cycle is a budget of zero, which the
+	 * dispatcher runs exactly one block on. */
+	block = lightrec_find_block(state->block_cache, pc);
+	pc_fgl = pc;
+	n_trail = 0;
+	for (i = 0; i < 100000u; i++) {
+		pc_fgl = lightrec_execute(state, pc_fgl, state->current_cycle);
+		if (n_trail < 16)
+			trail[n_trail++] = pc_fgl;
+		if (state->exit_flags || !block)
+			break;
+		if (pc_fgl < pc || pc_fgl >= pc + 4u * block->nb_ops)
+			break;
+	}
+	after = state->regs;
+	cyc_fgl = state->current_cycle;
+
+	/* REGISTERS ONLY, DELIBERATELY.
+	 *
+	 * Snapshotting a window of guest RAM around each block as well is the
+	 * complete comparison, and it costs three copies per block -- measured
+	 * at two thousand times the throughput, which no run survives.  The
+	 * registers are enough here: a wrong value reaches a register before
+	 * it reaches a wild pointer, and that is the block this is looking
+	 * for.  Stores therefore happen twice, which is why blocks that touch
+	 * a device are left alone. */
+	{
+		static unsigned seen, no_blk, exitf, dev, rng, cmp;
+		if (!block) no_blk++;
+		else if (state->exit_flags) exitf++;
+		else if (block_touches_device(block) ||
+			 block_writes_memory(block)) dev++;
+		else if (!((((pc & 0x1fffffffu) >= 0x1000u &&
+			     (pc & 0x1fffffffu) < 0x200000u) ||
+			    ((pc & 0x1fffffffu) >= 0x1fc00000u &&
+			     (pc & 0x1fffffffu) < 0x1fc80000u)))) rng++;
+		else cmp++;
+		if (++seen % 20000u == 0)
+			fprintf(stderr, "LS seen=%u noblk=%u exit=%u dev=%u rng=%u cmp=%u\n",
+				seen, no_blk, exitf, dev, rng, cmp);
+	}
+	if (block && !state->exit_flags && !block_touches_device(block) &&
+	    !block_writes_memory(block) &&
+	    (((pc & 0x1fffffffu) >= 0x1000u &&
+	      (pc & 0x1fffffffu) < 0x200000u) ||
+	     ((pc & 0x1fffffffu) >= 0x1fc00000u &&
+	      (pc & 0x1fffffffu) < 0x1fc80000u))) {
+		memcpy(mem_fgl, ram, LS_MEM_BYTES);
+
+		state->regs = before;
+		state->current_cycle = cyc0;
+		memcpy(ram, mem_before, LS_MEM_BYTES);
+
+		pc_int = pc;
+		for (i = 0; i < 100000u; i++) {
+			pc_int = lightrec_emulate_block(state, block, pc_int);
+			if (state->exit_flags)
+				break;
+			if (pc_int < pc || pc_int >= pc + 4u * block->nb_ops)
+				break;
+		}
+
+		/* NOT COMPARABLE WHEN THE INTERPRETER FELL OFF THE END.
+		 *
+		 * lightrec's block has an artificial end; fgl's does not.  If
+		 * the interpreter stopped at exactly `pc + 4 * nb_ops` it did
+		 * not reach a control transfer -- it ran out of block -- and
+		 * fgl carried straight on into whatever follows.  fgl has then
+		 * executed strictly more instructions than the interpreter and
+		 * every register downstream of that differs for a reason that
+		 * is the harness's, not the emitter's.
+		 *
+		 * Found by a false positive at 800171fc, where a `bltz` lands
+		 * on the delay slot of the `j` that ends the block: the
+		 * interpreter runs the slot and falls out, fgl runs the slot
+		 * and keeps going.  Reported four wrong GPRs and a wrong exit,
+		 * all of them fgl being further ahead. */
+		was = reported;
+		if (pc_int == pc + 4u * block->nb_ops)
+			goto not_comparable;
+
+		/* THE CHARGE, NOT JUST THE RESULT.
+		 *
+		 * Two engines can agree on every register and still run a
+		 * different program, because the guest's interrupts are
+		 * delivered on a cycle count and whoever charges differently
+		 * takes them at a different instruction.  The comparison above
+		 * is blind to that by construction -- it hands both engines
+		 * the same budget and asks what they computed.  This asks what
+		 * they spent.  Both numbers are already here; nothing else in
+		 * the harness had to change to ask the question. */
+		{
+			u32 cost_fgl = cyc_fgl - cyc0;
+			u32 cost_int = state->current_cycle - cyc0;
+			static unsigned cyc_bad, cyc_seen;
+
+			cyc_seen++;
+			if (cost_fgl != cost_int) {
+				cyc_bad++;
+				if (cyc_bad <= 12 || (cyc_bad % 5000u) == 0)
+					fprintf(stderr,
+						"LS %08x: cycles fgl=%u int=%u (%u ops) [%u/%u]\n",
+						pc, cost_fgl, cost_int,
+						block->nb_ops, cyc_bad, cyc_seen);
+			}
+		}
+
+		if (pc_int != pc_fgl) {
+			reported++;
+			fprintf(stderr, "\nLS %08x: exit fgl=%08x int=%08x\n",
+				pc, pc_fgl, pc_int);
+		}
+		for (i = 0; i < 34; i++) {
+			if (state->regs.gpr[i] == after.gpr[i])
+				continue;
+			if (reported == was)
+				reported++;
+			fprintf(stderr, "LS %08x: $%u fgl=%08x int=%08x\n",
+				pc, i, after.gpr[i], state->regs.gpr[i]);
+		}
+		for (i = 0; i < 32; i++) {
+			if (state->regs.cp2d[i] == after.cp2d[i])
+				continue;
+			if (reported == was)
+				reported++;
+			fprintf(stderr, "LS %08x: d%u fgl=%08x int=%08x\n",
+				pc, i, after.cp2d[i], state->regs.cp2d[i]);
+		}
+		for (i = 0; i < 32; i++) {
+			if (state->regs.cp2c[i] == after.cp2c[i])
+				continue;
+			if (reported == was)
+				reported++;
+			fprintf(stderr, "LS %08x: c%u fgl=%08x int=%08x\n",
+				pc, i, after.cp2c[i], state->regs.cp2c[i]);
+		}
+		for (i = 0; i < LS_MEM_BYTES / 4u && reported == was; i++) {
+			if (((const u32 *)ram)[i] == ((const u32 *)mem_fgl)[i])
+				continue;
+			reported++;
+			fprintf(stderr, "\nLS %08x: [%08x] fgl=%08x int=%08x\n",
+				pc, LS_MEM_BASE + i * 4u,
+				((const u32 *)mem_fgl)[i],
+				((const u32 *)ram)[i]);
+		}
+
+not_comparable:
+		memcpy(ram, mem_fgl, LS_MEM_BYTES);
+
+		if (reported != was) {
+			fprintf(stderr, "LS fgl trail:");
+			for (i = 0; i < n_trail; i++)
+				fprintf(stderr, " %08x", trail[i]);
+			fprintf(stderr, "\n");
+			fgl_lockstep_report(block);
+		}
+	}
+
+	state->regs = after;
+	state->current_cycle = cyc_fgl;
+	return pc_fgl;
+}
+
 u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 {
 	void *block_trace;
@@ -1351,6 +1813,8 @@ u32 lightrec_run_interpreter(struct lightrec_state *state, u32 pc,
 		block = lightrec_get_block(state, pc);
 		if (!block)
 			break;
+
+		fgl_checkpoint(state, pc);
 
 		pc = lightrec_emulate_block(state, block, pc);
 

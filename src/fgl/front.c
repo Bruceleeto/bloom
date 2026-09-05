@@ -78,9 +78,73 @@ static int access_is_ours(const ir_node *p, unsigned io)
 }
 
 /* Returns 0 if it met an access it cannot express, which stops the block. */
+/* A LOAD IN A BRANCH DELAY SLOT, WHICH FGL CANNOT YET EXPRESS.
+ *
+ * The delay is a whole instruction long and the instruction it lands on is
+ * the FIRST ONE OF THE TARGET BLOCK, which is not compiled yet and may not
+ * even be decided yet.  lightrec's answer is a runtime one: the value goes to
+ * `temp_reg` instead of the destination register, the block leaves through a
+ * dispatcher door with the register number in hand, and
+ * `lightrec_check_load_delay` (lightrec.c:899) looks at the target's first
+ * instruction to decide whether the write lands before it or after
+ * (emitter.c:142-154).  `LIGHTREC_LOAD_DELAY` is the optimiser saying "this
+ * one needs that machinery"; it clears the flag wherever it could prove the
+ * delay away.
+ *
+ * fgl has none of that machinery -- `fgl_check_load_delay` exists in
+ * lightrec.c and nothing calls it -- and it was not refusing the case either,
+ * so the destination register was simply written a whole instruction early.
+ * The target block's first instruction then reads the new value where the
+ * hardware reads the old one.  Silent, data-dependent, and rare: Spyro ran a
+ * hundred seconds before one such register turned into a wild pointer.
+ *
+ * Refusing is not a fallback path bolted on -- it is what `apply_flags` next
+ * door already does with a deferred load it cannot lower, and what the block
+ * refusal machinery is for.  The block is interpreted, which is correct and
+ * slower.  Filling the hole means the dispatcher door and the `temp_reg`
+ * protocol, and that is its own piece of work. */
+static int ds_load_delay(const struct opcode *ds)
+{
+        uint32_t insn = ds->c.opcode;
+        unsigned op = insn >> 26;
+        unsigned rs = (insn >> 21) & 31;
+        unsigned rt = (insn >> 16) & 31;
+
+        if (!op_flag_load_delay(ds->flags))
+                return 0;
+
+        /* `opcode_has_load_delay` (optimizer.c), written out rather than
+         * called: front.c is compiled by the host harness too, which links
+         * neither the optimiser nor anything else of lightrec's. */
+        if (op == 0x10 || op == 0x12)                   /* MFC0 / MFC2, CFC */
+                return rs == 0x00 || rs == 0x02;
+
+        if (op == 0x32)                                 /* LWC2: no delay */
+                return 0;
+
+        return rt != 0 && (op == 0x20 || op == 0x21 || op == 0x22 ||
+                           op == 0x23 || op == 0x24 || op == 0x25 ||
+                           op == 0x26);
+}
+
+/* DEBUG BISECT: pretend the optimiser proved nothing about any access, so
+ * every load and store becomes IR_RW and is performed by C against the state
+ * block -- lightrec's own memory path, the one the interpreter uses.
+ *
+ * If a fault survives this, fgl's emitted loads and stores are not the cause
+ * and the search moves elsewhere; if it disappears, the cause is in the
+ * masked direct access or its invalidation.  One run either way, which beats
+ * a hypothesis per hardware boot. */
+int fgl_all_accesses_to_c;
+unsigned fgl_local_noslot;	/* DEBUG: local branches that bill no slot */
+
 static int apply_flags(ir_ctx *c, int from, uint32_t flags, uint32_t insn)
 {
         unsigned io = LIGHTREC_FLAGS_GET_IO_MODE(flags);
+
+        /* 1 = every access, 2 = stores only, 3 = loads only. */
+        if (fgl_all_accesses_to_c == 1)
+                io = LIGHTREC_IO_UNKNOWN;
         int i;
 
         for (i = from; i < c->n; i++) {
@@ -91,6 +155,33 @@ static int apply_flags(ir_ctx *c, int from, uint32_t flags, uint32_t insn)
                 case IR_LOAD_UN: case IR_STORE_UN:
                 case IR_LWC2: case IR_SWC2:
                         p->io = (uint8_t)io;
+
+                        switch (fgl_all_accesses_to_c) {
+                        case 2:         /* every store */
+                                if (p->op == IR_STORE ||
+                                    p->op == IR_STORE_UN || p->op == IR_SWC2)
+                                        p->io = FGL_IO_UNKNOWN;
+                                break;
+                        case 3:         /* every load */
+                                if (p->op == IR_LOAD ||
+                                    p->op == IR_LOAD_UN || p->op == IR_LWC2)
+                                        p->io = FGL_IO_UNKNOWN;
+                                break;
+                        case 4:         /* SWL / SWR only */
+                                if (p->op == IR_STORE_UN)
+                                        p->io = FGL_IO_UNKNOWN;
+                                break;
+                        case 5:         /* SWC2 only */
+                                if (p->op == IR_SWC2)
+                                        p->io = FGL_IO_UNKNOWN;
+                                break;
+                        case 6:         /* the aligned stores only */
+                                if (p->op == IR_STORE)
+                                        p->io = FGL_IO_UNKNOWN;
+                                break;
+                        default:
+                                break;
+                        }
                         if (op_flag_no_mask(flags))
                                 p->hint |= FGL_H_NO_MASK;
                         /* Whether a store has to uncompile what it wrote
@@ -101,7 +192,7 @@ static int apply_flags(ir_ctx *c, int from, uint32_t flags, uint32_t insn)
                         if (op_flag_no_invalidate(flags))
                                 p->hint |= FGL_H_NO_INV;
 
-                        if (access_is_ours(p, io))
+                        if (access_is_ours(p, p->io))
                                 break;
 
                         /* A DEFERRED LOAD CANNOT GO THIS WAY, and refusing is
@@ -429,6 +520,51 @@ static int movi_step(ir_ctx *c, movi_state *m, const struct opcode *op,
  * The substitute has to read what the meta opcode reads and write what it
  * writes; nothing else about it is used.
  */
+/* A DELAY SLOT IS AN INSTRUCTION LIKE ANY OTHER, INCLUDING A META ONE.
+ *
+ * The main loop tests for the optimiser's own opcodes before decoding,
+ * because they occupy encodings that mean something else in the guest ISA.
+ * The delay slot is lowered from a second place, and handing the raw word
+ * straight to `ir_decode_op` there skips that test: a meta opcode arrives as
+ * major 0x3c, matches no case, and is dropped without a word of complaint.
+ *
+ * `lightrec_transform_ops` rewrites `addu rd, rs, $zero` to OP_META_MOV
+ * wherever it finds one, delay slots included, and that idiom is how MIPS
+ * passes an argument -- so the dropped instruction was usually the one
+ * setting up $a0 for the call it sits behind.  The callee then ran against a
+ * stale register, which is why this surfaced as a table built at the wrong
+ * base rather than as anything resembling a missing move.
+ *
+ * Returns zero for a slot that cannot be lowered, which stops the block. */
+static int lower_slot(ir_ctx *c, const struct opcode *op, uint32_t pc)
+{
+        unsigned major = op->opcode >> 26;
+
+        switch (major) {
+        case OP_META:
+                return lower_meta(c, op, pc);
+
+        case OP_META_MULT2:
+        case OP_META_MULTU2:
+                lower_mult2(c, op, pc);
+                return 1;
+
+        case OP_META_LWU:
+        case OP_META_SWU:
+                lower_fused_unaligned(c, op, pc, major == OP_META_SWU);
+                return 1;
+
+        /* Never produced by any pass in this tree; refuse it rather than let
+         * it decode as whatever 0x3b happens to mean. */
+        case OP_META_BIOS:
+                return 0;
+
+        default:
+                ir_decode_op(c, op->opcode, pc);
+                return 1;
+        }
+}
+
 static uint32_t hazard_word(const struct opcode *op)
 {
         unsigned major = op->opcode >> 26;
@@ -463,9 +599,22 @@ static uint32_t hazard_word(const struct opcode *op)
  * against the instruction just lowered, then decide whether that instruction
  * leaves a load pending itself. */
 static int shadow_step(ir_ctx *c, int pend, uint32_t *pend_insn,
-                       uint32_t insn, int mark)
+                       uint32_t insn, int mark, int hold)
 {
-        int settled = ir_shadow_fix(c, pend, *pend_insn, insn, mark);
+        int settled;
+
+        /* THE SWAPPED SLOT IS NOT THE INSTRUCTION IN THE SHADOW.
+         *
+         * `hold` says this entry is the slot half of a swapped pair, which in
+         * machine order runs AFTER its branch.  A load in front of the pair
+         * therefore has the branch in its shadow, and settling it here would
+         * settle it against an instruction that has not run yet.  Step over
+         * with the shadow still pending; the branch, one entry later, is what
+         * settles it. */
+        if (hold)
+                return pend;
+
+        settled = ir_shadow_fix(c, pend, *pend_insn, insn, mark);
 
         *pend_insn = insn;
         return settled ? -1 : ir_shadow_pending(c, insn, mark);
@@ -532,6 +681,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                 /* What the hazard analysis is shown; the same word for
                  * everything that really is a MIPS instruction. */
                 uint32_t hword = hazard_word(op);
+                int ds_slot;
                 int mark = c.n;
 
                 /* A SWAPPED DELAY SLOT IS NOT WHERE THE LOAD DELAY THINKS.
@@ -560,8 +710,18 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                  * branch has already absorbed, and a load that IS the slot
                  * does not have its shadow settled against a branch that in
                  * truth ran before it. */
-                if (op_flag_no_ds(op->flags))
-                        pend = -1;
+                ds_slot = op_flag_no_ds(op->flags) && !ir_is_transfer(word);
+
+                /* The slot may be stepped over with a shadow still pending
+                 * only if it cannot observe or disturb the load. Refusing is
+                 * the honest answer to the rest; C runs the instruction. */
+                if (ds_slot && pend >= 0 &&
+                    !ir_slot_holds_shadow(hword, pend_insn)) {
+                        note_unsupported(info, op, at);
+                        info->stop_reason = FGL_STOP_UNSUPPORTED;
+                        info->ended_early = 1;
+                        break;
+                }
 
                 if (c.n + 4 > max) {
                         movi_flush(&c, &movi, at);
@@ -591,7 +751,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
                         info->n_ops = i + 1;
                         continue;
                 }
@@ -604,7 +764,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
                         info->n_ops = i + 1;
                         continue;
                 }
@@ -618,7 +778,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
                         info->n_ops = i + 1;
                         continue;
                 }
@@ -651,7 +811,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                  * the load exactly where it already is, which
                                  * is what one instruction of delay means. */
                                 pend = shadow_step(&c, pend, &pend_insn,
-                                                   hword, mark);
+                                                   hword, mark, ds_slot);
                                 info->n_ops = i + 1;
                                 continue;
                         }
@@ -691,7 +851,7 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                 info->ended_early = 1;
                                 break;
                         }
-                        pend = shadow_step(&c, pend, &pend_insn, hword, mark);
+                        pend = shadow_step(&c, pend, &pend_insn, hword, mark, ds_slot);
                         info->n_ops = i + 1;
 
                         /* A STATUS OR CAUSE WRITE ENDS THE BLOCK.
@@ -727,16 +887,65 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                  * branch is not to pay a dispatch -- so it is the first thing
                  * to revisit once blocks can chain. */
                 if (op_flag_local_branch(op->flags)) {
+                        if (!op_flag_no_ds(op->flags) && i + 1 < nb &&
+                            ds_load_delay(&ops[i + 1])) {
+                                note_unsupported(info, &ops[i + 1], at + 4);
+                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                info->ended_early = 1;
+                                return c.n;
+                        }
+                        int slot = 0;
+
                         if (ir_decode_transfer(&c, word, branch_at)) {
                                 ir_shadow_fix(&c, pend, pend_insn, hword, mark);
-                                if (!op_flag_no_ds(op->flags) && i + 1 < nb)
-                                        ir_decode_op(&c, ops[i + 1].opcode,
-                                                     at + 4);
+                                if (!op_flag_no_ds(op->flags) && i + 1 < nb) {
+                                        if (!lower_slot(&c, &ops[i + 1], at + 4)) {
+                                                note_unsupported(info, &ops[i + 1],
+                                                                 at + 4);
+                                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                                info->ended_early = 1;
+                                                return c.n;
+                                        }
+                                        slot = 1;
+                                }
                         } else {
                                 ir_shadow_fix(&c, pend, pend_insn, hword, mark);
                         }
-                        info->n_ops = i + 2;
+
+                        /* N_OPS IS A CYCLE CHARGE, NOT A GUESS.
+                         *
+                         * `fgl_emit` turns this into the number of guest
+                         * cycles the block bills, so counting an instruction
+                         * that was never lowered bills the guest for it.
+                         * This said `i + 2` unconditionally, which is right
+                         * only when a delay slot was actually consumed --
+                         * and it is not consumed in three cases the general
+                         * transfer path below already distinguishes:
+                         *
+                         *   - a swapped pair, where the slot was consumed at
+                         *     i-1 and LIGHTREC_NO_DS says so;
+                         *   - a branch that is the last entry in the list,
+                         *     where there is no slot to consume;
+                         *   - SYSCALL and BREAK, which have no delay slot at
+                         *     all (`ir_decode_transfer` returns 0).
+                         *
+                         * Each one overcharges by exactly one cycle, every
+                         * time the block runs.  A hardware register read is
+                         * answered from the cycle count, so an overcharged
+                         * block makes a timer read early -- which is a wrong
+                         * value returned to the guest, not a slow frame. */
+                        if (!slot)
+                                fgl_local_noslot++;   /* DEBUG */
+                        info->n_ops = i + 1 + (unsigned)slot;
                         info->stop_reason = FGL_STOP_LOCAL;
+                        info->ended_early = 1;
+                        return c.n;
+                }
+
+                if (!op_flag_no_ds(op->flags) && i + 1 < nb &&
+                    ds_load_delay(&ops[i + 1])) {
+                        note_unsupported(info, &ops[i + 1], at + 4);
+                        info->stop_reason = FGL_STOP_UNSUPPORTED;
                         info->ended_early = 1;
                         return c.n;
                 }
@@ -755,7 +964,13 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                         if (!op_flag_no_ds(op->flags) && i + 1 < nb) {
                                 int dmark = c.n;
 
-                                ir_decode_op(&c, ops[i + 1].opcode, at + 4);
+                                if (!lower_slot(&c, &ops[i + 1], at + 4)) {
+                                        note_unsupported(info, &ops[i + 1],
+                                                         at + 4);
+                                        info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                        info->ended_early = 1;
+                                        return c.n;
+                                }
                                 if (!apply_flags(&c, dmark, ops[i + 1].flags,
                                                  ops[i + 1].opcode)) {
                                         note_unsupported(info, &ops[i + 1], at + 4);

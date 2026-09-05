@@ -83,5 +83,6 @@ int ir_decode_transfer(ir_ctx *c, uint32_t insn, uint32_t pc);
  * neither can see the hazard from inside a single opcode's lowering. */
 int ir_shadow_pending(const ir_ctx *c, uint32_t insn, int mark);
 int ir_shadow_fix(ir_ctx *c, int pend, uint32_t load, uint32_t insn, int mark);
+int ir_slot_holds_shadow(uint32_t slot, uint32_t load);
 
 #endif /* DECODE_INT_H */

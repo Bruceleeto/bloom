@@ -10,6 +10,7 @@
  */
 
 #include "alloc.h"
+#include "fgl.h"
 #include "fgl_state.h"
 
 /* THE POOL HAS TO OUTNUMBER WHAT ONE NODE CAN WANT AT ONCE, or a node's own
@@ -91,6 +92,7 @@ typedef struct {
         uint8_t   last[ALLOC_N];        /* node of the last reference        */
         uint8_t   wrote[ALLOC_N];       /* ...and whether it was a write     */
         int8_t    where[GUEST_HI + 1];  /* pool index per guest register     */
+        uint8_t   defined[GUEST_HI + 1];/* written somewhere in this block   */
         uint8_t   rank[RANK_BYTES];
         int       node;                 /* the node being allocated for      */
         ir_alloc *a;
@@ -199,7 +201,33 @@ static int take(allocator *s, unsigned g, int want_value)
                  * entry, where the load is furthest from its use.  Once it has
                  * held a value, the load has to wait until that value is
                  * dead. */
-                if (!s->used[h] && s->a->n_preload < ALLOC_N) {
+                /* A LOAD MAY ONLY BE HOISTED FOR A REGISTER THE BLOCK HAS
+                 * NOT WRITTEN.
+                 *
+                 * `used[h]` is a property of the HOST register -- has this
+                 * one ever held anything -- and says nothing about the guest
+                 * register being loaded.  A guest register written earlier in
+                 * the block and since flushed to the state block (every call
+                 * into C flushes) is unbound again, so the next read of it
+                 * takes this path; hoisting that load to block entry reads
+                 * the value from BEFORE the write.
+                 *
+                 * Found in Spyro at 0x800172b0:
+                 *
+                 *      mflo    $v0             ; $v0 = LO, in r7
+                 *      mtc2    $v0,$30         ; a call into C: everything
+                 *                              ; flushed, r7 unbound
+                 *      ...
+                 *      srlv    $v0,$v0,$v1     ; reads $v0 -- hoisted to
+                 *                              ; block entry, into r11
+                 *
+                 * r11 got the value $v0 had when the block started, the shift
+                 * ran on it, and the block's writeback then published r11
+                 * over the correct value.  The result was an angle 2000-odd
+                 * degrees out, which is how the camera came to point at
+                 * nothing and the scene drained away one frame at a time. */
+                if (!s->used[h] && !s->defined[g] &&
+                    s->a->n_preload < ALLOC_N) {
                         ir_fixup *f = &s->a->preload[s->a->n_preload++];
 
                         f->at    = 0;
@@ -222,9 +250,14 @@ static int take(allocator *s, unsigned g, int want_value)
 
 /* Guest register 0 is never allocated: it reads zero and discards writes, so
  * a register holding it would hold nothing. */
+/* -1 IS ALREADY THE ANSWER FOR "IN THE STATE BLOCK", which is why dumb mode
+ * costs three lines and no new code in the emitter: every node already has a
+ * memory path for the case where the allocator could not give it a register.
+ * Returning -1 always simply takes that path every time.  `scratch` is left
+ * alone -- a `jsr` target has to be in a register whatever mode this is. */
 static int8_t host_src(allocator *s, unsigned g)
 {
-        if (g == 0)
+        if (g == 0 || FGL_DUMB_REGS)
                 return -1;
         return (int8_t)(ALLOC_FIRST + take(s, g, 1));
 }
@@ -233,11 +266,12 @@ static int8_t host_dst(allocator *s, unsigned g)
 {
         int h;
 
-        if (g == 0)
+        if (g == 0 || FGL_DUMB_REGS)
                 return -1;
         h = take(s, g, 0);
         s->dirty[h] = 1;
         s->wrote[h] = 1;
+        s->defined[g] = 1;
         return (int8_t)(ALLOC_FIRST + h);
 }
 
@@ -246,11 +280,12 @@ static int8_t host_mod(allocator *s, unsigned g)
 {
         int h;
 
-        if (g == 0)
+        if (g == 0 || FGL_DUMB_REGS)
                 return -1;
         h = take(s, g, 1);
         s->dirty[h] = 1;
         s->wrote[h] = 1;
+        s->defined[g] = 1;
         return (int8_t)(ALLOC_FIRST + h);
 }
 
@@ -425,8 +460,10 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                 s.last[i] = 0;
                 s.wrote[i] = 0;
         }
-        for (i = 0; i <= GUEST_HI; i++)
+        for (i = 0; i <= GUEST_HI; i++) {
                 s.where[i] = -1;
+                s.defined[i] = 0;
+        }
         for (i = 0; i < ALLOC_N; i++)
                 if (ir_pin[i] >= 0)
                         s.where[ir_pin[i]] = (int8_t)i;

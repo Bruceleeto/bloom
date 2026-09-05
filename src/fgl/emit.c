@@ -221,8 +221,24 @@ static void ld_guest(fgl_emitter *e, unsigned g, int rn)
 		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, rn);
 }
 
+/* WRITING GUEST $ZERO IS A NO-OP, AND A LOAD INTO IT IS NOT.
+ *
+ * `decode.c` used to drop any load whose destination was $zero, on the
+ * reasoning that a node producing nothing produces nothing.  That is true of
+ * a register write and false of a memory READ: `lbu $zero,0x1040($v1)` is how
+ * a driver drains the SIO receive FIFO -- the value is thrown away and the
+ * side effect IS the instruction.  Spyro's memcard code does exactly that,
+ * and dropping it hung the transfer and then faulted on a wild pointer.
+ *
+ * So the node is built like any other and the destination is discarded HERE,
+ * in the one place every writeback passes through.  `host_dst` already
+ * returns -1 for guest 0, so such a node arrives with `hd < 0` and would
+ * otherwise store over the state block's $zero -- which every later read of
+ * $zero would then see. */
 static void st_guest(fgl_emitter *e, unsigned g, int rn)
 {
+	if (g == 0)
+		return;
 	if (rn != FGL_R_XFER)
 		sh4_emit_mov_reg(&e->cg, rn, FGL_R_XFER);
 	sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(g));
@@ -368,7 +384,23 @@ static void emit_invalidate(fgl_emitter *e, const ir_node *p, int addr, int tmp)
 	if (!ir_store_invalidates(p))
 		return;
 
-	if (tmp < 0) {
+	/* ZERO IS "NO SCRATCH", NOT "REGISTER ZERO".
+	 *
+	 * `sc[]` is unsigned and uses 0 for a scratch the allocation pass
+	 * could not spare -- which is how every other node reads it
+	 * (`emit_rw`, and the `p->sc[0] ? p->sc[0] : FGL_R_XFER` in IR_STORE
+	 * itself).  Testing `< 0` can never fire, so a store in a block with
+	 * no register to spare took r0 as its scratch, and r0 is the transfer
+	 * register this sequence is already using:
+	 *
+	 *      and     addr, r0        ; r0 = the byte offset
+	 *      mov     r0, r0          ; "save it in tmp" -- tmp IS r0
+	 *      mov.l   @(LUT,gbr), r0  ; r0 = the table base, offset gone
+	 *      mov.l   addr, @(r0, r0) ; store at twice the table base
+	 *
+	 * -- a wild store, fired only under register pressure, which is why
+	 * it was data-dependent and why comparing registers never saw it. */
+	if (tmp <= 0) {
 		e->overflow = 9;        /* the allocator and ir.h disagree */
 		return;
 	}
@@ -1107,7 +1139,7 @@ static void emit_hw_load(fgl_emitter *e, const ir_node *p)
 	} else if (p->hd >= 0) {
 		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, rd);
 	} else {
-		sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+		st_guest(e, p->rd, FGL_R_XFER);
 	}
 }
 
@@ -1397,7 +1429,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		if (p->hd >= 0)
 			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
 		else
-			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+			st_guest(e, p->rd, FGL_R_XFER);
 		break;
 
 	case IR_STORE:
@@ -1410,6 +1442,8 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		 * block. Doing it in the other order costs a scratch register
 		 * on every store whose value is not in a register. */
 		emit_addr(e, p, FGL_R_T1, FGL_R_XFER);
+
+
 		rt = operand(e, p->ht, p->rt, FGL_R_XFER);
 		switch (p->sub) {
 		case MEM_B:
@@ -1449,7 +1483,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		else if (p->hd >= 0)
 			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
 		else
-			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+			st_guest(e, p->rd, FGL_R_XFER);
 		break;
 
 	case IR_MTC_C:
@@ -1588,7 +1622,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		else if (p->hd >= 0)
 			sh4_emit_mov_reg(&e->cg, FGL_R_XFER, p->hd);
 		else
-			sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(p->rd));
+			st_guest(e, p->rd, FGL_R_XFER);
 		break;
 
 	case IR_MFC2_C:
@@ -1676,6 +1710,13 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		 * and there is no other register that can. */
 		emit_cop2_addr(e, p, FGL_R_T1, FGL_R_XFER);
 		sh4_emit_mov_l_load_gbr(&e->cg, (int)p->imm);
+		/* Narrowed on the way out, exactly as IR_MFC2 narrows it: a
+		 * store of a coprocessor register is a read of it.  See
+		 * decode.c on SWC2. */
+		if (p->sub == CP2_SX)
+			sh4_emit_exts_w(&e->cg, FGL_R_XFER, FGL_R_XFER);
+		else if (p->sub == CP2_ZX)
+			sh4_emit_extu_w(&e->cg, FGL_R_XFER, FGL_R_XFER);
 		sh4_emit_mov_l_store(&e->cg, FGL_R_XFER, FGL_R_T1);
 		break;
 
@@ -1842,6 +1883,20 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	 *
 	 * So charge in whole table-loads and then the remainder.  Two extra
 	 * instructions per 33 ops, on the epilogue of a long block only. */
+	/* A DELIBERATE ERROR IN THE GUEST CLOCK, TO SEE IF THE FAULT MOVES.
+	 *
+	 * Two theories for the Spyro fault: fgl emits a wrong value, or fgl
+	 * charges cycles differently from the interpreter and an interrupt
+	 * lands on a different instruction.  They are told apart by nudging
+	 * the clock and nothing else -- if the crash address moves, the bug is
+	 * timing; if it sits at exactly the same address, the value is wrong
+	 * and cycles are innocent.
+	 *
+	 * Biasing the table index costs no instructions and no bytes: the
+	 * displacement changes, the encoding does not.  So the two builds have
+	 * identical layout and the comparison is not confounded by it. */
+	n_ops += FGL_CYCLE_BIAS;
+
 	while (n_ops > FGL_CYCLE_ENTRIES - 1) {
 		sh4_emit_mov_l_load_gbr(&e->cg,
 					(int)(FGL_AT_CYCLES + FGL_CYCLE_ENTRIES - 1));

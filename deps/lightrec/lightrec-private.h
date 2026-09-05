@@ -500,5 +500,10 @@ void fgl_rw(u32 opcode, struct lightrec_state *state);
 void fgl_mtc(u32 opcode, struct lightrec_state *state);
 void fgl_mfc(u32 opcode, struct lightrec_state *state);
 void fgl_rfe(u32 unused, struct lightrec_state *state);
+u32 fgl_lockstep(struct lightrec_state *state, u32 pc);
+void fgl_dump_ring(void);
+void fgl_checkpoint(struct lightrec_state *state, u32 pc);
+extern u32 fgl_pc_ring[1 + 64 * 4];
+extern u32 fgl_lockstep_on;
 
 #endif /* __LIGHTREC_PRIVATE_H__ */

@@ -142,6 +142,79 @@ _fgl_dispatch_loop:
 
 .Lrun:
 
+#if FGL_DEBUG_RING
+	/* DEBUG: a ring of the last 64 guest block PCs.
+	 *
+	 * A fault inside emitted code names the block it happened in and
+	 * nothing about how the machine got there, which is useless when the
+	 * bug is that the block should never have run.  Eight instructions
+	 * here buy the predecessor chain.
+	 *
+	 * Off by default -- this is the hottest path in the emulator, and the
+	 * ring costs four loads and four stores on every block entry.  Build
+	 * with -DWITH_FGL_DEBUG_RING=ON to get it back.
+	 *
+	 * r2 is the PC and must survive; r0 and r1 are both reloaded from
+	 * scratch immediately below, so they are free to clobber. */
+	mov.l	.Lringp, r1
+	mov.l	@r1, r0				/* the index */
+	add	#1, r0
+	and	#63, r0				/* AND #imm is R0-only */
+	mov.l	r0, @r1
+	shll2	r0
+	shll2	r0				/* sixteen bytes per slot */
+	add	r0, r1
+	mov.l	r2, @(4, r1)			/* slot.pc = pc */
+
+	/* And the three guest registers this hunt needs with it.  Nothing is
+	 * pinned yet, so every register is in the state block at a block
+	 * boundary and these are the true values the next block starts from.
+	 * `mov.l @(disp,GBR)` can only target r0, which is free by now. */
+	mov.l	@(3 * 4, gbr), r0		/* $v1 */
+	mov.l	r0, @(8, r1)
+	/* DEBUG: guest scratchpad word 0, the list head this hunt is about.
+	 * Recording it per block entry names the block boundary it changed
+	 * at, and the ring's predecessors then name the writer. */
+	mov.l	.Lsp0, r0
+	mov.l	@r0, r0
+	mov.l	r0, @(12, r1)
+	mov.l	@(30 * 4, gbr), r0		/* $s8 -- the list pointer */
+	mov.l	r0, @(16, r1)
+#endif
+
+#if FGL_DEBUG_CP
+	/* DEBUG: a C call on EVERY block entry, for the cross-engine
+	 * comparator.
+	 *
+	 * The comparator needs the two engines sampled at the same guest
+	 * moments.  lightrec's interpreter hashes state once per block, from
+	 * inside `lightrec_run_interpreter`; the fgl side had no equivalent
+	 * hook and was sampled from `fgl_lockstep` instead, which C enters
+	 * once per DISPATCH, not once per block.  So one log was every block
+	 * and the other a sparse sample of outer-loop entries, and matching
+	 * them as a subsequence reported a divergence that was only the two
+	 * granularities disagreeing.  This is the missing hook: `.Lrun` is
+	 * where every block in the program arrives, with r2 the guest PC.
+	 *
+	 * The dispatcher's budget is r0/r1/r2/T/PR, and a C call takes more
+	 * than that -- but r8-r15 are callee-saved by the SH-4 ABI, so r13
+	 * and r14 come back untouched, GBR is never written by code that has
+	 * no TLS, and r3-r7 hold nothing at a block boundary while `ir_pin[]`
+	 * is all -1.  PIN: when pinning is switched on, publish here.
+	 * Only r2 has to be saved by hand.
+	 *
+	 * Ruinously slow, and meant to be: it is a debug build. */
+	sts.l	pr, @-r15
+	mov.l	r2, @-r15
+	stc	gbr, r4				/* the state block IS the state */
+	mov	r2, r5
+	mov.l	.Lcheckpoint, r0
+	jsr	@r0
+	 nop
+	mov.l	@r15+, r2
+	lds.l	@r15+, pr
+#endif
+
 	/* The guest PC into a byte offset in the block table, branchlessly.
 	 *
 	 * lightrec's `lut_offset()` is a two-case function of bit 28: RAM is
@@ -403,6 +476,13 @@ _fgl_dispatch_ds_check:
 	 mov	r0, r14
 
 	.align	2
+#if FGL_DEBUG_RING
+.Lringp:	.long	_fgl_pc_ring
+.Lsp0:		.long	0x1f800000
+#endif
+#if FGL_DEBUG_CP
+.Lcheckpoint:	.long	_fgl_checkpoint
+#endif
 .Lkuseg:	.long	0x1fffffff
 .Lrammask:	.long	0x001fffff
 .Lbiosbit:	.long	0x00200000

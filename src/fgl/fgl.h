@@ -156,6 +156,9 @@ typedef struct {
 	 * the first GTE command.  See ir.h on IR_MTC2. */
 	uint32_t cp2_ctrl_gen;
 
+	/* DEBUG: called when an emitted store computes a wild address. */
+	uint32_t wild;
+
 	/* The C body that runs one COP2 command, given the guest instruction
 	 * word.  Resolved AT COMPILE TIME -- the command is a constant in the
 	 * block, so there is no runtime dispatch and nothing decodes it twice.
@@ -212,6 +215,45 @@ uint32_t fgl_size(const fgl_emitter *e);
 
 /* Emit one already-decoded, already-allocated block. Returns its entry
  * address, or 0 if the emitter overflowed or met something it cannot lower. */
+/* DUMB MODE: THE EMITTER WITH ITS TWO CLEVER PARTS SWITCHED OFF.
+ *
+ * fgl does two things beyond turning one guest instruction into SH-4: it
+ * keeps guest registers in host registers across a run of instructions, and
+ * it compiles a run of instructions as one block.  Both are where the hard
+ * bugs live -- eviction, writeback, spill, delay-slot placement, block
+ * boundaries -- and neither is needed for a correct machine, only a fast one.
+ *
+ * These two switches remove them independently, so a fault can be bisected to
+ * one half of the emitter in two runs rather than argued about:
+ *
+ *   FGL_DUMB_REGS=1     no register allocation.  Every operand is loaded from
+ *                       the state block and every result stored straight back
+ *                       to it, exactly as the emitter already does when the
+ *                       allocator runs out -- so this is the existing memory
+ *                       path taken always, not a new one.
+ *   FGL_DUMB_BLOCKS=1   one guest instruction per block, plus the delay slot
+ *                       when that instruction is a transfer (splitting those
+ *                       two would change what the machine does, not just how
+ *                       fast it does it).
+ *
+ * Both are slow -- slower than the C interpreter, most likely -- and neither
+ * is a configuration to ship.  They are instruments.  What they do NOT touch
+ * is cycle accounting or interrupt delivery, so a fault that survives both is
+ * in an instruction template or in the runtime, not in block formation.
+ */
+#ifndef FGL_DUMB_REGS
+#define FGL_DUMB_REGS 0
+#endif
+#ifndef FGL_DUMB_BLOCKS
+#define FGL_DUMB_BLOCKS 0
+#endif
+
+/* Cycles added to every block's charge.  Zero is the real clock; a
+ * non-zero value is the A/B described at the charge site in emit.c. */
+#ifndef FGL_CYCLE_BIAS
+#define FGL_CYCLE_BIAS 0
+#endif
+
 /* Emit one block. `n_ops` is the number of GUEST INSTRUCTIONS it covers, delay
  * slot included -- not the node count, which folding and transfer expansion
  * both move. It is what the block charges the cycle counter for, so getting it

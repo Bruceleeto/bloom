@@ -336,8 +336,9 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
         case 0x0f: ir_emit_set(c, pc, rt, imm << 16); return;      /* LUI */
 
         case 0x20: case 0x21: case 0x23: case 0x24: case 0x25:
-                if (rt == 0)
-                        return;
+                /* NO `rt == 0` TEST HERE, deliberately -- see `st_guest` in
+                 * emit.c.  A load into $zero still READS, and on a device
+                 * register the read is the whole instruction. */
                 p = ir_node_new(c, IR_LOAD, pc);
                 if (!p)
                         return;
@@ -362,8 +363,7 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                 return;
 
         case 0x22: case 0x26:                                   /* LWL / LWR */
-                if (rt == 0)
-                        return;
+                /* Same as the aligned loads above: it reads. */
                 p = ir_node_new(c, IR_LOAD_UN, pc);
                 if (!p)
                         return;
@@ -471,6 +471,39 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                         return;
                 case 0x04:                              /* MTC2 rt,rd */
                 case 0x06:                              /* CTC2 rt,rd */
+                        /* FOUR OF THE SIXTY-FOUR ARE NOT STORAGE.
+                         *
+                         * `SXYP` pushes the screen FIFO rather than holding a
+                         * value; `IRGB` decomposes into IR1-IR3; `LZCS`
+                         * computes the leading-bit count into `LZCR`; `LZCR`
+                         * itself is read-only; and `FLAG` recomputes its
+                         * summary bit.  lightrec sends all of them through
+                         * `lightrec_mtc2`/`lightrec_ctc2` (lightrec.c) and so
+                         * does its interpreter, which is why the two agree
+                         * and fgl did not.
+                         *
+                         * LZCS is the one that bites hardest, because the
+                         * normalise idiom is `mtc2 $30` / `mfc2 $31` / `sub
+                         * 31 - count`: leave LZCR stale and a shift amount
+                         * comes out wrong, which turns into a wild pointer a
+                         * few instructions later.
+                         *
+                         * The count has no SH-4 instruction behind it and the
+                         * FIFO push is three moves, so these go to C -- the
+                         * same door MTC0 to Status uses.  They are rare
+                         * enough that the call costs nothing measurable.
+                         * Unlike Status, they do NOT end the block: nothing
+                         * here can raise an interrupt. */
+                        if ((rs == 0x04 && (rd == 15u || rd == 28u ||
+                                            rd == 30u || rd == 31u)) ||
+                            (rs == 0x06 && rd == 31u)) {
+                                p = ir_node_new(c, IR_MTC_C, pc);
+                                if (!p)
+                                        return;
+                                p->imm = insn;
+                                return;
+                        }
+
                         p = ir_node_new(c, IR_MTC2, pc);
                         if (!p)
                                 return;
@@ -494,14 +527,36 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                 p->imm2 = simm;
                 return;
 
-        case 0x3a:                                      /* SWC2 rt,imm(rs) */
+        case 0x3a: {                                    /* SWC2 rt,imm(rs) */
+                unsigned reg = rt;
+
+                /* SWC2 IS AN MFC2 WITH A MEMORY DESTINATION.
+                 *
+                 * lightrec runs the value through `rec_cp2_do_mfc2` before
+                 * storing it (emitter.c:1671-1686), and its interpreter
+                 * through `lightrec_mfc2` (lightrec.c:490) -- the same
+                 * narrowing, the same SXYP alias, the same computed IRGB.
+                 * fgl was loading the raw word.
+                 *
+                 * `SZ0`-`SZ3` and `OTZ` are the ones that bite: `gte_fpu.c`
+                 * writes them through a halfword member, so the top half of
+                 * the word is whatever was there before.  A game that does
+                 * `swc2 $19` to spill a depth gets that garbage, and Spyro
+                 * turns the depth into an ordering-table index -- which then
+                 * runs off the end of the table and hands the display-list
+                 * builder a wild pointer. */
+                if (reg == 15u)
+                        reg = 14u;
+
                 p = ir_node_new(c, IR_SWC2, pc);
                 if (!p)
                         return;
                 p->rs = (uint8_t)rs;
-                p->imm = cop2_disp(rt, 0);
+                p->imm = cop2_disp(reg, 0);
                 p->imm2 = simm;
+                p->sub = (uint8_t)cop2_read_kind(reg);
                 return;
+        }
 
         default:
                 c->unknown = 1;                         /* skipped, not trapped */
@@ -699,6 +754,49 @@ int ir_shadow_pending(const ir_ctx *c, uint32_t insn, int mark)
  * reads what the pending load writes, move the load node after it.  Returns
  * non-zero if it did, because the array order and the decode order have then
  * parted company and the caller must stop tracking. */
+/* MAY A PENDING LOAD SHADOW BE CARRIED ACROSS A SWAPPED DELAY SLOT?
+ *
+ * After `lightrec_switch_delay_slots` the list reads slot-then-branch while
+ * the machine runs branch-then-slot, so a load sitting in front of the pair
+ * has the BRANCH in its shadow, not the slot.  The slot has to be stepped
+ * over with the shadow still pending, which is only sound if the slot neither
+ * reads the register the load is about to write nor writes memory the load is
+ * about to read -- the two things the rotation in `ir_shadow_fix` would get
+ * wrong once the load moves past it. */
+int ir_slot_holds_shadow(uint32_t slot, uint32_t load)
+{
+        unsigned rd = (load >> 16) & 31;        /* the load's destination */
+        unsigned rb = (load >> 21) & 31;        /* and its base           */
+
+        /* The rotation runs the WHOLE load last -- its memory read as well
+         * as its register write -- so three separate things have to still be
+         * true once the slot has run ahead of it.
+         *
+         * The slot must not READ rd: in machine order the slot is two
+         * instructions after the load and owes the new value, but the
+         * rotation would hand it the old one.
+         *
+         * The slot must not WRITE rd: the load's write lands after the slot's
+         * and would clobber it, where the hardware retires the load's write
+         * first and leaves the slot's standing.
+         *
+         * The slot must not WRITE rb: the load's ADDRESS is computed where
+         * the node sits, so moving it past a write to its own base makes it
+         * read through a pointer that did not exist when it issued.  That is
+         * a wild load, and whatever it lands in rd is a wild pointer for
+         * whoever dereferences it next.
+         *
+         * And it must not write memory, for the reason `ir_shadow_fix` gives
+         * where it splits the load instead of moving it. */
+        if (ir_reads(slot, rd))
+                return 0;
+        if (mips_writes(slot, rd) || mips_writes(slot, rb))
+                return 0;
+        if (mips_writes_state(slot))
+                return 0;
+        return 1;
+}
+
 int ir_shadow_fix(ir_ctx *c, int pend, uint32_t load, uint32_t insn, int mark)
 {
         unsigned rd = (load >> 16) & 31;        /* the load's destination */
