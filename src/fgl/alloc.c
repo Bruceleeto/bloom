@@ -12,6 +12,7 @@
 #include "alloc.h"
 #include "fgl.h"
 #include "fgl_state.h"
+#include "pins.h"
 
 /* THE POOL HAS TO OUTNUMBER WHAT ONE NODE CAN WANT AT ONCE, or a node's own
  * allocation evicts one of its own operands — the emitter still holds the host
@@ -30,31 +31,45 @@ _Static_assert(ALLOC_N >= 5, "a node can want four registers and a scratch");
  * and a short block never disturbs a pinned register at all.  They are also
  * the three the block-boundary services use as working storage, which is only
  * safe because nothing is live in them when a block begins or ends. */
-/* PINNING IS OFF, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT.
+/* PINNING IS ON.  The assignment lives in pins.h, which the dispatcher also
+ * reads; this is only its per-slot form, where index k means host register
+ * ALLOC_FIRST + k.
  *
- * A pinned guest register is one a block assumes it was HANDED, in a host
- * register, by whoever branched to it -- no preload at entry, no writeback at
- * exit. It is worth real instructions, and it is also a contract between two
- * blocks that were compiled separately.
+ * ONE OF THE TWO REASONS IT USED TO BE OFF IS GONE and one is not.
  *
- * Two reasons it stays off for now:
+ *   - "The dispatcher does not exist."  It does now (dispatch.S).  It touches
+ *     r0, r1 and r2 and nothing else, so a pinned register survives a trip
+ *     through the loop; every route that reaches C publishes and reloads at a
+ *     site marked PIN.
+ *   - "Nothing can check it."  Still true.  The oracle runs one block cold and
+ *     reads the registers out, so a cross-block register handshake is
+ *     invisible to it by construction.  This is a HARDWARE-checked feature.
+ *     Do not read an oracle pass as evidence about pinning either way.
  *
- *   - Nothing can check it yet. The oracle runs one block, cold, and reads
- *     the registers out; a cross-block register handshake is invisible to it
- *     by construction. Turning this on would make the oracle report failures
- *     for correct code and, worse, hide real ones behind the noise.
- *   - lightrec enters blocks through a code LUT from arbitrary predecessors,
- *     including the interpreter and the exception path. Every one of those
- *     entries has to honour the same assignment or the block reads garbage.
- *     That is the dispatcher's problem, and the dispatcher does not exist.
- *
- * The mechanism is intact: put the guest register numbers back and the
- * allocator uses them again. Revisit once blocks link directly, and expect to
- * need a hardware check rather than an oracle one. */
+ * Set FGL_NUM_PINS to 0 to put it back.  That is the A/B that separates a
+ * pinning bug from an emitter bug, and it needs to keep working. */
+#define PIN_SLOT(host) ((host) - ALLOC_FIRST)
+
 const int8_t ir_pin[ALLOC_N] = {
-        -1, -1, -1, -1,         /* r3-r6  */
-        -1, -1, -1, -1,         /* r7-r10 */
-        -1, -1                  /* r11-r12 */
+        [0 ... ALLOC_N - 1] = -1,
+#if FGL_NUM_PINS > 0
+        [PIN_SLOT(FGL_PIN0_HOST)] = FGL_PIN0_GUEST,
+#endif
+#if FGL_NUM_PINS > 1
+        [PIN_SLOT(FGL_PIN1_HOST)] = FGL_PIN1_GUEST,
+#endif
+#if FGL_NUM_PINS > 2
+        [PIN_SLOT(FGL_PIN2_HOST)] = FGL_PIN2_GUEST,
+#endif
+#if FGL_NUM_PINS > 3
+        [PIN_SLOT(FGL_PIN3_HOST)] = FGL_PIN3_GUEST,
+#endif
+#if FGL_NUM_PINS > 4
+        [PIN_SLOT(FGL_PIN4_HOST)] = FGL_PIN4_GUEST,
+#endif
+#if FGL_NUM_PINS > 5
+        [PIN_SLOT(FGL_PIN5_HOST)] = FGL_PIN5_GUEST,
+#endif
 };
 
 /* ---------------------------------------------------------------- */

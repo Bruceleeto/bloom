@@ -65,6 +65,77 @@
  */
 
 #include "fgl_state.h"
+#include "pins.h"
+
+/* THE PINNED REGISTERS, PUBLISHED AND RELOADED.
+ *
+ * Generated code holds the guest registers named in pins.h in host registers
+ * and does not write them back per block -- that is what pinning is.  C reads
+ * and writes them through the state block, so every crossing here has to put
+ * them where C looks and take back what C left.
+ *
+ * Two instructions each way per pin: `@(disp,GBR)` has no destination but r0,
+ * and r0 is free at all of these sites because the dispatcher owns it.
+ *
+ * PIN_PUBLISH before a crossing; PIN_LOAD after one that could have WRITTEN a
+ * guest register, and at the entry from C where the registers are filled for
+ * the first time.  Which crossings write is not a guess: `.Lcompile` runs the
+ * first-pass interpreter, `_fgl_dispatch_interpreter` runs guest code, and
+ * `_fgl_dispatch_ds_check` assigns `regs.gpr[reg]` (lightrec.c:971).  The
+ * memset service reads $a0/$a1 and writes neither. */
+.macro	PIN_PUBLISH
+#if FGL_NUM_PINS > 0
+	mov	r\()FGL_PIN0_HOST, r0
+	mov.l	r0, @(FGL_PIN0_GUEST * 4, gbr)
+#endif
+#if FGL_NUM_PINS > 1
+	mov	r\()FGL_PIN1_HOST, r0
+	mov.l	r0, @(FGL_PIN1_GUEST * 4, gbr)
+#endif
+#if FGL_NUM_PINS > 2
+	mov	r\()FGL_PIN2_HOST, r0
+	mov.l	r0, @(FGL_PIN2_GUEST * 4, gbr)
+#endif
+#if FGL_NUM_PINS > 3
+	mov	r\()FGL_PIN3_HOST, r0
+	mov.l	r0, @(FGL_PIN3_GUEST * 4, gbr)
+#endif
+#if FGL_NUM_PINS > 4
+	mov	r\()FGL_PIN4_HOST, r0
+	mov.l	r0, @(FGL_PIN4_GUEST * 4, gbr)
+#endif
+#if FGL_NUM_PINS > 5
+	mov	r\()FGL_PIN5_HOST, r0
+	mov.l	r0, @(FGL_PIN5_GUEST * 4, gbr)
+#endif
+.endm
+
+.macro	PIN_LOAD
+#if FGL_NUM_PINS > 0
+	mov.l	@(FGL_PIN0_GUEST * 4, gbr), r0
+	mov	r0, r\()FGL_PIN0_HOST
+#endif
+#if FGL_NUM_PINS > 1
+	mov.l	@(FGL_PIN1_GUEST * 4, gbr), r0
+	mov	r0, r\()FGL_PIN1_HOST
+#endif
+#if FGL_NUM_PINS > 2
+	mov.l	@(FGL_PIN2_GUEST * 4, gbr), r0
+	mov	r0, r\()FGL_PIN2_HOST
+#endif
+#if FGL_NUM_PINS > 3
+	mov.l	@(FGL_PIN3_GUEST * 4, gbr), r0
+	mov	r0, r\()FGL_PIN3_HOST
+#endif
+#if FGL_NUM_PINS > 4
+	mov.l	@(FGL_PIN4_GUEST * 4, gbr), r0
+	mov	r0, r\()FGL_PIN4_HOST
+#endif
+#if FGL_NUM_PINS > 5
+	mov.l	@(FGL_PIN5_GUEST * 4, gbr), r0
+	mov	r0, r\()FGL_PIN5_HOST
+#endif
+.endm
 
 	.text
 	.align	2
@@ -104,7 +175,8 @@ _fgl_dispatch:
 	mov	r0, r13				/* the guest address mask */
 	mov	r5, r2				/* the PC to run */
 
-	/* PIN: preload the pinned guest registers here. */
+	/* Filled for the first time; from here they live in registers. */
+	PIN_LOAD
 
 	/* Into the loop BELOW the cycle test.
 	 *
@@ -273,6 +345,11 @@ _fgl_dispatch_compile:
 	bsr	.Lsync_out
 	 nop
 
+	/* ENABLE_FIRST_PASS makes `get_next_block` INTERPRET the block before
+	 * compiling it, so this crossing reads and writes guest registers like
+	 * any other run of guest code -- it is not merely the compiler. */
+	PIN_PUBLISH
+
 	stc	gbr, r4				/* arg0: the state */
 	mov.l	@(FGL_AT_CURR_PC * 4, gbr), r0
 	mov	r0, r5				/* arg1: the guest PC */
@@ -289,6 +366,8 @@ _fgl_dispatch_compile:
 	mov.l	@(FGL_AT_CURR_PC * 4, gbr), r0
 	mov	r0, r2
 
+	PIN_LOAD
+
 	mov.l	@r15+, r1
 	tst	r1, r1
 	bt	.Lexit				/* C could not produce a block */
@@ -303,7 +382,7 @@ _fgl_dispatch_compile:
 	bsr	.Lsync_out
 	 nop
 
-	/* PIN: publish the pinned guest registers here. */
+	PIN_PUBLISH
 
 	mov	r14, r1				/* the return value */
 
@@ -348,8 +427,9 @@ _fgl_dispatch_compile:
  * ------------------------------------------------------------------------- */
 	.globl	_fgl_dispatch_memset
 _fgl_dispatch_memset:
-	/* PIN: publish the pinned guest registers here -- $a0 and $a1 at the
-	 * very least, which is what C is about to read. */
+	/* $a0 and $a1 are what `lightrec_memset` reads (lightrec.c:941).  It
+	 * writes no guest register, so there is no reload. */
+	PIN_PUBLISH
 
 	stc	gbr, r4				/* arg0: the state */
 	mov.l	.Lmemset, r0
@@ -389,8 +469,8 @@ _fgl_dispatch_interpreter:
 	bsr	.Lsync_out
 	 nop
 
-	/* PIN: publish the pinned guest registers here -- the interpreter is
-	 * about to read and write every one of them. */
+	/* The interpreter reads and writes every one of them. */
+	PIN_PUBLISH
 
 	mov	r2, r6				/* arg2: the branch's PC */
 	mov	r1, r5				/* arg1: the block */
@@ -403,6 +483,8 @@ _fgl_dispatch_interpreter:
 
 	bsr	.Lsync_in
 	 nop
+
+	PIN_LOAD
 
 	bra	_fgl_dispatch_loop
 	 nop
@@ -431,7 +513,7 @@ _fgl_dispatch_ds_check:
 	bsr	.Lsync_out
 	 nop
 
-	/* PIN: publish the pinned guest registers here. */
+	PIN_PUBLISH
 
 	mov	r1, r6				/* arg2: the guest register */
 	mov	r2, r5				/* arg1: the branch target */
@@ -443,6 +525,10 @@ _fgl_dispatch_ds_check:
 
 	bsr	.Lsync_in
 	 nop
+
+	/* C assigned `regs.gpr[reg]` (lightrec.c:971), so a pinned register
+	 * may be the one it wrote. */
+	PIN_LOAD
 
 	bra	_fgl_dispatch_loop
 	 nop

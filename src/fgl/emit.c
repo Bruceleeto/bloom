@@ -10,6 +10,7 @@
 
 #include "fgl.h"
 #include "fgl_state.h"
+#include "pins.h"
 
 #include <string.h>
 
@@ -1185,6 +1186,95 @@ static void emit_hw_store(fgl_emitter *e, const ir_node *p)
  * anywhere else: an unproven address can reach a device, a device can raise
  * an interrupt, and an interrupt is delivered by moving `target_cycle` in
  * memory where a register cannot see it. */
+/* PUBLISH AND RELOAD, THE TWO HALVES OF THE PINNING CONTRACT AT A C CROSSING.
+ *
+ * C reads and writes guest registers through the state block and knows nothing
+ * about r9-r12, so a node that calls a service has to put the pinned values
+ * where C will look and take back whatever C left there.  Which nodes those
+ * are is not a judgement call: it is exactly the set the allocator flushes at
+ * (alloc.c, the IR_MTC_C/IR_MFC2_C/IR_RFE/IR_RW case), and the flush is what
+ * makes an UNCONDITIONAL publish correct here -- after it, every pinned host
+ * register is holding its own guest register again, so storing all of them
+ * needs no per-node liveness.
+ *
+ * Two instructions each way per pin, because `@(disp,GBR)` has no destination
+ * but r0.  That is why this is affordable only at the crossings: it would be
+ * ruinous per block, and per block is exactly what pinning removes.
+ *
+ * BOTH RUN BEFORE r0 IS LOADED WITH ANYTHING, or after it has been consumed.
+ * The publish is the first thing a service node emits and the reload the last,
+ * so the callee address and the arguments are never live across either.
+ *
+ * A CROSSING WITHOUT A PUBLISH DOES NOT CRASH.  It hands C a stale register
+ * and the guest drifts somewhere else entirely, so add one to the list here
+ * whenever a new service is added; `grep emit_publish_pinned` is the check. */
+static void emit_publish_pinned(fgl_emitter *e)
+{
+#if FGL_NUM_PINS > 0
+	static const struct { uint8_t host, guest; } pin[FGL_NUM_PINS] = {
+		{ FGL_PIN0_HOST, FGL_PIN0_GUEST },
+#if FGL_NUM_PINS > 1
+		{ FGL_PIN1_HOST, FGL_PIN1_GUEST },
+#endif
+#if FGL_NUM_PINS > 2
+		{ FGL_PIN2_HOST, FGL_PIN2_GUEST },
+#endif
+#if FGL_NUM_PINS > 3
+		{ FGL_PIN3_HOST, FGL_PIN3_GUEST },
+#endif
+#if FGL_NUM_PINS > 4
+		{ FGL_PIN4_HOST, FGL_PIN4_GUEST },
+#endif
+#if FGL_NUM_PINS > 5
+		{ FGL_PIN5_HOST, FGL_PIN5_GUEST },
+#endif
+	};
+	unsigned i;
+
+	for (i = 0; i < FGL_NUM_PINS; i++) {
+		sh4_emit_mov_reg(&e->cg, pin[i].host, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(pin[i].guest));
+	}
+#else
+	(void)e;
+#endif
+}
+
+/* The other half.  Only for a service that RETURNS INTO THE BLOCK -- a node
+ * that leaves for good (IR_STOP, IR_EXIT) publishes and does not reload,
+ * because the next block's entry is where the pinned registers come from. */
+static void emit_reload_pinned(fgl_emitter *e)
+{
+#if FGL_NUM_PINS > 0
+	static const struct { uint8_t host, guest; } pin[FGL_NUM_PINS] = {
+		{ FGL_PIN0_HOST, FGL_PIN0_GUEST },
+#if FGL_NUM_PINS > 1
+		{ FGL_PIN1_HOST, FGL_PIN1_GUEST },
+#endif
+#if FGL_NUM_PINS > 2
+		{ FGL_PIN2_HOST, FGL_PIN2_GUEST },
+#endif
+#if FGL_NUM_PINS > 3
+		{ FGL_PIN3_HOST, FGL_PIN3_GUEST },
+#endif
+#if FGL_NUM_PINS > 4
+		{ FGL_PIN4_HOST, FGL_PIN4_GUEST },
+#endif
+#if FGL_NUM_PINS > 5
+		{ FGL_PIN5_HOST, FGL_PIN5_GUEST },
+#endif
+	};
+	unsigned i;
+
+	for (i = 0; i < FGL_NUM_PINS; i++) {
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)GUEST_AT(pin[i].guest));
+		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, pin[i].host);
+	}
+#else
+	(void)e;
+#endif
+}
+
 static void emit_rw(fgl_emitter *e, const ir_node *p)
 {
 	int rs = p->sc[0];
@@ -1195,11 +1285,13 @@ static void emit_rw(fgl_emitter *e, const ir_node *p)
 		return;
 	}
 
+	emit_publish_pinned(e);
 	emit_const(e, e->tgt->rw, FGL_R_XFER);
 	emit_const(e, p->imm, FGL_R_T1);        /* the guest instruction word */
 	emit_const(e, e->tgt->shim_call, rs);
 	sh4_emit_jsr(&e->cg, rs);
 	sh4_emit_nop(&e->cg);                   /* delay slot */
+	emit_reload_pinned(e);
 }
 
 /* Does this access reach a device rather than memory?
@@ -1495,6 +1587,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 			e->unsupported_op = p->op;
 			break;
 		}
+		emit_publish_pinned(e);
 		emit_const(e, e->tgt->mtc, FGL_R_XFER);
 		emit_const(e, p->imm, FGL_R_T1);   /* the guest instruction */
 		emit_const(e, e->tgt->shim_call, rs);
@@ -1633,11 +1726,18 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 			e->unsupported_op = p->op;
 			break;
 		}
+		/* `fgl_mfc` WRITES the destination guest register into the
+		 * state block, so this one reloads as well as publishes.
+		 * `fgl_mtc` above only reads, and `lightrec_rfe` touches cop0
+		 * alone -- which is why neither of those reloads and IR_RFE
+		 * does not publish at all. */
+		emit_publish_pinned(e);
 		emit_const(e, e->tgt->mfc, FGL_R_XFER);
 		emit_const(e, p->imm, FGL_R_T1);
 		emit_const(e, e->tgt->shim_call, rs);
 		sh4_emit_jsr(&e->cg, rs);
 		sh4_emit_nop(&e->cg);
+		emit_reload_pinned(e);
 		break;
 
 	case IR_MTC2:
