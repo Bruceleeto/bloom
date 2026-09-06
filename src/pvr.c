@@ -28,6 +28,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "overlay.h"
+#include "perf.h"
 #include "pvr.h"
 
 #if ENABLE_THREADED_RENDERER
@@ -2424,29 +2425,6 @@ static bool poly_should_clip(const struct poly *poly)
 __pvr __attribute__((optimize(2)))
 static void process_poly(struct poly *poly, bool scissor)
 {
-	/* TEMPORARY: does the guest draw anything at all?  The only signal
-	 * that separates "booted" from "alive but rendering nothing", and it
-	 * arrives in the first second of a working boot. */
-	{	/* TEMPORARY: a heartbeat, ten reports ten seconds apart.
-		 * The clock is only read once per 1024 polys -- this sits in
-		 * the hot path and `timer_ms_gettime64` is not free. */
-		static unsigned long long next_ms;
-		static unsigned n, reports;
-
-		if (!(++n & 1023) && reports < 10) {
-			unsigned long long now = timer_ms_gettime64();
-
-			if (!next_ms)
-				next_ms = now + 10000;
-			if (now >= next_ms) {
-				reports++;
-				next_ms = now + 10000;
-				fprintf(stderr, "POLY %u drawn at %llu s\n",
-					n, now / 1000);
-			}
-		}
-	}
-
 	struct texture_page *page;
 	unsigned int i, offt;
 	uint16_t umin, umax;
@@ -3096,6 +3074,7 @@ static void process_gpu_commands(void)
 int do_cmd_list(uint32_t *list, int list_len,
 		int *cycles_sum_out, int *cycles_last, int *last_cmd)
 {
+	PERF_BEGIN(PERF_GPU);
 	bool multicolor, multiple, textured;
 	int cpu_cycles_sum = 0, cpu_cycles = *cycles_last;
 	uint32_t cmd = 0, len;
@@ -3229,6 +3208,7 @@ out:
 	*cycles_sum_out += cpu_cycles_sum;
 	*cycles_last = cpu_cycles;
 	*last_cmd = cmd;
+	PERF_END(PERF_GPU);
 	return list - list_start;
 }
 

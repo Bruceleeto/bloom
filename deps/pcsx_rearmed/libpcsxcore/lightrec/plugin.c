@@ -29,6 +29,7 @@
 
 #include "bloom-config.h"
 #include "gte_fpu.h"
+#include "perf.h"
 
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
@@ -679,7 +680,11 @@ static void lightrec_plugin_execute_internal(bool block_only)
 	u32 old_pc = psxRegs.pc;
 
 	regs = lightrec_get_registers(lightrec_state);
-	gen_interupt((psxCP0Regs *)regs->cp0);
+	{
+		PERF_BEGIN(PERF_EVENT);
+		gen_interupt((psxCP0Regs *)regs->cp0);
+		PERF_END(PERF_EVENT);
+	}
 	if (!block_only && psxRegs.stop)
 		return;
 
@@ -721,9 +726,12 @@ static void lightrec_plugin_execute_internal(bool block_only)
 								  psxRegs.pc);
 				} while (lightrec_current_cycle_count(lightrec_state) < end
 					 && !lightrec_exit_flags(lightrec_state));
-			} else
+			} else {
+			PERF_BEGIN(PERF_CPU);
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
+			PERF_END(PERF_CPU);
+			}
 #ifdef __sh__
 			__asm__ __volatile__("ldc %0, gbr" : : "r"(saved_gbr));
 #endif

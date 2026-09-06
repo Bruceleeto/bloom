@@ -887,17 +887,14 @@ static unsigned fgl_n_links;
 unsigned fgl_link_patched, fgl_link_uncompiled, fgl_link_range, fgl_link_undone;
 unsigned fgl_link_calls;
 
-/* `calls` is the one that says whether this is working.  A patched edge never
+/* `calls` IS THE ONE THAT SAYS WHETHER THIS IS WORKING.  A patched edge never
  * comes back here, so in a machine that is linking well the call count goes
  * quiet while the frame counter keeps moving; a call count that tracks the
- * frame rate means the links are being torn down as fast as they are made. */
-static void fgl_link_report(void)
-{
-	fprintf(stderr, "fgl links: calls %u  near %u  far %u  "
-		"uncompiled %u  undone %u\n",
-		fgl_link_calls, fgl_link_patched, fgl_link_range,
-		fgl_link_uncompiled, fgl_link_undone);
-}
+ * frame rate means the links are being torn down as fast as they are made.
+ *
+ * Nothing prints them -- they are read from a debugger, or by a printf added
+ * for one run.  A per-second report was here and was noise once the mechanism
+ * was known to work. */
 
 void fgl_unlink_all(struct lightrec_state *state)
 {
@@ -941,8 +938,7 @@ u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
 	void *slot = lut_read(state, lut_offset(target));
 	int32_t d;
 
-	if ((++fgl_link_calls & 0x3f) == 0)
-		fgl_link_report();
+	fgl_link_calls++;
 
 	if (!slot) {
 		fgl_link_uncompiled++;

@@ -23,6 +23,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "overlay.h"
+#include "perf.h"
 #include "pvr.h"
 
 #define MAX_LAG_FRAMES 3
@@ -36,6 +37,14 @@
 
 static unsigned int frames;
 static uint64_t timer_ms;
+
+uint64_t bloom_perf_us[PERF_N];
+uint32_t bloom_perf_cnt[PERF_N];
+
+uint64_t bloom_perf_now(void)
+{
+	return timer_us_gettime64();
+}
 /* Whether the PVR, and not the emulator, is what the frame is waiting on.
  * Read by the renderer: cutting PVR work is only worth VRAM when this is
  * true (src/pvr.c, rtt_update_alloc). */
@@ -197,6 +206,51 @@ static inline void copy24(const uint16_t *vram, int w, int h)
 	}
 }
 
+/* One line a second, next to the fps counter, over the same window.
+ *
+ * Percentages of WALL TIME, not of each other, so they do not add to 100 and
+ * are not meant to: `jit` overlaps everything (it is another thread) and
+ * `other` is what is left after the four brackets.  The per-call figures are
+ * what say whether a bucket got slower or merely got called more -- a change
+ * that halves the dispatch count and leaves the microseconds alone has moved
+ * nothing. */
+static void bloom_perf_report(uint64_t window_ms, unsigned int nframes)
+{
+	uint64_t wall_us = window_ms * 1000u;
+	uint64_t sum;
+	unsigned int i;
+
+	if (!nframes || !wall_us)
+		return;
+
+	sum = bloom_perf_us[PERF_CPU] + bloom_perf_us[PERF_EVENT]
+	    + bloom_perf_us[PERF_GPU] + bloom_perf_us[PERF_FLIP];
+
+	printf("perf %5.1f fps %6.2f ms/f | cpu %4.1f%% (%5.2f ms/f, %u/f) "
+	       "gpu %4.1f%% (%5.2f ms/f, %u/f) flip %4.1f%% (%5.2f ms/f) "
+	       "evt %4.1f%% (%5.2f ms/f) other %4.1f%% | jit %4.1f%% (%u blk)\n",
+	       (float)nframes * 1000.0f / (float)window_ms,
+	       (float)window_ms / (float)nframes,
+	       100.0f * bloom_perf_us[PERF_CPU] / wall_us,
+	       bloom_perf_us[PERF_CPU] / 1000.0f / nframes,
+	       bloom_perf_cnt[PERF_CPU] / nframes,
+	       100.0f * bloom_perf_us[PERF_GPU] / wall_us,
+	       bloom_perf_us[PERF_GPU] / 1000.0f / nframes,
+	       bloom_perf_cnt[PERF_GPU] / nframes,
+	       100.0f * bloom_perf_us[PERF_FLIP] / wall_us,
+	       bloom_perf_us[PERF_FLIP] / 1000.0f / nframes,
+	       100.0f * bloom_perf_us[PERF_EVENT] / wall_us,
+	       bloom_perf_us[PERF_EVENT] / 1000.0f / nframes,
+	       100.0f * (wall_us > sum ? wall_us - sum : 0) / wall_us,
+	       100.0f * bloom_perf_us[PERF_JIT] / wall_us,
+	       bloom_perf_cnt[PERF_JIT]);
+
+	for (i = 0; i < PERF_N; i++) {
+		bloom_perf_us[i] = 0;
+		bloom_perf_cnt[i] = 0;
+	}
+}
+
 static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			 int x, int y, int w, int h, int dims_changed)
 {
@@ -210,6 +264,8 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 
 	if (!started || !vram)
 		return;
+
+	PERF_BEGIN(PERF_FLIP);
 
 	if (HARDWARE_ACCELERATED && !frame_was_24bpp) {
 		/* Render the old frame */
@@ -296,6 +352,8 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 
 	frame_was_24bpp = bgr24;
 
+	PERF_END(PERF_FLIP);
+
 	new_timer = timer_ms_gettime64();
 
 	frames++;
@@ -306,6 +364,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	}
 
 	if (new_timer > (timer_ms + 1000)) {
+		bloom_perf_report(new_timer - timer_ms, frames);
 		pvr_get_stats(&pvr_stats);
 
 		cputime = timer_ms_gettime64();

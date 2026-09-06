@@ -29,6 +29,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include "perf.h"
 
 /*
  * Bumped on every write to a COP2 control register, wherever the write comes
@@ -1257,8 +1258,10 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	 * own.  Correct, and slower than it needs to be -- see the note in
 	 * fgl_compile_block.
 	 */
+	PERF_BEGIN(PERF_JIT);
 	new_fn = fgl_compile_block(cstate, block, &block->code_size, &err,
 				   entries, &nb_entries);
+	PERF_END(PERF_JIT);
 	if (!new_fn) {
 		if (err == -ENOMEM) {
 			if (!ENABLE_THREADED_COMPILER)
