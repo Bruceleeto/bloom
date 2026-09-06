@@ -87,7 +87,7 @@ static void patch_fwd12(fgl_emitter *e, int site)
  * Spyro hardware, matched steady rows: 0 is 56.3 ms/f, 1 is 47.9, 2 is 43.5,
  * and every millisecond of that came out of the emitted-code bucket.
  *
- * MODE 2 IS THE REASON `emit_publish_pc` EXISTS.  With one site a block still
+ * MODE 2 IS WHY `curr_pc` HAD TO BE PUBLISHED AT ALL.  With one site a block still
  * leaves through the dispatcher on its other arm; with two it stops visiting
  * the dispatcher at all, and everything the dispatcher did on the way in has
  * to be done at the site instead.  Adding a mode here means asking what else
@@ -110,43 +110,61 @@ static void patch_fwd12(fgl_emitter *e, int site)
  * The length is deliberately a multiple of four, so that a second site placed
  * immediately after a first is still longword aligned and its pad costs
  * nothing.  Conditional linking emits two of these back to back. */
-/* PUBLISH THE GUEST PC, THE WAY THE DISPATCHER DOES.
+/* PUBLISH THE GUEST PC, WHERE THE ONE THING THAT READS IT CAN SEE IT.
  *
  * `_fgl_dispatch_loop` stores r2 into `curr_pc` as its FIRST act, before the
  * budget test and before the table lookup, on every single block entry.  A
- * linked edge does not pass through it, so a linked edge does not publish --
- * and while a chain is running, `curr_pc` names whichever block last went the
- * long way round.
+ * linked edge does not pass through it, so while a chain is running `curr_pc`
+ * names whichever block last went the long way round.
  *
  * ONE SITE HID THIS AND TWO SITES DID NOT.  A conditional with a single site
  * still leaves through the dispatcher on its other arm, so the value goes
  * stale for one edge and is put right again almost immediately.  Give the
- * block a site on BOTH arms and it need never reach the dispatcher again
- * until its timeslice runs out -- `curr_pc` then sits frozen across a whole
- * budget's worth of guest execution, and everything that reads it while a
- * chain is running reads a lie.  That is measured, not argued: with both arms
- * linked the game boots when the stub returns 0 and sends the edge round the
- * dispatcher, and faults when it returns the target and the edge goes direct.
+ * block a site on BOTH arms and it need never reach the dispatcher again until
+ * its timeslice runs out, and the stale value is read.  That was measured, not
+ * argued: with both arms linked the game booted when the stub returned 0 and
+ * faulted when the edge went direct.
+ *
+ * SO IT MOVED TO THE READER INSTEAD OF THE EDGE.  Exactly one thing reads
+ * `curr_pc` without first passing through the dispatcher, and it is
+ * `lightrec_rw_generic_cb` -- `find_block_from_lut(.., state->curr_pc)`, which
+ * exits SEGFAULT when the PC names a block several hops back.  Every other
+ * reader (dispatch.S at the compile, service and interpreter crossings,
+ * `lightrec_execute`'s return, `plugin.c`'s inline service) is on a path the
+ * dispatcher republishes on the way in.  `emit_rw` is the only node that
+ * reaches the generic path, so the publish belongs there.
+ *
+ * IT IS A CONSTANT, NOT r2.  r2 is the EXIT PC, and a block holds more than
+ * one branch: after the first of them r2 names somewhere the block has not
+ * reached yet, so a later `rw` publishing r2 sends the lookup to the wrong
+ * block, which returns the wrong opcode and writes the wrong guest register.
+ * That is a silent corruption, not a crash -- it surfaced as an address error
+ * several blocks later on a pointer the guest never computed.  `p->pc` is the
+ * address of this very instruction, always inside the block by construction,
+ * and `find_block_from_lut` wants any address in range rather than the entry.
+ *
+ * WHAT THAT IS WORTH.  On the edge it was two instructions on every
+ * block-to-block link -- 21.4M of them, 3.9% of everything executed in the
+ * Spyro savestate scene.  At the reader it sits beside a full register flush
+ * and a call and costs 8,810 instructions in total.
+ *
+ * A CLEAN RUN AFTER DELETING IT OUTRIGHT IS NOT EVIDENCE IT IS DEAD.  The
+ * generic path is the re-optimisation fallback and barely fires; removing the
+ * publish altogether also runs cycle-identical for a long while.
  *
  * Two instructions, because `mov.l @(disp,GBR)` can only name r0 -- and r0 is
- * FGL_R_XFER, which the site below reloads on its very next instruction, so
- * there is nothing to preserve.  Both are `mov`, so the T bit the arm branch
- * above just consumed is not disturbed either.
- *
- * IT SITS OUTSIDE THE PATCHED LONGWORD, deliberately.  The patcher rewrites
- * site+0..3 and nothing else, so putting the publish ahead of the site keeps
- * it on the path for the life of the edge, patched or not.  It is also four
- * bytes, which leaves the site's alignment exactly as it was. */
-static void emit_publish_pc(fgl_emitter *e)
+ * FGL_R_XFER, which the caller reloads on its very next instruction, so there
+ * is nothing to preserve.  Both are `mov`, so no T bit is disturbed either. */
+static void emit_const(fgl_emitter *e, uint32_t v, int rn);
+
+static void emit_publish_pc(fgl_emitter *e, uint32_t pc)
 {
-	sh4_emit_mov_reg(&e->cg, FGL_R_EXIT, FGL_R_XFER);
+	emit_const(e, pc, FGL_R_XFER);
 	sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_CURR_PC);
 }
 
 static void emit_link_site(fgl_emitter *e)
 {
-	emit_publish_pc(e);
-
 	if ((e->base + fgl_size(e)) & 3)
 		sh4_emit_nop(&e->cg);          /* pad: the site is 4-aligned */
 
@@ -1389,6 +1407,12 @@ static void emit_rw(fgl_emitter *e, const ir_node *p)
 	}
 
 	emit_publish_pinned(e);
+
+	/* The PC the generic path looks this block up by.  BEFORE the operands,
+	 * because it goes through r0 and r0 is about to become the first of
+	 * them.  r2 still holds what the block was entered at. */
+	emit_publish_pc(e, p->pc);
+
 	emit_const(e, e->tgt->rw, FGL_R_XFER);
 	emit_const(e, p->imm, FGL_R_T1);        /* the guest instruction word */
 	emit_const(e, e->tgt->shim_call, rs);

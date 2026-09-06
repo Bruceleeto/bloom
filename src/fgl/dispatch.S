@@ -505,6 +505,24 @@ _fgl_dispatch_memset:
 	 nop
 	sub	r0, r14				/* charge what the memset cost */
 
+#if FGL_GBASE
+	/* r3 is caller-saved and this door calls C without going through
+	 * `.Lsync_in`, which is where every other door rebuilds it. */
+	stc	gbr, r3
+#endif
+
+	/* AND THE PINS, FOR THE SAME REASON THE OTHER DOORS RELOAD THEM.
+	 *
+	 * `lightrec_memset` writes no guest register, so this is not about
+	 * stale values -- it is about r7.  FGL_PIN3_HOST is r7, which is
+	 * CALLER-saved: compiled C may destroy it and is entitled to, which is
+	 * why `fgl_link_stub` saves it by hand.  This door did neither, so a
+	 * memset block handed $a0 back as whatever `lightrec_memset` left in
+	 * r7.  Reloading all six is a handful of instructions on a path that
+	 * replaces a whole guest loop; saving only r7 would be one more place
+	 * to edit when the pin table moves. */
+	PIN_LOAD
+
 	/* PIN: $ra is a guest register like any other; if it is ever pinned
 	 * this must read the pinned copy rather than the state block. */
 	mov.l	@(31 * 4, gbr), r0		/* guest $ra */

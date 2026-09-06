@@ -1034,6 +1034,22 @@ u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
 	}
 
 	if (slot == (void *)(uintptr_t)state->get_next_block) {
+		/* THE SENTINEL IS AN ENTRY POINT, AND IT READS `curr_pc`.
+		 *
+		 * The stub `jmp`s straight to whatever comes back, so returning
+		 * this sends the edge into `_fgl_dispatch_compile` -- which
+		 * takes the guest PC out of the state block, because the
+		 * dispatcher's own route there has already destroyed r2 working
+		 * out the table index.  The loop publishes on its way in; a
+		 * linked edge never passes through the loop, so without this
+		 * the compile would run on whichever block last went the long
+		 * way round and enter the wrong one, silently.
+		 *
+		 * Here rather than in the stub because this is the only branch
+		 * that needs it: every other return is either 0, which goes
+		 * round the loop, or a real block entry, which is entered with
+		 * r2 and needs nothing. */
+		state->curr_pc = target;
 		fgl_link_uncompiled++;
 		return (u32)(uintptr_t)slot;
 	}
