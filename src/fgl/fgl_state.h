@@ -175,9 +175,23 @@
  * Two purposes that overlap in time need two words. */
 #define FGL_AT_SHIM_ARG      (FGL_AT_ADDR_MASK + 1u)                  /* +692 */
 
+/* THE LINK STUB, WHICH IS A DISPATCH THAT DELETES ITSELF.
+ *
+ * A block whose successor is a compile-time constant does not have to go round
+ * the dispatcher to reach it -- it can branch straight there.  It cannot do
+ * that when it is compiled, because the successor usually is not compiled yet,
+ * so the branch is emitted as a call to the stub whose address lives here and
+ * the stub REWRITES ITS OWN CALL SITE into a `bra` the first time it runs.
+ * After that the edge costs two instructions and no memory reference at all.
+ *
+ * It is a state-block word rather than a literal in each block's pool for the
+ * ordinary reason: one instruction to reach instead of one instruction plus
+ * four bytes of pool, on an edge that exists in nearly every block. */
+#define FGL_AT_LINK          (FGL_AT_SHIM_ARG + 1u)                   /* +696 */
+
 /* How many words of state block generated code can touch, so a harness knows
  * how much to allocate. */
-#define FGL_STATE_WORDS (FGL_AT_SHIM_ARG + 1u)
+#define FGL_STATE_WORDS (FGL_AT_LINK + 1u)
 
 /* The COP0 registers that are actually live.  Everything else reads zero and
  * discards writes. */

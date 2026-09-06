@@ -391,8 +391,14 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 
 			if (ENABLE_THREADED_COMPILER)
 				lightrec_recompiler_add(state->rec, block);
-			else
+			else {
+				/* Same reason as remove_from_code_lut: a
+				 * patched link does not go through the slot,
+				 * so clearing the slot alone would leave the
+				 * stale code reachable. */
+				fgl_unlink_all(state);
 				lut_write(state, lut_offset(block->pc), NULL);
+			}
 		}
 	}
 
@@ -924,6 +930,14 @@ static void lightrec_realloc_code(struct lightrec_state *state,
 
 void lightrec_free_code(struct lightrec_state *state, void *ptr)
 {
+	/* BEFORE THE FREE, AND THAT ORDER IS THE WHOLE POINT.  A patched link
+	 * is a `bra` baked into another block's code with no indirection left
+	 * to redirect, so the only way to take one back is to rewrite the site
+	 * -- and the site has to still be code we own when we do it.  Undoing
+	 * every link on any free is bloop's answer too (`blocks.h`): selective
+	 * invalidation is what direct linking costs. */
+	fgl_unlink_all(state);
+
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_code_alloc_lock(state);
 
@@ -2013,6 +2027,7 @@ struct lightrec_state * lightrec_init(char *argv0,
 	state->dispatch  = (u32)(uintptr_t)fgl_dispatch_loop;
 	state->lut_base  = (u32)(uintptr_t)state->code_lut;
 	state->addr_mask = 0x1fffffff;
+	state->link      = (u32)(uintptr_t)fgl_link_stub;
 
 	map = &maps[PSX_MAP_BIOS];
 	state->offset_bios = (uintptr_t)map->address - map->pc;

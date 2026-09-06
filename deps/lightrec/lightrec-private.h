@@ -203,6 +203,7 @@ struct lightrec_state {
 	u32 lut_base;				/* +684 */
 	u32 addr_mask;				/* +688 */
 	u32 shim_arg;				/* +692 */
+	u32 link;				/* +696 */
 	u8 in_delay_slot_n;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
@@ -510,6 +511,19 @@ void fgl_dispatch_compile(void);
 void fgl_dispatch_memset(void);
 void fgl_dispatch_interpreter(void);
 void fgl_dispatch_ds_check(void);
+
+/* THE SELF-PATCHING LINK.  `fgl_link_stub` is the address stored in
+ * `state->link`; a block with a constant successor calls it instead of going
+ * round the dispatcher, and it rewrites its own call site into a `bra` once
+ * the successor exists.  `fgl_unlink_all` puts every site it has patched back
+ * -- the price of a direct branch is that there is no indirection left to
+ * redirect, so anything that frees or invalidates code has to call this
+ * FIRST, while the sites are still live memory. */
+void fgl_link_stub(void);
+void fgl_unlink_all(struct lightrec_state *state);
+u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site);
+extern unsigned fgl_link_patched, fgl_link_uncompiled;
+extern unsigned fgl_link_range, fgl_link_undone, fgl_link_calls;
 
 /* What that assembly calls back into. The last three exist because lightrec's
  * own functions are static; see the comment on them in lightrec.c. */

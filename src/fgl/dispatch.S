@@ -137,6 +137,24 @@
 #endif
 .endm
 
+/* The one pin below r8, saved and restored by hand around a C call.
+ *
+ * r8-r15 are callee-saved in the SH-4 ABI, so five of the six pins survive a
+ * compiled call on their own.  FGL_PIN3 does not -- see pins.h on why it is
+ * there anyway -- so anything here that calls C without going through shim.S
+ * has to bracket the call with these. */
+.macro	PIN_CALLER_SAVE
+#if FGL_NUM_PINS > 3
+	mov.l	r\()FGL_PIN3_HOST, @-r15
+#endif
+.endm
+
+.macro	PIN_CALLER_RESTORE
+#if FGL_NUM_PINS > 3
+	mov.l	@r15+, r\()FGL_PIN3_HOST
+#endif
+.endm
+
 	.text
 	.align	2
 
@@ -534,6 +552,68 @@ _fgl_dispatch_ds_check:
 	 nop
 
 /* ---------------------------------------------------------------------------
+ * fgl_link_stub: the dispatch a linked edge uses ONCE.
+ *
+ * A block whose successor is a compile-time constant ends in
+ *
+ *      cmp/pl  r14                     <- the budget, moved out of the loop
+ *      bf      .Lout
+ *      [nop]                           <- pad, so the site is four-aligned
+ *  site+0  mov.l @(FGL_AT_LINK, gbr), r0
+ *  site+2  jsr   @r0
+ *  site+4  nop                         <- delay slot; PR is site+6
+ *  .Lout   the ordinary five-instruction epilogue
+ *
+ * and arrives here with the target guest PC in r2, exactly as it would have
+ * arrived at the loop.  `fgl_link_resolve` looks the target up and, when it is
+ * compiled and within `bra` reach, REWRITES site+0..3 into `bra target; nop`
+ * -- so the second execution of this edge never comes here again.
+ *
+ * WHY THE BUDGET TEST MOVED.  It used to sit in the loop, which every block
+ * exit passed through; a linked edge does not pass through the loop, so a
+ * guest loop of two linked blocks would spin for ever and never give up its
+ * timeslice.  Two instructions in the tail buy that back, and the loop keeps
+ * its own copy for every edge that still goes round it.
+ *
+ * WHAT THIS MAY TOUCH is a block's contract, r0/r1/r2/T/PR -- but it makes a
+ * C call, and C clobbers r0-r7.  r3-r6 hold nothing at a block tail, the
+ * allocator having flushed; r7 does, because it is a pinned guest register and
+ * the only pin below r8 (see pins.h).  So r7 is saved here by hand, the way
+ * `shim.S` saves it for every other crossing.  No pin needs PUBLISHING: this
+ * calls one pure function of the block table and it touches no guest state.
+ * ------------------------------------------------------------------------- */
+	.globl	_fgl_link_stub
+_fgl_link_stub:
+	sts	pr, r0
+	add	#-6, r0				/* the call site */
+	mov.l	r0, @-r15
+	mov.l	r2, @-r15			/* the target guest PC */
+#if FGL_NUM_PINS > 3
+	PIN_CALLER_SAVE				/* pinned and caller-saved */
+	mov.l	@(4, r15), r5			/* arg1: the target */
+	mov.l	@(8, r15), r6			/* arg2: the site */
+#else
+	mov.l	@r15, r5			/* arg1: the target */
+	mov.l	@(4, r15), r6			/* arg2: the site */
+#endif
+	stc	gbr, r4				/* arg0: the state */
+	mov.l	.Llinkres, r0
+	jsr	@r0
+	 nop
+	mov	r0, r1				/* where to go, or 0 */
+	PIN_CALLER_RESTORE
+	mov.l	@r15+, r2			/* the exit PC, untouched */
+	add	#4, r15				/* drop the site */
+
+	tst	r1, r1
+	bt	.Llink_slow
+	jmp	@r1
+	 nop
+.Llink_slow:
+	bra	_fgl_dispatch_loop
+	 nop
+
+/* ---------------------------------------------------------------------------
  * The two halves of the cycle contract, which is the thing most likely to be
  * got wrong quietly.
  *
@@ -596,3 +676,7 @@ _fgl_emulate_slot:
 	.globl	_fgl_dscheck_slot
 _fgl_dscheck_slot:
 .Ldscheck:	.long	_fgl_check_load_delay
+
+	.globl	_fgl_linkres_slot
+_fgl_linkres_slot:
+.Llinkres:	.long	_fgl_link_resolve

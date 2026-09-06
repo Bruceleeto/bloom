@@ -83,6 +83,8 @@ FGL_ASSERT(FGL_AT_ADDR_MASK * 4
 	   == offsetof(struct lightrec_state, addr_mask), addr_mask);
 FGL_ASSERT(FGL_AT_SHIM_ARG * 4
 	   == offsetof(struct lightrec_state, shim_arg), shim_arg);
+FGL_ASSERT(FGL_AT_LINK * 4
+	   == offsetof(struct lightrec_state, link), link);
 
 /* THE REACH ITSELF.  `mov.l @(disp,GBR),r0` has an eight-bit displacement
  * scaled by four, so the last word generated code can name is at +1020.
@@ -670,7 +672,13 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 			struct fgl_entry *entries, unsigned int *nb_entries)
 {
 	struct lightrec_state *state = cstate->state;
-	static uint8_t scratch[FGL_SCRATCH_BYTES];
+	/* FOUR-ALIGNED, AND THE TWO-PASS PROTOCOL DEPENDS ON IT.  The link
+	 * site is padded to a four-byte boundary, so whether the pad exists is
+	 * a function of the base address -- and the measuring pass runs at
+	 * this buffer's address while the real pass runs in the arena.  Two
+	 * differently aligned bases give two different sizes and the block is
+	 * refused for "SECOND PASS DIFFERS". */
+	static uint8_t scratch[FGL_SCRATCH_BYTES] __attribute__((aligned(4)));
 	/* Two failures that look the same from the outside and must not be
 	 * confused: the arena being full is transient and the caller may flush
 	 * and retry, while fgl declining to lower a block is permanent and a
@@ -803,4 +811,188 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 void fgl_dump_mem_pub(u32 addr, unsigned words)
 {
 	fgl_dump_mem(addr, words);
+}
+
+/* ---------------------------------------------------------------- */
+/* CROSS-BLOCK LINKING: THE DISPATCH THAT DELETES ITSELF             */
+/* ---------------------------------------------------------------- */
+
+/* A BLOCK EXIT IS EIGHTEEN INSTRUCTIONS AND ONLY TWO OF THEM ARE THE JUMP.
+ *
+ * Leaving a block costs the epilogue -- load the cycle constant, `sub` it off
+ * r14, load the dispatch address, `jmp`, `nop` -- and then the dispatcher:
+ * publish `curr_pc`, test the budget, ten instructions of branchless block
+ * table arithmetic, load the slot, test it, and an INDIRECT jump.  All of that
+ * to reach an address that, for a branch with a constant target, was known
+ * when the block was compiled.
+ *
+ * The reason it is not simply branched to is that at compile time the
+ * successor usually does not exist yet.  So the exit is emitted as a call to
+ * `fgl_link_stub`, and the stub asks this function where the successor went;
+ * once there is an answer, the CALL SITE IS REWRITTEN INTO A `bra` and the
+ * question is never asked again.  The steady-state edge is `bra` + delay slot,
+ * with no memory reference and no indirect branch for the pipeline to stall on
+ * -- and the epilogue that is no longer emitted is footprint the icache does
+ * not have to carry, which is the measured lever on this machine.
+ *
+ * WHAT IT COSTS, AND IT IS NOT FREE.  A patched link is a branch baked into
+ * another block's code with no indirection left in front of it, so the block
+ * table can no longer redirect it.  Selective invalidation therefore stops
+ * working, and the only invalidation left is to put every link back.  bloop
+ * pays exactly the same price and says so (`bloop/src/blocks.h`): it is a
+ * consequence of making the common case free, not an oversight.
+ *
+ * Hence `fgl_unlink_all`, and hence the rule its callers obey: it runs BEFORE
+ * anything frees code or clears a table slot, while the sites are still ours.
+ */
+
+/* THE CALL SITE, WHICH IS THREE INSTRUCTIONS AND ONE LONGWORD.
+ *
+ *      site+0  mov.l @(FGL_AT_LINK,gbr), r0
+ *      site+2  jsr   @r0
+ *      site+4  nop                     <- delay slot; PR is site+6
+ *
+ * The patch replaces site+0..3 -- the load and the `jsr` -- with `bra target`
+ * and its delay slot, in ONE ALIGNED LONGWORD STORE.  Two halfword stores
+ * would be visible to the instruction fetcher half-done, and on this machine
+ * that is not a theoretical race: the compiler runs on another thread.  A
+ * longword store to a two-mod-four address is an address error, so the
+ * emitter pads the site to four bytes and this asserts it rather than
+ * trusting that it did.
+ *
+ * The `nop` at site+4 is dead once patched: the `bra` leaves from site+0 and
+ * its own delay slot is at site+2.  Two dead bytes per link is the price of
+ * being able to store the patch atomically. */
+#define FGL_LINK_SITE_W0  ((uint16_t)(0xc600u | FGL_AT_LINK))   /* mov.l @(d,gbr),r0 */
+#define FGL_LINK_SITE_W1  ((uint16_t)0x400bu)                   /* jsr @r0           */
+
+/* Little-endian: the halfword at the lower address is the low half. */
+#define FGL_PACK(lo, hi)  (((uint32_t)(uint16_t)(hi) << 16) | (uint16_t)(lo))
+
+#define FGL_LINK_SITE_WORD FGL_PACK(FGL_LINK_SITE_W0, FGL_LINK_SITE_W1)
+
+/* Every site this run has patched, so that they can be put back.
+ *
+ * A fixed array and not a list: it is walked in full or not at all, it is
+ * never searched, and an allocation on the compile path is a failure mode
+ * this does not need.  Running out is not an error -- linking simply stops
+ * until the next invalidation empties it, which costs speed and nothing else.
+ * If that ever happens often the number is too small, and it is one number. */
+#define FGL_MAX_LINKS 4096
+static uint32_t fgl_link_site[FGL_MAX_LINKS];
+static unsigned fgl_n_links;
+
+/* DIAGNOSTIC: how the edges came out, printed by nothing yet but readable
+ * from a debugger and cheap to keep. */
+unsigned fgl_link_patched, fgl_link_uncompiled, fgl_link_range, fgl_link_undone;
+unsigned fgl_link_calls;
+
+/* `calls` is the one that says whether this is working.  A patched edge never
+ * comes back here, so in a machine that is linking well the call count goes
+ * quiet while the frame counter keeps moving; a call count that tracks the
+ * frame rate means the links are being torn down as fast as they are made. */
+static void fgl_link_report(void)
+{
+	fprintf(stderr, "fgl links: calls %u  near %u  far %u  "
+		"uncompiled %u  undone %u\n",
+		fgl_link_calls, fgl_link_patched, fgl_link_range,
+		fgl_link_uncompiled, fgl_link_undone);
+}
+
+void fgl_unlink_all(struct lightrec_state *state)
+{
+	unsigned i;
+
+	if (!fgl_n_links)
+		return;
+
+	for (i = 0; i < fgl_n_links; i++) {
+		uint32_t site = fgl_link_site[i];
+
+		*(volatile uint32_t *)(uintptr_t)site = FGL_LINK_SITE_WORD;
+		if (state->ops.code_inv)
+			state->ops.code_inv((void *)(uintptr_t)site, 4);
+	}
+
+	fgl_link_undone += fgl_n_links;
+	fgl_n_links = 0;
+}
+
+/* Called by `fgl_link_stub` with the guest PC the block is leaving for and the
+ * address of the call site that asked.  Returns the host address to enter, or
+ * 0 to mean "go round the dispatcher this time" -- which is what happens while
+ * the successor is not compiled yet, and is why the stub is a call and not a
+ * one-shot resolver.
+ *
+ * The answer is only PATCHED IN when it is one a `bra` can reach.  SH-4's
+ * unconditional branch has a twelve-bit word displacement, so +/-4 KB; the
+ * code arena is megabytes, so out-of-range successors are ordinary and they
+ * keep the call.  They are not a bug and not worth a second mechanism: the
+ * call is what the edge cost before linking existed.
+ *
+ * IT REFUSES TO LINK TO THE COMPILE SENTINEL.  Under the threaded compiler a
+ * table slot can hold `get_next_block` to mean "seen, not compiled yet"
+ * (lightrec.c, `lightrec_precompile_block`).  That is a legal thing for the
+ * DISPATCHER to jump to, because the dispatcher asks again next time -- but
+ * baking it into a `bra` would freeze the edge on the sentinel for ever and
+ * the real block would never be reached. */
+u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
+{
+	void *slot = lut_read(state, lut_offset(target));
+	int32_t d;
+
+	if ((++fgl_link_calls & 0x3f) == 0)
+		fgl_link_report();
+
+	if (!slot) {
+		fgl_link_uncompiled++;
+		return 0;
+	}
+
+	if (slot == (void *)(uintptr_t)state->get_next_block) {
+		fgl_link_uncompiled++;
+		return (u32)(uintptr_t)slot;
+	}
+
+	if (fgl_n_links >= FGL_MAX_LINKS)
+		return (u32)(uintptr_t)slot;
+
+	if (site & 3)                   /* the emitter's pad failed */
+		return (u32)(uintptr_t)slot;
+
+	/* `sh4_branch_disp12` counts from the branch's own address, which is
+	 * site+0 -- the load is what the `bra` replaces, not what it follows. */
+	d = sh4_branch_disp12(site, (uintptr_t)slot);
+	if (sh4_disp12_fits(d)) {
+		*(volatile uint32_t *)(uintptr_t)site =
+			FGL_PACK(SH4_D12(0xa000, d), 0x0009u /* nop */);
+		fgl_link_patched++;
+	} else {
+		/* FAR: the address goes in the six dead bytes the emitter left
+		 * behind the site, and the site becomes a PC-relative load and
+		 * an indirect jump.  `mov.l @(disp,PC),R0` reads
+		 * `(PC & ~3) + disp * 4` with PC = site+4, and the site is
+		 * four-aligned, so disp 1 names site+8.
+		 *
+		 * THE LITERAL IS WRITTEN FIRST.  Until the instruction pair
+		 * below lands, site+8 is data nothing reads; after it lands it
+		 * is the jump's target.  The other order gives the fetcher a
+		 * jump through whatever the emitter left there. */
+		*(volatile uint32_t *)(uintptr_t)(site + 8) =
+			(uint32_t)(uintptr_t)slot;
+		if (state->ops.code_inv)
+			state->ops.code_inv((void *)(uintptr_t)(site + 8), 4);
+
+		*(volatile uint32_t *)(uintptr_t)site =
+			FGL_PACK(0xd001u /* mov.l @(1,pc),r0 */,
+				 0x402bu /* jmp @r0 */);
+		fgl_link_range++;
+	}
+
+	if (state->ops.code_inv)
+		state->ops.code_inv((void *)(uintptr_t)site, 4);
+
+	fgl_link_site[fgl_n_links++] = site;
+
+	return (u32)(uintptr_t)slot;
 }

@@ -2006,6 +2006,79 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
 	sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
 
+	/* THE LINK, WHEN THE SUCCESSOR IS A CONSTANT.
+	 *
+	 * `IR_JUMP` is the only node that puts a compile-time address in the
+	 * exit register -- `IR_CAPTURE` puts a guest register there, which is
+	 * an indirect branch and cannot be linked to anything.  So a block
+	 * whose last node is `IR_JUMP` has exactly one successor and its
+	 * address was known when the block was compiled.
+	 *
+	 * It still cannot be branched to here, because it is usually not
+	 * compiled yet.  Instead the edge is a call to `fgl_link_stub`, which
+	 * REWRITES THIS CALL SITE into `bra target; nop` the first time the
+	 * successor exists -- see fgl_lightrec.c.  From the second execution
+	 * the edge is two instructions and no memory reference, in place of
+	 * the five below plus thirteen in the dispatcher.
+	 *
+	 * THE BUDGET TEST HAS TO BE HERE, and this is the only reason it is.
+	 * It used to live entirely in the dispatcher, which every exit passed
+	 * through.  A linked edge does not pass through the dispatcher, so a
+	 * guest loop of two linked blocks would run for ever without ever
+	 * checking its timeslice.  `cmp/pl` and its branch are what buy that
+	 * back, and they are paid only by blocks that can actually link.
+	 *
+	 * The site is padded to four bytes because the patch is a single
+	 * longword store: two halfword stores would be visible to the
+	 * instruction fetcher half-done, and the compiler runs on its own
+	 * thread.  A longword store to a two-mod-four address is an address
+	 * error, not a slow path. */
+	if (n > 0 && ir[n - 1].op == IR_JUMP) {
+		int out;
+
+		sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);   /* T = budget remains */
+		out = bf_fwd(e);
+
+		if ((e->base + fgl_size(e)) & 3)
+			sh4_emit_nop(&e->cg);          /* pad: site is 4-aligned */
+
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_LINK);
+		sh4_emit_jsr(&e->cg, FGL_R_XFER);
+		sh4_emit_nop(&e->cg);                  /* delay slot, kept by both patches */
+
+		/* SIX BYTES OF DATA, BECAUSE `bra` ALMOST NEVER REACHES.
+		 *
+		 * SH-4's unconditional branch has a twelve-bit word
+		 * displacement, so +/-4 KB.  bloop's blocks are bump-allocated
+		 * out of one 1 MB buffer and its census puts out-of-range
+		 * edges at 0.1%; lightrec's arena is a tlsf heap over
+		 * megabytes and a block is compiled long before its successor,
+		 * so the two land wherever there was room.  Measured here:
+		 * 97% of edges could not be reached by a `bra`.
+		 *
+		 * An edge that cannot be patched is not merely unimproved, it
+		 * is WORSE than no linking at all -- it pays the stub and a
+		 * whole C call on every execution instead of going round the
+		 * dispatcher.  So the far case has to patch too, and what it
+		 * patches to needs an arbitrary 32-bit address:
+		 *
+		 *      site+0  mov.l @(1,pc), r0      <- reads site+8
+		 *      site+2  jmp   @r0
+		 *      site+4  nop                    <- the same delay slot
+		 *      site+6  .word 0                <- pad, so the target aligns
+		 *      site+8  .long <host address>   <- written before the patch
+		 *
+		 * Three instructions and one load in place of eighteen.  The
+		 * near case still patches to `bra`+`nop` and leaves these six
+		 * bytes dead; nothing executes them either way, because the
+		 * `bf` above jumps over the whole site. */
+		sh4_word(&e->cg, 0x0000u);             /* pad, data */
+		sh4_word(&e->cg, 0x0000u);             /* the target host address, */
+		sh4_word(&e->cg, 0x0000u);             /* filled in by the patcher */
+
+		patch_fwd8(e, out);
+	}
+
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
 	sh4_emit_jmp(&e->cg, FGL_R_XFER);
 	sh4_emit_nop(&e->cg);                                  /* delay slot */
