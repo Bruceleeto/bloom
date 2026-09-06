@@ -295,11 +295,24 @@ static void maybe_flush_pool(fgl_emitter *e)
 /* State-block traffic                                               */
 /* ---------------------------------------------------------------- */
 
-/* Guest register `g` into host register `rn`, and back. Two instructions,
- * not one, whenever `rn` is not r0 -- the GBR displacement form has no other
- * destination. This is the whole reason r0 is reserved. */
+/* Guest register `g` into host register `rn`, and back.
+ *
+ * On the GBR path this is TWO instructions and not one whenever `rn` is not
+ * r0, because the GBR displacement form has no other destination -- which is
+ * the whole reason r0 is reserved, and 27.9% of everything the recompiler
+ * executes.  $0-$15 take the base-register path instead and cost one.  See
+ * pins.h. */
 static void ld_guest(fgl_emitter *e, unsigned g, int rn)
 {
+#if FGL_GBASE
+	/* One instruction, straight to the destination, and R0 never involved
+	 * -- which is the dependency chain as much as the count.  See pins.h. */
+	if (GUEST_AT(g) < FGL_GBASE_MAX) {
+		sh4_emit_mov_l_load_disp(&e->cg, FGL_R_GBASE, rn,
+					 (int)GUEST_AT(g));
+		return;
+	}
+#endif
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)GUEST_AT(g));
 	if (rn != FGL_R_XFER)
 		sh4_emit_mov_reg(&e->cg, FGL_R_XFER, rn);
@@ -323,6 +336,13 @@ static void st_guest(fgl_emitter *e, unsigned g, int rn)
 {
 	if (g == 0)
 		return;
+#if FGL_GBASE
+	if (GUEST_AT(g) < FGL_GBASE_MAX) {
+		sh4_emit_mov_l_store_disp(&e->cg, rn, FGL_R_GBASE,
+					  (int)GUEST_AT(g));
+		return;
+	}
+#endif
 	if (rn != FGL_R_XFER)
 		sh4_emit_mov_reg(&e->cg, rn, FGL_R_XFER);
 	sh4_emit_mov_l_store_gbr(&e->cg, (int)GUEST_AT(g));

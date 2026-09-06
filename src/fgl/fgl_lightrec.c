@@ -683,13 +683,18 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 			struct fgl_entry *entries, unsigned int *nb_entries)
 {
 	struct lightrec_state *state = cstate->state;
-	/* FOUR-ALIGNED, AND THE TWO-PASS PROTOCOL DEPENDS ON IT.  The link
-	 * site is padded to a four-byte boundary, so whether the pad exists is
-	 * a function of the base address -- and the measuring pass runs at
-	 * this buffer's address while the real pass runs in the arena.  Two
-	 * differently aligned bases give two different sizes and the block is
-	 * refused for "SECOND PASS DIFFERS". */
-	static uint8_t scratch[FGL_SCRATCH_BYTES] __attribute__((aligned(4)));
+	/* ALIGNED LIKE THE ARENA, AND THE TWO-PASS PROTOCOL DEPENDS ON IT.
+	 * The link site is padded to a four-byte boundary, so whether the pad
+	 * exists is a function of the base address -- and the measuring pass
+	 * runs at this buffer's address while the real pass runs in the arena.
+	 * Two differently aligned bases give two different sizes and the block
+	 * is refused for "SECOND PASS DIFFERS".
+	 *
+	 * 32, to match the cache-line alignment `lightrec_alloc_code` gives
+	 * every block entry.  Four would still satisfy the pad rule -- 32 is a
+	 * superset -- but keeping the two bases congruent is the property this
+	 * comment exists to protect. */
+	static uint8_t scratch[FGL_SCRATCH_BYTES] __attribute__((aligned(32)));
 	/* Two failures that look the same from the outside and must not be
 	 * confused: the arena being full is transient and the caller may flush
 	 * and retry, while fgl declining to lower a block is permanent and a

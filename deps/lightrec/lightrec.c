@@ -930,7 +930,40 @@ void * lightrec_alloc_code(struct lightrec_state *state, size_t size)
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_code_alloc_lock(state);
 
-	code = tlsf_malloc(state->tlsf, size);
+	/* EVERY BLOCK ENTRY STARTS A CACHE LINE.
+	 *
+	 * A block exit is a taken branch to an entry point tens of kilobytes
+	 * away, so it misses the instruction cache essentially every time:
+	 * measured on Spyro, 129.4k icache misses a frame against roughly the
+	 * same number of block exits, 22 cycles each, 14.3 ms.  Those misses
+	 * are not avoidable -- the entry is cold and something has to fetch it.
+	 *
+	 * What IS avoidable is fetching it twice.  The SH7750's line is 32
+	 * bytes; an entry landing at offset k into one gets (32 - k) useful
+	 * bytes out of the fill and takes a second miss on the very next line,
+	 * k bytes later.  tlsf hands out 4-aligned pointers, so k averages 16
+	 * and HALF of all entries pay that second miss immediately.  Aligning
+	 * the entry to the line makes the first fill sixteen whole
+	 * instructions every time.
+	 *
+	 * Worth 4.4 ms a frame on Spyro, 14.3 -> 15.3 fps: icache misses
+	 * 129.4k -> 82k, freeze_icache 2868k -> 1919k cycles.  It costs
+	 * padding -- up to 28 bytes a block, 448 -> 497 KiB of arena -- which
+	 * is why this is the cache-line size and not something bigger.
+	 * Aligning to 64 or 128 would buy nothing (the line is 32) and spend
+	 * four times the arena to buy it.
+	 *
+	 * `fgl_compile_block`'s measuring buffer is aligned to match, and has
+	 * to be: the two-pass protocol sizes the block at that buffer's
+	 * address and emits it here, so two differently aligned bases give two
+	 * different sizes and every block is refused for "SECOND PASS
+	 * DIFFERS".
+	 *
+	 * lightrec publishes exactly one entry per allocation (`fgl_emit_all`
+	 * says why), so aligning the allocation aligns the entry.  If that ever
+	 * becomes several entries per allocation, the padding has to move
+	 * inside the emitter and this stops being sufficient. */
+	code = tlsf_memalign(state->tlsf, 32, size);
 
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_code_alloc_unlock(state);

@@ -297,6 +297,11 @@ static void bloom_perf_report(uint64_t window_ms, unsigned int nframes)
 	if (!nframes || !wall_us)
 		return;
 
+#if !BLOOM_PERF
+	/* The brackets compiled out, so every bucket is zero and the report is
+	 * four lines a second of zeroes down the serial port.  See perf.h. */
+	(void)wall_us; (void)parents; (void)other; (void)kids; (void)i;
+#else
 	parents = bloom_perf_us[PERF_CPU] + bloom_perf_us[PERF_EVT]
 		+ bloom_perf_us[PERF_FLIP];
 	other = wall_us > parents ? wall_us - parents : 0;
@@ -387,6 +392,7 @@ static void bloom_perf_report(uint64_t window_ms, unsigned int nframes)
 		bloom_perf_evt_us[i] = 0;
 		bloom_perf_evt_cnt[i] = 0;
 	}
+#endif /* BLOOM_PERF */
 }
 
 static void dc_vout_flip(const void *vram, int offset, int bgr24,

@@ -86,6 +86,26 @@ extern uint32_t bloom_perf_evt_cnt[PERF_EVT_N];
  * not have to see a KOS header to be bracketed. */
 uint64_t bloom_perf_now(void);
 
+/* OFF BY DEFAULT, AND THE MACROS VANISH WHEN IT IS.
+ *
+ * The brackets are not free and the cost is not small.  The MMIO shims fire
+ * ~1270 times a frame and `gpu` ~1900, so a frame pays on the order of 3300
+ * bracket pairs and each is two TMU reads -- ~6600 on-chip I/O accesses a
+ * frame, against the 400 a frame an uninstrumented build makes in total.
+ * Measured on Spyro: ~10 ms a frame, which is a sixth of the frame.
+ *
+ * The report itself is four lines a second down a 115200 serial port on top of
+ * that.  Both are worth having while a question is open and neither belongs in
+ * a build whose frame time is being quoted.  A number to compare against a
+ * build without this is a number FROM a build without this.
+ *
+ * -DWITH_PERF=ON puts it all back. */
+#ifndef BLOOM_PERF
+#define BLOOM_PERF 0
+#endif
+
+#if BLOOM_PERF
+
 #define PERF_BEGIN(b)   uint64_t perf_t0_##b = bloom_perf_now()
 #define PERF_END(b)     do {                                             \
 		bloom_perf_us[b] += bloom_perf_now() - perf_t0_##b;      \
@@ -98,5 +118,14 @@ uint64_t bloom_perf_now(void);
 		bloom_perf_evt_us[i] += bloom_perf_now() - (v);          \
 		bloom_perf_evt_cnt[i]++;                                 \
 	} while (0)
+
+#else
+
+#define PERF_BEGIN(b)           do { } while (0)
+#define PERF_END(b)             do { } while (0)
+#define PERF_BEGIN_AT(v)        do { } while (0)
+#define PERF_END_EVT(v, i)      do { } while (0)
+
+#endif /* BLOOM_PERF */
 
 #endif /* BLOOM_PERF_H */

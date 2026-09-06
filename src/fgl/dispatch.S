@@ -188,6 +188,9 @@ _fgl_dispatch:
 	mov.l	r0, @-r15
 
 	ldc	r4, gbr				/* the state block */
+#if FGL_GBASE
+	mov	r4, r3				/* the guest-file base: pins.h */
+#endif
 	mov	r7, r14				/* the cycle delta */
 	mov.l	@(FGL_AT_ADDR_MASK * 4, gbr), r0
 	mov	r0, r13				/* the guest address mask */
@@ -303,6 +306,9 @@ _fgl_dispatch_loop:
 	 nop
 	mov.l	@r15+, r2
 	lds.l	@r15+, pr
+#if FGL_GBASE
+	stc	gbr, r3
+#endif
 #endif
 
 	/* The guest PC into a byte offset in the block table, branchlessly.
@@ -645,6 +651,9 @@ _fgl_link_stub:
 	jsr	@r0
 	 nop
 	mov	r0, r1				/* where to go, or 0 */
+#if FGL_GBASE
+	stc	gbr, r3				/* clobbered by C; see pins.h */
+#endif
 	PIN_CALLER_RESTORE
 	mov.l	@r15+, r2			/* the exit PC, untouched */
 	add	#4, r15				/* drop the site */
@@ -678,6 +687,11 @@ _fgl_link_stub:
 	 mov.l	r0, @(FGL_AT_CURRENT_CYCLE * 4, gbr)
 
 .Lsync_in:
+#if FGL_GBASE
+	/* r3 is caller-saved, so a compiled callee is entitled to have
+	 * destroyed it.  Rebuilding beats saving: the value IS gbr. */
+	stc	gbr, r3
+#endif
 	mov.l	@(FGL_AT_CURRENT_CYCLE * 4, gbr), r0
 	mov	r0, r1
 	mov.l	@(FGL_AT_TARGET_CYCLE * 4, gbr), r0

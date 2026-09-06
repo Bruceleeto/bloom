@@ -58,6 +58,52 @@
 #ifndef FGL_PINS_H
 #define FGL_PINS_H
 
+/* THE GUEST-FILE BASE REGISTER, AND THE 2:1 IT DELETES.
+ *
+ * `mov.l @(disp,GBR),Rn` does not exist: the GBR displacement form has R0 as
+ * its only destination.  So every guest register access is TWO instructions,
+ * a GBR load and a `mov` off R0 -- exactly 2:1, and the harness measured it:
+ * 83.4M guest-register accesses costing 167M of 598M executed instructions,
+ * 27.9% of the program.  It is the largest single line item there is, and it
+ * is also why R0 is a serialisation point that shows up as load-use stalls.
+ *
+ * `mov.l @(disp,Rm),Rn` has no such restriction, but its displacement is four
+ * bits scaled by four -- 0..60 bytes, SIXTEEN words.  Guest registers live at
+ * word `g` of the state block (`GUEST_AT`), so one base register pointing at
+ * the state block reaches $0-$15 in ONE instruction to any destination, and
+ * $16-$33 keep the GBR pair.  $0-$15 is $zero, $at, $v0/$v1, $a0-$a3 and
+ * $t0-$t7 -- the half MIPS actually computes in.
+ *
+ * WHERE THE REGISTER COMES FROM.  All sixteen were spoken for, so this takes
+ * the BOTTOM of the allocator's pool: `ALLOC_FIRST` moves 3 -> 4 and the pool
+ * is r4-r12, nine deep.  It deliberately does not take r13 (the address mask,
+ * one `and` on every guest memory access, ~27.6M of them) and it deliberately
+ * does not drop a pin -- the pinned six are bloop's set, register for
+ * register, and changing them makes every number incomparable with bloop.
+ * What it costs is one of the four ROTATING registers, so the rotating set
+ * goes 4 -> 3 and spilling rises.  Spilling is 8.1% of executed instructions
+ * against the 14% this saves, so the trade only fails if losing a quarter of
+ * the rotating set nearly doubles it.  That is what the A/B is for.
+ *
+ * IT IS A CONSTANT, WHICH IS WHY IT IS NEVER SAVED.  Its value is the state
+ * block pointer, the same thing GBR holds, so anything that may have clobbered
+ * it rebuilds it with `stc gbr, r3` rather than touching the stack.  That
+ * matters because r3 is CALLER-saved in the SH-4 ABI: a compiled C callee may
+ * destroy it and is entitled to.  `shim.S` happens to save r2-r7 already, so
+ * the shims are covered; `dispatch.S` rebuilds it at the two places that come
+ * back from C into generated code.
+ *
+ * Set FGL_GBASE to 0 to put every guest access back on the GBR pair and give
+ * r3 back to the allocator.  That is the A/B, and it has to keep working. */
+#ifndef FGL_GBASE
+#define FGL_GBASE 1
+#endif
+
+#if FGL_GBASE
+#define FGL_R_GBASE     3
+#define FGL_GBASE_MAX   16      /* guest registers reachable: $0..$15 */
+#endif
+
 /* How many of the four below are live.  0 disables pinning entirely. */
 #ifndef FGL_NUM_PINS
 #define FGL_NUM_PINS 6

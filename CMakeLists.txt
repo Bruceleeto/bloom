@@ -210,6 +210,24 @@ option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF
 option(WITH_CLIPPING "Enable pixel clipping" ON)
 option(WITH_FPS_OVERLAY "Draw an on-screen fps/frame-time counter" OFF)
 
+# THE STAGE BREAKDOWN (src/perf.h): `perf`, `links` and `unlink` lines once a
+# second.  OFF because it is expensive, not because it is noisy -- ~3300 bracket
+# pairs a frame at two TMU reads each, measured at ~10 ms a frame on Spyro.
+# Never quote a frame time from a build with this on.
+# THE GUEST-FILE BASE REGISTER (src/fgl/pins.h).  ON: $0-$15 are one
+# instruction instead of the GBR/r0 pair, at the price of one rotating
+# allocator register.  OFF puts r3 back in the pool and every guest access back
+# on the pair.  This is the A/B for the 27.9% the pair costs.
+option(WITH_FGL_NO_GBASE "Put guest registers back on the GBR/r0 pair" OFF)
+if (WITH_FGL_NO_GBASE)
+	add_compile_definitions(FGL_GBASE=0)
+endif (WITH_FGL_NO_GBASE)
+
+option(WITH_PERF "Per-stage wall-clock breakdown down the serial port" OFF)
+if (WITH_PERF)
+	add_compile_definitions(BLOOM_PERF=1)
+endif (WITH_PERF)
+
 if (WITH_HYBRID_RENDERING)
 	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
 	math(EXPR POLY_BUFFER_SIZE "0x400 * ${WITH_POLYBUF_SIZE_KB}")

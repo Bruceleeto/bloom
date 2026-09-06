@@ -34,9 +34,17 @@
 #include <stdint.h>
 
 #include "ir.h"
+#include "pins.h"
 
+/* r3 is the guest-file base when FGL_GBASE is on, so the pool starts at r4 and
+ * loses one of its four rotating registers.  See pins.h. */
+#if FGL_GBASE
+#define ALLOC_FIRST 4           /* r4 */
+#define ALLOC_N     9           /* r4-r12 */
+#else
 #define ALLOC_FIRST 3           /* r3 */
 #define ALLOC_N     10          /* r3-r12 */
+#endif
 
 /* SIX GUEST REGISTERS LIVE IN HOST REGISTERS ACROSS BLOCK BOUNDARIES, indexed
  * here by pool slot: -1 for a register that arrives holding nothing.
