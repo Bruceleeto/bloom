@@ -2363,6 +2363,16 @@ u32 lightrec_exit_flags(struct lightrec_state *state)
 	return state->exit_flags;
 }
 
+u32 lightrec_get_curr_pc(struct lightrec_state *state)
+{
+	return state->curr_pc;
+}
+
+void lightrec_set_curr_pc(struct lightrec_state *state, u32 pc)
+{
+	state->curr_pc = pc;
+}
+
 u32 lightrec_current_cycle_count(const struct lightrec_state *state)
 {
 	return state->current_cycle;

@@ -228,7 +228,7 @@ _fgl_dispatch_loop:
 	mov.l	r0, @(FGL_AT_CURR_PC * 4, gbr)
 
 	cmp/pl	r14				/* T = (delta > 0) */
-	bf	.Lexit
+	bf	.Lservice
 
 .Lrun:
 
@@ -394,6 +394,49 @@ _fgl_dispatch_compile:
 	 nop
 
 /* ---------------------------------------------------------------------------
+ * The slice is spent.  Ask C for another one WITHOUT leaving.
+ *
+ * This is M3: the outer loop's per-slice work (advance the pcsx clock, run the
+ * event scheduler, size the next slice) is C, but it is an ordinary call and
+ * not a reason to tear the dispatcher down.  r8-r15 are callee-saved, so the
+ * pins, the guest address mask and the budget register come back untouched,
+ * and GBR survives because bloom's image has no TLS.  What used to cost a full
+ * epilogue plus a re-entry through `lightrec_execute` now costs one `jsr`.
+ *
+ * The cycle pair has to be reconciled before the call and the pins published,
+ * because the scheduler can raise an exception that reads and moves guest
+ * state -- the same reasons `.Lexit` does both.  On the way back in the budget
+ * is re-derived from the pair rather than trusted from a register, since C is
+ * what decided how long the next slice is.
+ * ------------------------------------------------------------------------- */
+.Lservice:
+	bsr	.Lsync_out
+	 nop
+
+	PIN_PUBLISH
+
+	stc	gbr, r4				/* arg0: the state */
+	mov	r14, r5				/* arg1: the delta we spent */
+	mov.l	.Lservicefn, r0
+	jsr	@r0
+	 nop
+
+	tst	r0, r0
+	bt	.Lexit_published		/* no more slices: leave */
+
+	bsr	.Lsync_in
+	 nop
+	mov	r0, r14				/* the fresh budget */
+
+	PIN_LOAD
+
+	/* C may have moved the PC -- an interrupt is delivered by pointing it
+	 * at a vector -- so take it from the state block, never from r2. */
+	mov.l	@(FGL_AT_CURR_PC * 4, gbr), r0
+	bra	.Lrun
+	 mov	r0, r2
+
+/* ---------------------------------------------------------------------------
  * Leaving for good.
  * ------------------------------------------------------------------------- */
 .Lexit:
@@ -402,6 +445,7 @@ _fgl_dispatch_compile:
 
 	PIN_PUBLISH
 
+.Lexit_published:
 	mov	r14, r1				/* the return value */
 
 	mov.l	@r15+, r0
@@ -659,6 +703,9 @@ _fgl_link_stub:
 	.globl	_fgl_getnext_slot
 _fgl_getnext_slot:
 .Lgetnext:	.long	_fgl_get_next_block
+
+	.align	2
+.Lservicefn:	.long	_fgl_service_events
 
 /* The same arrangement for the other three doors.  Each is the fgl-side name
  * of one of lightrec's C functions -- `lightrec_memset` and

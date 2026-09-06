@@ -168,6 +168,81 @@ static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 	lightrec_reset_cycle_count(state, 0);
 }
 
+/*
+ * M3: service a slice boundary without leaving generated code.
+ *
+ * When the cycle budget runs out, the work the outer loop does at that moment
+ * -- advance the pcsx clock, run the event scheduler, size the next slice --
+ * needs C, but it does not need the dispatcher torn down first.  r8-r15 are
+ * callee-saved by the SH-4 ABI, so the pinned guest registers, the guest
+ * address mask and the budget register all survive an ordinary call, and GBR
+ * survives because nothing in bloom's image uses TLS.  So a slice boundary can
+ * cost one call instead of a full exit through `_fgl_dispatch`'s epilogue and
+ * a re-entry through `lightrec_execute`.
+ *
+ * Called from `.Lservice` in dispatch.S with the cycle pair already reconciled
+ * by `.Lsync_out` and the pins already published.
+ *
+ * Returns nonzero to run another slice -- the dispatcher then re-reads the
+ * budget out of the state block -- and 0 to leave for real.  On 0 the cycle
+ * pair is left where `lightrec_execute`'s
+ * `current_cycle = target_cycle - delta` still reproduces it, which is why the
+ * spent delta comes in as an argument.
+ */
+volatile int fgl_service_inline = 1;
+
+s32 fgl_service_events(struct lightrec_state *state, s32 delta)
+{
+	struct lightrec_registers *regs;
+	s32 cycles_pcsx;
+
+	/* `fgl_service_inline = 0` reproduces the pre-M3 behaviour exactly --
+	 * the dispatcher exits, the outer loop does all of this itself -- and
+	 * does it without changing a byte of .text, so the two states are a
+	 * matched pair. */
+	if (!fgl_service_inline || block_stepping)
+		return 0;
+
+	/* A block asked for C (syscall, break, an unknown op).  Only the outer
+	 * loop knows what to do with those. */
+	if (lightrec_exit_flags(state) != LIGHTREC_EXIT_NORMAL)
+		return 0;
+
+	psxRegs.pc = lightrec_get_curr_pc(state);
+	lightrec_tansition_to_pcsx(state);
+
+	regs = lightrec_get_registers(state);
+	{
+		PERF_BEGIN(PERF_EVT);
+		gen_interupt((psxCP0Regs *)regs->cp0);
+		PERF_END(PERF_EVT);
+	}
+
+	/* Software interrupts, exactly as the outer loop tests for them after
+	 * a run: `gen_interupt` is what can have raised one. */
+	if ((regs->cp0[13] & regs->cp0[12] & 0x300) && (regs->cp0[12] & 0x1)) {
+		regs->cp0[13] &= ~0x7c;
+		psxException(regs->cp0[13], 0, (psxCP0Regs *)regs->cp0);
+	}
+
+	/* An exception moves the PC, and that is where the next slice starts. */
+	lightrec_set_curr_pc(state, psxRegs.pc);
+
+	cycles_pcsx = psxRegs.next_interupt - psxRegs.cycle;
+
+	if (psxRegs.stop || cycles_pcsx <= 0) {
+		/* Leaving after all, and the transition above already moved
+		 * the clock.  Put the pair back where the caller's arithmetic
+		 * expects to find it. */
+		lightrec_set_target_cycle_count(state,
+			lightrec_current_cycle_count(state) + delta);
+		return 0;
+	}
+
+	lightrec_set_target_cycle_count(state, (u32)cycles_pcsx * 1024);
+	return 1;
+}
+
 static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 {
 	s32 cycles_left = psxRegs.next_interupt - psxRegs.cycle;
