@@ -5,6 +5,7 @@
 #include "psxdma.h"
 #include "mdec.h"
 #include "psxevents.h"
+#include "perf.h"
 
 //#define evprintf printf
 #define evprintf(...)
@@ -73,7 +74,15 @@ void irq_test(psxCP0Regs *cp0)
 		if ((s32)(cycle - regs->event_cycles[irq]) >= 0) {
 			// note: irq_funcs() also modify regs->interrupt
 			regs->interrupt &= ~(1u << irq);
-			irq_funcs[irq]();
+			{
+				/* Split `evt` by source: this loop is the
+				 * whole of it, and which device is costing
+				 * the milliseconds is not guessable. */
+				PERF_BEGIN_AT(t0);
+				irq_funcs[irq]();
+				PERF_END_EVT(t0, irq < PERF_EVT_N ? irq
+							  : PERF_EVT_N - 1);
+			}
 		}
 	}
 

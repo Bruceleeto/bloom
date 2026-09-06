@@ -23,6 +23,7 @@
 #include "lightrec-private.h"
 
 #include "fgl_state.h"
+#include "perf.h"
 #include "fgl.h"
 #include "decode_int.h"
 
@@ -186,6 +187,7 @@ static u32 fgl_gte_body(void *user, u32 op)
  * Implementing it here as well would be a second mechanism for one thing. */
 void fgl_rw(u32 opcode, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_RW);
 	union code op = { .opcode = opcode };
 	u32 ret;
 
@@ -207,6 +209,8 @@ void fgl_rw(u32 opcode, struct lightrec_state *state)
 	default:
 		break;
 	}
+
+	PERF_END(PERF_RW);
 }
 
 /* A write to COP0 Status or Cause.  `lightrec_mtc_cb`'s job, minus its LWC2
@@ -217,9 +221,11 @@ void fgl_rw(u32 opcode, struct lightrec_state *state)
  * Status.  See ir.h on IR_MTC_C. */
 void fgl_mtc(u32 opcode, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_COP);
 	union code op = { .opcode = opcode };
 
 	lightrec_mtc(state, op, op.r.rd, state->regs.gpr[op.r.rt]);
+	PERF_END(PERF_COP);
 }
 
 /* A COP2 read that is not a load: `IRGB` and `ORGB`.  `lightrec_mfc2`'s job,
@@ -227,10 +233,12 @@ void fgl_mtc(u32 opcode, struct lightrec_state *state)
  * write -- the same shape `fgl_rw` has for the same reason. */
 void fgl_mfc(u32 opcode, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_COP);
 	union code op = { .opcode = opcode };
 
 	if (op.r.rt)
 		state->regs.gpr[op.r.rt] = lightrec_mfc(state, op);
+	PERF_END(PERF_COP);
 }
 
 /* Returning from an exception.  `lightrec_rfe` pops the interrupt-enable
@@ -238,9 +246,12 @@ void fgl_mfc(u32 opcode, struct lightrec_state *state)
  * pending-interrupt check lives.  See ir.h on IR_RFE. */
 void fgl_rfe(u32 unused, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_COP);
+
 	(void) unused;
 
 	lightrec_rfe(state);
+	PERF_END(PERF_COP);
 }
 
 /* ---------------------------------------------------------------- */
@@ -875,17 +886,37 @@ void fgl_dump_mem_pub(u32 addr, unsigned words)
  *
  * A fixed array and not a list: it is walked in full or not at all, it is
  * never searched, and an allocation on the compile path is a failure mode
- * this does not need.  Running out is not an error -- linking simply stops
- * until the next invalidation empties it, which costs speed and nothing else.
- * If that ever happens often the number is too small, and it is one number. */
+ * this does not need.
+ *
+ * RUNNING OUT IS WORSE THAN IT LOOKS.  A site that cannot be recorded cannot
+ * be patched, and an unpatched site pays the stub AND a C call on every single
+ * execution -- strictly worse than never having linked it.  It is not a
+ * graceful degradation, it is a cliff.  So this wants to be comfortably above
+ * the live edge count, and `fgl_link_patched + fgl_link_range` is the number
+ * to check it against: the last steady-state census was ~1160.
+ *
+ * It was briefly 16384, raised in the same change that added conditional
+ * linking, on the guess that the edge count would triple.  Two variables at
+ * once and the build faulted; this went back first because it was the guess. */
 #define FGL_MAX_LINKS 4096
 static uint32_t fgl_link_site[FGL_MAX_LINKS];
+
+/* WHICH TABLE SLOT EACH SITE BRANCHES AT, so that a teardown can be about the
+ * code that actually died.
+ *
+ * A site is stored with `lut_offset()` of its successor rather than the guest
+ * PC, because that is the unit the invalidation paths work in: they clear
+ * `((len + 3) / 4)` slots starting at `lut_offset(addr)`, so a site is stale
+ * exactly when its index falls in that window.  Comparing indices makes the
+ * two agree by construction instead of by both getting the segment masking
+ * right separately. */
+static uint32_t fgl_link_slot[FGL_MAX_LINKS];
 static unsigned fgl_n_links;
 
 /* DIAGNOSTIC: how the edges came out, printed by nothing yet but readable
  * from a debugger and cheap to keep. */
 unsigned fgl_link_patched, fgl_link_uncompiled, fgl_link_range, fgl_link_undone;
-unsigned fgl_link_calls;
+unsigned fgl_link_calls, fgl_link_bad_site;
 
 /* `calls` IS THE ONE THAT SAYS WHETHER THIS IS WORKING.  A patched edge never
  * comes back here, so in a machine that is linking well the call count goes
@@ -896,23 +927,75 @@ unsigned fgl_link_calls;
  * for one run.  A per-second report was here and was noise once the mechanism
  * was known to work. */
 
-void fgl_unlink_all(struct lightrec_state *state)
+unsigned fgl_unlink_calls[FGL_UNLINK_N];
+unsigned fgl_unlink_links[FGL_UNLINK_N];
+
+static void fgl_link_restore(struct lightrec_state *state, uint32_t site)
+{
+	*(volatile uint32_t *)(uintptr_t)site = FGL_LINK_SITE_WORD;
+	if (state->ops.code_inv)
+		state->ops.code_inv((void *)(uintptr_t)site, 4);
+}
+
+void fgl_unlink_all(struct lightrec_state *state, unsigned why)
 {
 	unsigned i;
+
+	fgl_unlink_calls[why]++;
+	fgl_unlink_links[why] += fgl_n_links;
 
 	if (!fgl_n_links)
 		return;
 
-	for (i = 0; i < fgl_n_links; i++) {
-		uint32_t site = fgl_link_site[i];
-
-		*(volatile uint32_t *)(uintptr_t)site = FGL_LINK_SITE_WORD;
-		if (state->ops.code_inv)
-			state->ops.code_inv((void *)(uintptr_t)site, 4);
-	}
+	for (i = 0; i < fgl_n_links; i++)
+		fgl_link_restore(state, fgl_link_site[i]);
 
 	fgl_link_undone += fgl_n_links;
 	fgl_n_links = 0;
+}
+
+/* THE SAME, FOR ONE WINDOW OF THE TABLE -- WHICH IS ALMOST ALWAYS WHAT WAS
+ * MEANT.
+ *
+ * `lightrec_invalidate` clears `n` slots and nothing else, and then called
+ * `fgl_unlink_all`, which put back every patched site in the program.  A four
+ * byte guest store threw away the whole link graph.  Measured on Spyro: 7992
+ * invalidations destroyed 251516 links, 99.7% of all the teardown in the run,
+ * while the other five callers together managed 688.
+ *
+ * A site is stale when the slot it branches at is one of the cleared ones, and
+ * no other site is affected, so only that window is torn down and the rest of
+ * the table is compacted down over the holes.  Order within the table means
+ * nothing -- it is walked whole or not at all -- so compacting is just a
+ * second index.
+ *
+ * THIS IS NOT A LICENCE TO SKIP THE GLOBAL SWEEP WHERE CODE IS FREED.  It is
+ * sound here only because invalidation retires a block without releasing its
+ * memory; `lightrec_free_code` hands the arena back and cannot know which
+ * sites pointed into it, so that path still unlinks everything. */
+void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
+		      unsigned why)
+{
+	unsigned i, keep = 0, hit = 0;
+	u32 last = first + n;
+
+	fgl_unlink_calls[why]++;
+
+	for (i = 0; i < fgl_n_links; i++) {
+		if (fgl_link_slot[i] >= first && fgl_link_slot[i] < last) {
+			fgl_link_restore(state, fgl_link_site[i]);
+			hit++;
+			continue;
+		}
+
+		fgl_link_site[keep] = fgl_link_site[i];
+		fgl_link_slot[keep] = fgl_link_slot[i];
+		keep++;
+	}
+
+	fgl_n_links = keep;
+	fgl_unlink_links[why] += hit;
+	fgl_link_undone += hit;
 }
 
 /* Called by `fgl_link_stub` with the guest PC the block is leaving for and the
@@ -956,6 +1039,36 @@ u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
 	if (site & 3)                   /* the emitter's pad failed */
 		return (u32)(uintptr_t)slot;
 
+	/* THE SITE HAS TO STILL BE A SITE BEFORE ANYTHING IS WRITTEN TO IT.
+	 *
+	 * `site` is not passed in from anywhere trustworthy -- the stub derives
+	 * it from PR, as `PR - 6`, which is only the call site if the emitter
+	 * laid the site out exactly as the stub assumes.  If those two ever
+	 * disagree, the two stores below write a `bra` and a `nop` into
+	 * WHATEVER `site` happens to name.  The code arena and bloom's own
+	 * .text are both writable, so the likely outcome is not a fault here
+	 * but silently corrupted C, faulting somewhere unrelated much later --
+	 * which is exactly the shape of the boot fault that prompted this.
+	 *
+	 * An unpatched site is two known halfwords and nothing else can be
+	 * mistaken for them, so checking is one load and one compare.  Refusing
+	 * costs the edge and nothing more; the dispatcher still runs.
+	 *
+	 * An ALREADY-patched site reaching here would also fail this test, and
+	 * that is equally a bug: a site is recorded when it is patched and only
+	 * an unpatched one can call the stub. */
+	if (*(volatile uint32_t *)(uintptr_t)site != FGL_LINK_SITE_WORD) {
+		/* Capped: if this fires at all it is likely to fire on every
+		 * edge, and a flood over dc-load is slower than the fault. */
+		if (fgl_link_bad_site++ < 20)
+			fprintf(stderr,
+				"fgl: link site %08x is not a link site: %08x\n",
+				(unsigned)site,
+				(unsigned)*(volatile uint32_t *)
+					(uintptr_t)site);
+		return (u32)(uintptr_t)slot;
+	}
+
 	/* `sh4_branch_disp12` counts from the branch's own address, which is
 	 * site+0 -- the load is what the `bra` replaces, not what it follows. */
 	d = sh4_branch_disp12(site, (uintptr_t)slot);
@@ -988,6 +1101,7 @@ u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
 	if (state->ops.code_inv)
 		state->ops.code_inv((void *)(uintptr_t)site, 4);
 
+	fgl_link_slot[fgl_n_links] = lut_offset(target);
 	fgl_link_site[fgl_n_links++] = site;
 
 	return (u32)(uintptr_t)slot;

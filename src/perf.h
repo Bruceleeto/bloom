@@ -1,32 +1,38 @@
-/* WHERE A FRAME GOES, IN FOUR NUMBERS AND A PRINTF.
+/* WHERE A FRAME GOES, IN A COUPLE OF PRINTFS.
  *
  * Not a profiler.  A profiler says which function; this says which STAGE, and
  * that is the question a recompiler rewrite actually needs answered -- whether
- * a change moved time out of emulated code and into the renderer, or moved it
- * nowhere and only moved it around inside the same bucket.
+ * a change moved time out of emulated code, or moved it nowhere and only moved
+ * it around inside the same bucket.
  *
  * Wall clock, microseconds, accumulated per bucket and reported over the same
  * one-second window `dc_vout_flip` already keeps for the fps counter, so the
  * buckets and the frame rate are measured over exactly the same interval and
- * can be put in the same sentence.
+ * belong in the same sentence.
  *
- * IT COSTS SOMETHING AND THE COST IS NOT ZERO.  Each bracket is two TMU reads
- * and a 64-bit subtract.  CPU is bracketed per dispatch (tens per frame), GPU
- * per command list (hundreds), so the overhead is tens of microseconds a frame
- * -- fine for reading a spread, not fine for quoting a frame time from.  A
- * number to compare against a build without this is a number from a build
- * without this.
+ * THE BUCKETS NEST, AND THE REPORT SAYS SO.  Only three are siblings:
  *
- * WHAT `other` IS.  The window's wall time minus the four buckets: audio, the
- * CD drive, MDEC, input, KOS, and the parts of pcsx_rearmed that are none of
- * the above.  If it grows, the thing to do is bracket another stage, not to
- * guess.
+ *      frame  =  cpu  +  evt  +  flip  +  other
  *
- * JIT IS ON ANOTHER THREAD.  The recompiler runs in its own worker, so its
- * microseconds are real work but they do not come out of the frame's budget
- * the way the other three do -- they overlap.  It is reported because a
- * compile storm is what a recompile dip IS, and seeing it spike next to a
- * dropped frame is the whole point.
+ * Everything else is a CHILD of one of those and is reported indented, never
+ * added in.  Inside `cpu` are the four doors out of generated code -- `hw`,
+ * `rw`, `cop`, `svc` -- and what `cpu` has left after them is emitted
+ * instructions and nothing else.  `gpu` is `do_cmd_list`, reached from a DMA
+ * register write, so it is inside `hw` and not beside it.  Inside `evt` are
+ * the fifteen interrupt sources, and inside the one of those that crosses
+ * vblank are `emuupd`, `lace`, `spu` and `vbl`.  `jit` is the odd one: real
+ * work, but on the recompiler's own thread, so it overlaps everything and is
+ * a child of nothing.
+ *
+ * An early version of this printed all of them as siblings and they summed to
+ * 104%, which is how the nesting was noticed.  Do not add a bucket without
+ * saying which parent it is inside.
+ *
+ * IT COSTS SOMETHING.  Two TMU reads and a 64-bit subtract per bracket.  The
+ * frequent ones are the event sources (tens per frame) and `gpu` (hundreds),
+ * so the overhead is tens of microseconds a frame -- fine for reading a
+ * spread, not fine for quoting a frame time from.  A number to compare against
+ * a build without this is a number FROM a build without this.
  */
 
 #ifndef BLOOM_PERF_H
@@ -35,25 +41,62 @@
 #include <stdint.h>
 
 enum {
-	PERF_CPU,       /* inside generated code: lightrec_execute        */
-	PERF_JIT,       /* compiling a block (recompiler thread)          */
-	PERF_EVENT,     /* gen_interupt: root counters, IRQs, DMA         */
-	PERF_GPU,       /* do_cmd_list: GPU command list -> PVR polygons  */
-	PERF_FLIP,      /* dc_vout_flip: scene submit and present         */
+	/* THE SIBLINGS.  These three and `other` are the frame, and nothing
+	 * else is ever added to a total. */
+	PERF_CPU,       /* inside generated code: lightrec_execute         */
+	PERF_EVT,       /* gen_interupt: the event tick between dispatches */
+	PERF_FLIP,      /* dc_vout_flip: scene submit and present          */
+
+	/* INSIDE `cpu` -- the C that generated code calls without leaving the
+	 * dispatch.  `hw` is every MMIO access the optimiser could classify,
+	 * and the DMA engines hang off it, so `gpu` is inside `hw` in turn. */
+	PERF_HW,        /* lightrec_hw_lb .. lightrec_hw_sw: known MMIO     */
+	PERF_RW,        /* fgl_rw: an access whose region was not proved    */
+	PERF_COP,       /* fgl_mtc / fgl_mfc / fgl_rfe                      */
+	PERF_SVC,       /* the dispatcher's own doors: interpret, memset,
+			 * ds_check -- a block giving up on emitted code    */
+	PERF_GPU,       /* do_cmd_list: GPU list -> PVR polygons            */
+
+	/* INSIDE `evt`, and specifically inside the ONE `rcnt` tick a frame
+	 * that crosses vblank.  pcsx hangs the whole frame boundary off that
+	 * counter, so these are not counter work at all. */
+	PERF_EMUUPDATE, /* EmuUpdate: input, memcard, frame limiter         */
+	PERF_LACE,      /* GPU_updateLace: sync with the render thread      */
+	PERF_SPU,       /* SPU_async                                        */
+	PERF_VBLANK,    /* GPU_vBlank, both calls                           */
+
+	/* Inside nothing: the recompiler has its own thread. */
+	PERF_JIT,
+
 	PERF_N
 };
 
+/* Which parent a bucket is reported under.  The table that pairs these with
+ * the printed names lives in platform.c, next to the report that reads it. */
+enum { PERF_IN_FRAME, PERF_IN_CPU, PERF_IN_HW, PERF_IN_EVT, PERF_IN_NONE };
+
+#define PERF_EVT_N 16
+
 extern uint64_t bloom_perf_us[PERF_N];
 extern uint32_t bloom_perf_cnt[PERF_N];
+extern uint64_t bloom_perf_evt_us[PERF_EVT_N];
+extern uint32_t bloom_perf_evt_cnt[PERF_EVT_N];
 
 /* Microseconds.  Defined in platform.c so that lightrec and pcsx_rearmed do
  * not have to see a KOS header to be bracketed. */
 uint64_t bloom_perf_now(void);
 
 #define PERF_BEGIN(b)   uint64_t perf_t0_##b = bloom_perf_now()
-#define PERF_END(b)     do {                                            \
+#define PERF_END(b)     do {                                             \
 		bloom_perf_us[b] += bloom_perf_now() - perf_t0_##b;      \
 		bloom_perf_cnt[b]++;                                     \
+	} while (0)
+
+/* The same, for a bucket chosen at run time. */
+#define PERF_BEGIN_AT(v)        uint64_t v = bloom_perf_now()
+#define PERF_END_EVT(v, i)      do {                                     \
+		bloom_perf_evt_us[i] += bloom_perf_now() - (v);          \
+		bloom_perf_evt_cnt[i]++;                                 \
 	} while (0)
 
 #endif /* BLOOM_PERF_H */

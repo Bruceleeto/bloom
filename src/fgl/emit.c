@@ -76,6 +76,89 @@ static void patch_fwd12(fgl_emitter *e, int site)
 		or_word_at(e, site, (uint16_t)(disp & 0xfff));
 }
 
+/* HOW MUCH OF A CONDITIONAL EXIT GETS A LINK.
+ *
+ * 0  `IR_JUMP` only -- one constant successor, one site.
+ * 1  plus IR_COND's TAKEN arm; the fallthrough keeps the dispatcher.
+ * 2  both arms.  A conditional block then need never reach the dispatcher.
+ * 3  the FALLTHROUGH arm only; the mirror of 1, kept because it is the
+ *    control that says whether a fault belongs to an arm or to the pair.
+ *
+ * Spyro hardware, matched steady rows: 0 is 56.3 ms/f, 1 is 47.9, 2 is 43.5,
+ * and every millisecond of that came out of the emitted-code bucket.
+ *
+ * MODE 2 IS THE REASON `emit_publish_pc` EXISTS.  With one site a block still
+ * leaves through the dispatcher on its other arm; with two it stops visiting
+ * the dispatcher at all, and everything the dispatcher did on the way in has
+ * to be done at the site instead.  Adding a mode here means asking what else
+ * that entry path was providing.
+ *
+ * A BISECT MODE MUST DIFFER FROM THE THING IT BISECTS.  Mode 3 was gated
+ * `>= 2` for the second site and `< 2` for the branch choosing between the
+ * arms, so it emitted two sites and left that branch unpatched -- mode 2
+ * mirrored, and worse.  Three hardware runs were spent proving "the
+ * fallthrough is unlinkable" from it, which is false. */
+#ifndef FGL_LINK_COND
+#define FGL_LINK_COND 2
+#endif
+
+
+/* ONE SELF-PATCHING EDGE.  Twelve bytes, four of them the two instructions the
+ * patcher overwrites and six of them data it may need; see the long comment
+ * in `fgl_emit` for what each patch turns this into.
+ *
+ * The length is deliberately a multiple of four, so that a second site placed
+ * immediately after a first is still longword aligned and its pad costs
+ * nothing.  Conditional linking emits two of these back to back. */
+/* PUBLISH THE GUEST PC, THE WAY THE DISPATCHER DOES.
+ *
+ * `_fgl_dispatch_loop` stores r2 into `curr_pc` as its FIRST act, before the
+ * budget test and before the table lookup, on every single block entry.  A
+ * linked edge does not pass through it, so a linked edge does not publish --
+ * and while a chain is running, `curr_pc` names whichever block last went the
+ * long way round.
+ *
+ * ONE SITE HID THIS AND TWO SITES DID NOT.  A conditional with a single site
+ * still leaves through the dispatcher on its other arm, so the value goes
+ * stale for one edge and is put right again almost immediately.  Give the
+ * block a site on BOTH arms and it need never reach the dispatcher again
+ * until its timeslice runs out -- `curr_pc` then sits frozen across a whole
+ * budget's worth of guest execution, and everything that reads it while a
+ * chain is running reads a lie.  That is measured, not argued: with both arms
+ * linked the game boots when the stub returns 0 and sends the edge round the
+ * dispatcher, and faults when it returns the target and the edge goes direct.
+ *
+ * Two instructions, because `mov.l @(disp,GBR)` can only name r0 -- and r0 is
+ * FGL_R_XFER, which the site below reloads on its very next instruction, so
+ * there is nothing to preserve.  Both are `mov`, so the T bit the arm branch
+ * above just consumed is not disturbed either.
+ *
+ * IT SITS OUTSIDE THE PATCHED LONGWORD, deliberately.  The patcher rewrites
+ * site+0..3 and nothing else, so putting the publish ahead of the site keeps
+ * it on the path for the life of the edge, patched or not.  It is also four
+ * bytes, which leaves the site's alignment exactly as it was. */
+static void emit_publish_pc(fgl_emitter *e)
+{
+	sh4_emit_mov_reg(&e->cg, FGL_R_EXIT, FGL_R_XFER);
+	sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_CURR_PC);
+}
+
+static void emit_link_site(fgl_emitter *e)
+{
+	emit_publish_pc(e);
+
+	if ((e->base + fgl_size(e)) & 3)
+		sh4_emit_nop(&e->cg);          /* pad: the site is 4-aligned */
+
+	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_LINK);
+	sh4_emit_jsr(&e->cg, FGL_R_XFER);
+	sh4_emit_nop(&e->cg);                  /* delay slot, kept by both patches */
+
+	sh4_word(&e->cg, 0x0000u);             /* pad, data */
+	sh4_word(&e->cg, 0x0000u);             /* the target host address, */
+	sh4_word(&e->cg, 0x0000u);             /* filled in by the patcher */
+}
+
 /* ---------------------------------------------------------------- */
 /* Constants                                                         */
 /* ---------------------------------------------------------------- */
@@ -2006,77 +2089,169 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
 	sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
 
-	/* THE LINK, WHEN THE SUCCESSOR IS A CONSTANT.
+	/* THE LINK, WHEN THE SUCCESSORS WERE KNOWN AT COMPILE TIME.
 	 *
-	 * `IR_JUMP` is the only node that puts a compile-time address in the
-	 * exit register -- `IR_CAPTURE` puts a guest register there, which is
-	 * an indirect branch and cannot be linked to anything.  So a block
-	 * whose last node is `IR_JUMP` has exactly one successor and its
-	 * address was known when the block was compiled.
+	 * Two nodes put compile-time addresses in the exit register.  `IR_JUMP`
+	 * has one successor; `IR_COND` has TWO, both constants -- the taken
+	 * target and the fallthrough -- because a MIPS conditional branch has
+	 * a sixteen-bit signed displacement and nothing else.  `IR_CAPTURE`
+	 * puts a guest register there, which is an indirect branch and cannot
+	 * be linked to anything.
 	 *
-	 * It still cannot be branched to here, because it is usually not
-	 * compiled yet.  Instead the edge is a call to `fgl_link_stub`, which
-	 * REWRITES THIS CALL SITE into `bra target; nop` the first time the
-	 * successor exists -- see fgl_lightrec.c.  From the second execution
-	 * the edge is two instructions and no memory reference, in place of
-	 * the five below plus thirteen in the dispatcher.
+	 * Neither can be branched to here, because the successor is usually
+	 * not compiled yet.  Instead each edge is a call to `fgl_link_stub`,
+	 * which REWRITES ITS OWN CALL SITE the first time that successor
+	 * exists -- see fgl_lightrec.c.  From the second execution the edge is
+	 * two instructions and no memory reference, in place of the three
+	 * below plus thirteen in the dispatcher.
+	 *
+	 * FINDING THE TRANSFER IS A BACKWARD SCAN, NOT `ir[n - 1]`.  The
+	 * decoder places a transfer's node AHEAD of its delay slot (decode.c,
+	 * `ir_decode`, and the comment at the top of ir.h says why), so in
+	 * `j target; addiu $a0,$a0,1` the IR_JUMP is at n-2 and the slot's
+	 * node is last.  Testing the last node therefore linked only the
+	 * transfers whose delay slot decoded to no nodes at all -- a `nop`, or
+	 * a pair the constant folder ate.  That is most of what the first
+	 * census counted, and it is why so few edges appeared.
 	 *
 	 * THE BUDGET TEST HAS TO BE HERE, and this is the only reason it is.
 	 * It used to live entirely in the dispatcher, which every exit passed
 	 * through.  A linked edge does not pass through the dispatcher, so a
 	 * guest loop of two linked blocks would run for ever without ever
 	 * checking its timeslice.  `cmp/pl` and its branch are what buy that
-	 * back, and they are paid only by blocks that can actually link.
-	 *
-	 * The site is padded to four bytes because the patch is a single
-	 * longword store: two halfword stores would be visible to the
-	 * instruction fetcher half-done, and the compiler runs on its own
-	 * thread.  A longword store to a two-mod-four address is an address
-	 * error, not a slow path. */
-	if (n > 0 && ir[n - 1].op == IR_JUMP) {
-		int out;
+	 * back, and they are paid only by blocks that can actually link.  One
+	 * test covers both arms of a conditional. */
+	{
+		const ir_node *t = (n > 0) ? &ir[n - 1] : NULL;
 
-		sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);   /* T = budget remains */
-		out = bf_fwd(e);
-
-		if ((e->base + fgl_size(e)) & 3)
-			sh4_emit_nop(&e->cg);          /* pad: site is 4-aligned */
-
-		sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_LINK);
-		sh4_emit_jsr(&e->cg, FGL_R_XFER);
-		sh4_emit_nop(&e->cg);                  /* delay slot, kept by both patches */
-
-		/* SIX BYTES OF DATA, BECAUSE `bra` ALMOST NEVER REACHES.
+		/* WHY THE LAST NODE AND NOT A BACKWARD SCAN FOR THE TRANSFER.
 		 *
-		 * SH-4's unconditional branch has a twelve-bit word
-		 * displacement, so +/-4 KB.  bloop's blocks are bump-allocated
-		 * out of one 1 MB buffer and its census puts out-of-range
-		 * edges at 0.1%; lightrec's arena is a tlsf heap over
-		 * megabytes and a block is compiled long before its successor,
-		 * so the two land wherever there was room.  Measured here:
-		 * 97% of edges could not be reached by a `bra`.
+		 * The decoder puts a transfer's node AHEAD of its delay slot
+		 * (decode.c, `ir_decode`), so `j target; addiu $a0,$a0,1`
+		 * leaves IR_JUMP at n-2 and the slot's node last.  Testing the
+		 * last node therefore links only the transfers whose delay
+		 * slot decoded to no nodes at all -- a `nop`, or a pair the
+		 * constant folder ate -- and leaves the rest going round the
+		 * dispatcher.  That is a real amount of the win still on the
+		 * table and it is the obvious next thing to take.
 		 *
-		 * An edge that cannot be patched is not merely unimproved, it
-		 * is WORSE than no linking at all -- it pays the stub and a
-		 * whole C call on every execution instead of going round the
-		 * dispatcher.  So the far case has to patch too, and what it
-		 * patches to needs an arbitrary 32-bit address:
+		 * IT IS NOT TAKEN HERE, ON PURPOSE.  Scanning back for the
+		 * transfer was tried and Spyro faulted during BIOS boot; the
+		 * cause was never established, and widening the test at the
+		 * same time as adding the conditional arm made the two
+		 * indivisible.  Re-widening is a separate change so that its
+		 * own hardware run means something.
 		 *
-		 *      site+0  mov.l @(1,pc), r0      <- reads site+8
-		 *      site+2  jmp   @r0
-		 *      site+4  nop                    <- the same delay slot
-		 *      site+6  .word 0                <- pad, so the target aligns
-		 *      site+8  .long <host address>   <- written before the patch
-		 *
-		 * Three instructions and one load in place of eighteen.  The
-		 * near case still patches to `bra`+`nop` and leaves these six
-		 * bytes dead; nothing executes them either way, because the
-		 * `bf` above jumps over the whole site. */
-		sh4_word(&e->cg, 0x0000u);             /* pad, data */
-		sh4_word(&e->cg, 0x0000u);             /* the target host address, */
-		sh4_word(&e->cg, 0x0000u);             /* filled in by the patcher */
+		 * IT IS ALSO WHAT MAKES THE CONDITIONAL ARM BELOW WORK.  That
+		 * arm reads the T bit the IR_COND comparison left behind, and
+		 * T only survives to here because IR_COND is the last node. */
+		if (t && (t->op == IR_JUMP ||
+			  (FGL_LINK_COND && t->op == IR_COND))) {
+			int fall = -1, out1, out2 = -1;
 
-		patch_fwd8(e, out);
+			/* THE ARM IS CHOSEN BY THE T BIT, NOT BY RE-ASKING.
+			 *
+			 * A site patches itself into a branch to ONE address,
+			 * so the two arms of a conditional cannot share one.
+			 * The first version of this picked between them by
+			 * re-materialising the taken PC into r0 and comparing
+			 * it against the exit register -- the answer rather
+			 * than the question -- because T "obviously" could not
+			 * have survived.  It cost a literal, a compare and a
+			 * branch, and it faulted.
+			 *
+			 * T DOES SURVIVE, and nothing between here and the
+			 * comparison can disturb it: IR_COND's own arms are
+			 * `mov`/`mov.l`/`bra`, the register writeback flush is
+			 * `st_guest` and `ld_guest` which are also only
+			 * `mov`/`mov.l`, and the cycle charge above is
+			 * `mov.l` and `sub` -- SUB does not write T on SH-4,
+			 * only SUBC and SUBV do.  So the compare's result is
+			 * still standing, and this is bloop's shape: one
+			 * conditional branch off the original comparison and a
+			 * link on each side of it.
+			 *
+			 * The sense is recomputed from the condition code the
+			 * same way IR_COND computed it, rather than carried in
+			 * the emitter, so the two cannot drift apart silently
+			 * -- they are the same expression. */
+			if (FGL_LINK_COND && t->op == IR_COND) {
+				int t_means_taken = (t->sub == CC_EQ ||
+						     t->sub == CC_GTZ ||
+						     t->sub == CC_GEZ);
+
+				/* Which arm walks away from the site.  Mode 3
+				 * is the mirror of 1 and 2: the single site
+				 * below belongs to the fallthrough instead. */
+				if (FGL_LINK_COND == 3)
+					fall = t_means_taken ? bt_fwd(e)
+							     : bf_fwd(e);
+				else
+					fall = t_means_taken ? bf_fwd(e)
+							     : bt_fwd(e);
+			}
+
+			/* THE BUDGET TEST HAS TO BE HERE, and this is the only
+			 * reason it is.  It used to live entirely in the
+			 * dispatcher, which every exit passed through.  A
+			 * linked edge does not pass through the dispatcher, so
+			 * a guest loop of two linked blocks would run for ever
+			 * without checking its timeslice.  Each arm pays its
+			 * own copy: `cmp/pl` writes T, so one test shared
+			 * ahead of the arm branch would destroy the very bit
+			 * the arm branch reads. */
+			sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
+			out1 = bf_fwd(e);
+
+			/* SIX BYTES OF DATA PER SITE, BECAUSE `bra` ALMOST
+			 * NEVER REACHES.
+			 *
+			 * SH-4's unconditional branch has a twelve-bit word
+			 * displacement, so +/-4 KB.  bloop's blocks are
+			 * bump-allocated out of one 1 MB buffer and its census
+			 * puts out-of-range edges at 0.1%; lightrec's arena is
+			 * a tlsf heap over megabytes and a block is compiled
+			 * long before its successor, so the two land wherever
+			 * there was room.  Measured here: 97% of edges could
+			 * not be reached by a `bra`.
+			 *
+			 * An edge that cannot be patched is not merely
+			 * unimproved, it is WORSE than no linking at all -- it
+			 * pays the stub and a whole C call on every execution
+			 * instead of going round the dispatcher.  So the far
+			 * case has to patch too, and what it patches to needs
+			 * an arbitrary 32-bit address:
+			 *
+			 *      site+0  mov.l @(1,pc), r0   <- reads site+8
+			 *      site+2  jmp   @r0
+			 *      site+4  nop                 <- same delay slot
+			 *      site+6  .word 0             <- pad, target aligns
+			 *      site+8  .long <host address>
+			 *
+			 * Three instructions and one load in place of
+			 * eighteen.  The near case still patches to `bra`+`nop`
+			 * and leaves these six bytes dead; nothing executes
+			 * them either way, because the `bf` above jumps over
+			 * the whole site. */
+			emit_link_site(e);             /* taken, or the only one */
+
+			if (fall >= 0 && FGL_LINK_COND == 2) {
+				patch_fwd8(e, fall);
+				sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
+				out2 = bf_fwd(e);
+				emit_link_site(e);     /* the fallthrough */
+			}
+
+			patch_fwd8(e, out1);
+			if (out2 >= 0)
+				patch_fwd8(e, out2);
+
+			/* Mode 1: the fallthrough arm was never given a site,
+			 * so its branch lands here, at the dispatcher, exactly
+			 * as it did before linking existed. */
+			if (fall >= 0 && FGL_LINK_COND != 2)
+				patch_fwd8(e, fall);
+		}
 	}
 
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);

@@ -520,10 +520,33 @@ void fgl_dispatch_ds_check(void);
  * redirect, so anything that frees or invalidates code has to call this
  * FIRST, while the sites are still live memory. */
 void fgl_link_stub(void);
-void fgl_unlink_all(struct lightrec_state *state);
+void fgl_unlink_all(struct lightrec_state *state, unsigned why);
+
+/* Tear down only the sites branching at slots [first, first + n) -- the window
+ * an invalidation actually cleared.  See fgl_lightrec.c. */
+void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
+		      unsigned why);
 u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site);
+/* Why a link teardown happened.  Every one of these wipes EVERY link in the
+ * program, so the interesting number is not how many links died but which
+ * caller keeps killing them. */
+enum {
+	FGL_UNLINK_INV_MAP,     /* lightrec_invalidate_map: guest store/DMA  */
+	FGL_UNLINK_SMC,         /* an opcode was tagged, block recompiles    */
+	FGL_UNLINK_FREE,        /* lightrec_free_code                        */
+	FGL_UNLINK_INV,         /* lightrec_invalidate                       */
+	FGL_UNLINK_INV_ALL,     /* lightrec_invalidate_all                   */
+	FGL_UNLINK_LUT,         /* remove_from_code_lut (blockcache.c)       */
+	FGL_UNLINK_N
+};
+
+extern unsigned fgl_unlink_calls[FGL_UNLINK_N];
+extern unsigned fgl_unlink_links[FGL_UNLINK_N];
+
 extern unsigned fgl_link_patched, fgl_link_uncompiled;
+extern unsigned fgl_link_undone;
 extern unsigned fgl_link_range, fgl_link_undone, fgl_link_calls;
+extern unsigned fgl_link_bad_site;
 
 /* What that assembly calls back into. The last three exist because lightrec's
  * own functions are static; see the comment on them in lightrec.c. */

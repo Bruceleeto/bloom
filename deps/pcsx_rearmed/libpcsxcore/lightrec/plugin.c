@@ -681,9 +681,9 @@ static void lightrec_plugin_execute_internal(bool block_only)
 
 	regs = lightrec_get_registers(lightrec_state);
 	{
-		PERF_BEGIN(PERF_EVENT);
+		PERF_BEGIN(PERF_EVT);
 		gen_interupt((psxCP0Regs *)regs->cp0);
-		PERF_END(PERF_EVENT);
+		PERF_END(PERF_EVT);
 	}
 	if (!block_only && psxRegs.stop)
 		return;

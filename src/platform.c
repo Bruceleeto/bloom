@@ -40,6 +40,8 @@ static uint64_t timer_ms;
 
 uint64_t bloom_perf_us[PERF_N];
 uint32_t bloom_perf_cnt[PERF_N];
+uint64_t bloom_perf_evt_us[PERF_EVT_N];
+uint32_t bloom_perf_evt_cnt[PERF_EVT_N];
 
 uint64_t bloom_perf_now(void)
 {
@@ -206,48 +208,184 @@ static inline void copy24(const uint16_t *vram, int w, int h)
 	}
 }
 
-/* One line a second, next to the fps counter, over the same window.
+/* The names of the event sources, in `enum psxint_ev` order (psxevents.h).
+ * Short, because fifteen of them share a line. */
+static const char *const perf_evt_name[PERF_EVT_N] = {
+	"sio", "cdr", "cdread", "gpudma", "mdecout", "spudma", "spuirq",
+	"mdecin", "gpuotc", "cdrdma", "drc", "rcnt", "cdrlid", "irq10",
+	"spuupd", "?"
+};
+
+/* THE BUCKET TABLE.  Name and parent, so that adding a bucket is one line
+ * here and one line in perf.h and the report picks it up on its own.
  *
- * Percentages of WALL TIME, not of each other, so they do not add to 100 and
- * are not meant to: `jit` overlaps everything (it is another thread) and
- * `other` is what is left after the four brackets.  The per-call figures are
- * what say whether a bucket got slower or merely got called more -- a change
- * that halves the dispatch count and leaves the microseconds alone has moved
- * nothing. */
+ * The parent column is not decoration.  `gpu` is inside `hw` because the GPU
+ * command list runs off a DMA register write, and an early report that made
+ * them siblings had the frame summing to more than the frame.  Nothing here
+ * is ever added into a total except the three PERF_IN_FRAME rows. */
+static const struct {
+	const char *name;
+	unsigned char in;
+} perf_row[PERF_N] = {
+	[PERF_CPU]       = { "cpu",    PERF_IN_FRAME },
+	[PERF_EVT]       = { "evt",    PERF_IN_FRAME },
+	[PERF_FLIP]      = { "flip",   PERF_IN_FRAME },
+	[PERF_HW]        = { "hw",     PERF_IN_CPU   },
+	[PERF_RW]        = { "rw",     PERF_IN_CPU   },
+	[PERF_COP]       = { "cop",    PERF_IN_CPU   },
+	[PERF_SVC]       = { "svc",    PERF_IN_CPU   },
+	[PERF_GPU]       = { "gpu",    PERF_IN_HW    },
+	[PERF_EMUUPDATE] = { "emuupd", PERF_IN_EVT   },
+	[PERF_LACE]      = { "lace",   PERF_IN_EVT   },
+	[PERF_SPU]       = { "spu",    PERF_IN_EVT   },
+	[PERF_VBLANK]    = { "vbl",    PERF_IN_EVT   },
+	[PERF_JIT]       = { "jit",    PERF_IN_NONE  },
+};
+
+/* A bucket, in the only two columns worth having: milliseconds per frame and
+ * calls per frame.  Calls are why this is not just a timer -- "hw 2.1 ms over
+ * 6000 accesses" and "hw 2.1 ms over 12 accesses" are different bugs. */
+/* The link counters live in the recompiler glue; declaring them here keeps
+ * platform.c out of lightrec's private header. */
+extern unsigned fgl_link_patched, fgl_link_uncompiled;
+extern unsigned fgl_link_undone, fgl_link_bad_site;
+extern unsigned fgl_link_range, fgl_link_calls;
+
+/* Mirrors the enum in lightrec-private.h; see the unlink line below. */
+extern unsigned fgl_unlink_calls[6], fgl_unlink_links[6];
+
+static void perf_col(int b, unsigned int nframes)
+{
+	printf(" %s %5.2f (%u/f)", perf_row[b].name,
+	       bloom_perf_us[b] / 1000.0f / nframes,
+	       bloom_perf_cnt[b] / nframes);
+}
+
+/* Three lines a second, next to the fps counter, over the same window.
+ *
+ * Line one is the frame: three siblings and the remainder, in MILLISECONDS
+ * PER FRAME.  The percentages are there to be glanced at, but ms/f is the
+ * column that means anything -- the split barely moves across a run while the
+ * total swings four to one, so a percentage says nothing about whether
+ * anything got faster.
+ *
+ * Line two opens up `cpu`, which was 80% of the frame and a single number.
+ * Everything on it is C that generated code called without leaving the
+ * dispatch, and `rest` is what is left: emitted instructions, the GTE, and
+ * the divide shims.  If `rest` is the whole of `cpu` then the frame is
+ * genuinely in the emitted code and the next lever is the code itself; if it
+ * is not, the named row says where to go instead.
+ *
+ * Line three opens up `evt`, which turned out to be almost entirely `rcnt`,
+ * which is not counter work: pcsx hangs the frame boundary off the counter
+ * that crosses vblank, so `lace` and `emuupd` and `spu` are in there.  A
+ * large `lace` is the render thread being waited on, and waiting is not cost.
+ *
+ * Silent rows are dropped -- fifteen event sources of which three are ever
+ * warm is a line nobody reads.
+ *
+ * THIS BUILD IS FOR READING A SPREAD, NOT FOR QUOTING A FRAME TIME.  The MMIO
+ * shims fire thousands of times a frame and each now pays two timer reads, so
+ * the total is inflated by the measurement.  Compare rows against each other,
+ * not this run against a run without the brackets. */
 static void bloom_perf_report(uint64_t window_ms, unsigned int nframes)
 {
 	uint64_t wall_us = window_ms * 1000u;
-	uint64_t sum;
+	uint64_t parents, other, kids;
 	unsigned int i;
 
 	if (!nframes || !wall_us)
 		return;
 
-	sum = bloom_perf_us[PERF_CPU] + bloom_perf_us[PERF_EVENT]
-	    + bloom_perf_us[PERF_GPU] + bloom_perf_us[PERF_FLIP];
+	parents = bloom_perf_us[PERF_CPU] + bloom_perf_us[PERF_EVT]
+		+ bloom_perf_us[PERF_FLIP];
+	other = wall_us > parents ? wall_us - parents : 0;
 
-	printf("perf %5.1f fps %6.2f ms/f | cpu %4.1f%% (%5.2f ms/f, %u/f) "
-	       "gpu %4.1f%% (%5.2f ms/f, %u/f) flip %4.1f%% (%5.2f ms/f) "
-	       "evt %4.1f%% (%5.2f ms/f) other %4.1f%% | jit %4.1f%% (%u blk)\n",
+	printf("perf %5.1f fps %6.2f ms/f | cpu %6.2f (%4.1f%%, %u/f) "
+	       "evt %6.2f (%4.1f%%, %u/f) flip %5.2f  other %5.2f (%4.1f%%)\n",
 	       (float)nframes * 1000.0f / (float)window_ms,
 	       (float)window_ms / (float)nframes,
-	       100.0f * bloom_perf_us[PERF_CPU] / wall_us,
 	       bloom_perf_us[PERF_CPU] / 1000.0f / nframes,
+	       100.0f * bloom_perf_us[PERF_CPU] / wall_us,
 	       bloom_perf_cnt[PERF_CPU] / nframes,
-	       100.0f * bloom_perf_us[PERF_GPU] / wall_us,
+	       bloom_perf_us[PERF_EVT] / 1000.0f / nframes,
+	       100.0f * bloom_perf_us[PERF_EVT] / wall_us,
+	       bloom_perf_cnt[PERF_EVT] / nframes,
+	       bloom_perf_us[PERF_FLIP] / 1000.0f / nframes,
+	       other / 1000.0f / nframes,
+	       100.0f * other / wall_us);
+
+	/* in cpu.  Only the direct children come out of `cpu`; `gpu` is
+	 * inside `hw` and is printed after them, in brackets, so that it is
+	 * never read as another slice of the same pie. */
+	kids = 0;
+	printf("  in cpu |");
+	for (i = 0; i < PERF_N; i++) {
+		if (perf_row[i].in != PERF_IN_CPU)
+			continue;
+		kids += bloom_perf_us[i];
+		perf_col(i, nframes);
+	}
+	printf("  (gpu %5.2f, %u/f)  rest %6.2f\n",
 	       bloom_perf_us[PERF_GPU] / 1000.0f / nframes,
 	       bloom_perf_cnt[PERF_GPU] / nframes,
-	       100.0f * bloom_perf_us[PERF_FLIP] / wall_us,
-	       bloom_perf_us[PERF_FLIP] / 1000.0f / nframes,
-	       100.0f * bloom_perf_us[PERF_EVENT] / wall_us,
-	       bloom_perf_us[PERF_EVENT] / 1000.0f / nframes,
-	       100.0f * (wall_us > sum ? wall_us - sum : 0) / wall_us,
-	       100.0f * bloom_perf_us[PERF_JIT] / wall_us,
+	       (bloom_perf_us[PERF_CPU] > kids
+		? bloom_perf_us[PERF_CPU] - kids : 0) / 1000.0f / nframes);
+
+	/* in evt: the warm event sources, then what the vblank tick does. */
+	printf("  in evt |");
+	for (i = 0; i < PERF_EVT_N; i++) {
+		/* A tenth of a millisecond a frame is the floor: below that a
+		 * source is noise and its column is in the way. */
+		if (bloom_perf_evt_us[i] < 100u * nframes)
+			continue;
+		printf(" %s %5.2f (%u/f)", perf_evt_name[i],
+		       bloom_perf_evt_us[i] / 1000.0f / nframes,
+		       bloom_perf_evt_cnt[i] / nframes);
+	}
+	printf("  |");
+	for (i = 0; i < PERF_N; i++)
+		if (perf_row[i].in == PERF_IN_EVT)
+			perf_col(i, nframes);
+	printf("  | jit %5.2f (%u blk)\n",
+	       bloom_perf_us[PERF_JIT] / 1000.0f / nframes,
 	       bloom_perf_cnt[PERF_JIT]);
+
+	/* Links are cumulative, not per-window: an edge is patched once and
+	 * then stops costing anything, so a rate would read as zero forever
+	 * after the first second.  `near` is how many of the patched edges were
+	 * inside a `bra`'s reach -- the population the FAR-only experiment is
+	 * about -- and it is counted even when the far path is forced. */
+	printf("  links  | near %u far %u uncompiled %u undone %u"
+	       " badsite %u calls %u\n",
+	       fgl_link_patched, fgl_link_range, fgl_link_uncompiled,
+	       fgl_link_undone, fgl_link_bad_site, fgl_link_calls);
+
+	/* WHO KEEPS KILLING THE LINKS.  A teardown is global -- freeing or
+	 * invalidating anything puts every patched site in the program back --
+	 * so `undone` above says how much work was thrown away and this says
+	 * which caller threw it.  Two numbers each: how often it fired, and
+	 * how many live links it took with it. */
+	{
+		static const char *const why[] = {
+			"invmap", "smc", "free", "inv", "invall", "lut"
+		};
+		unsigned k;
+
+		printf("  unlink |");
+		for (k = 0; k < 6; k++)
+			printf(" %s %u/%u", why[k], fgl_unlink_calls[k],
+			       fgl_unlink_links[k]);
+		printf("\n");
+	}
 
 	for (i = 0; i < PERF_N; i++) {
 		bloom_perf_us[i] = 0;
 		bloom_perf_cnt[i] = 0;
+	}
+	for (i = 0; i < PERF_EVT_N; i++) {
+		bloom_perf_evt_us[i] = 0;
+		bloom_perf_evt_cnt[i] = 0;
 	}
 }
 

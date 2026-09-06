@@ -290,6 +290,30 @@ static void lightrec_invalidate_map(struct lightrec_state *state,
 		const struct lightrec_mem_map *map, u32 addr, u32 len)
 {
 	if (map == &state->maps[PSX_MAP_KERNEL_USER_RAM]) {
+	/* EVERY LUT CLEAR HAS TO UNLINK FIRST, AND THIS ONE DID NOT.
+	 *
+	 * A patched link is a `bra` straight into another block's code.  There
+	 * is no indirection left in it -- that is the entire point -- so it
+	 * cannot notice that lightrec has dropped the block it points at.
+	 * Clearing a table slot retires a block for every route EXCEPT a
+	 * linked one, which keeps branching into code that has been freed or
+	 * overwritten underneath it.
+	 *
+	 * This is the invalidation path for guest stores and DMA into RAM, so
+	 * it fires whenever the guest writes code -- which the BIOS does
+	 * constantly while it loads the executable.  Linking only unconditional
+	 * jumps survived it by luck: a jump target is a function entry that
+	 * tends to outlive the write.  A conditional branch's FALLTHROUGH is a
+	 * block boundary that exists only because fgl ends blocks at branches,
+	 * so it is created and invalidated over and over during loading, and
+	 * linking it faulted during BIOS boot every single time.
+	 *
+	 * `fgl_unlink_all` returns immediately when nothing is linked, so the
+	 * cost on this path is one walk per invalidation storm and not one per
+	 * store. */
+		fgl_unlink_range(state, lut_offset(addr), (len + 3) / 4,
+				 FGL_UNLINK_INV_MAP);
+
 		memset(lut_address(state, lut_offset(addr)), 0,
 		       ((len + 3) / 4) * lut_elm_size(state));
 	}
@@ -397,7 +421,7 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 				 * patched link does not go through the slot,
 				 * so clearing the slot alone would leave the
 				 * stale code reachable. */
-				fgl_unlink_all(state);
+				fgl_unlink_all(state, FGL_UNLINK_SMC);
 				lut_write(state, lut_offset(block->pc), NULL);
 			}
 		}
@@ -937,7 +961,7 @@ void lightrec_free_code(struct lightrec_state *state, void *ptr)
 	 * -- and the site has to still be code we own when we do it.  Undoing
 	 * every link on any free is bloop's answer too (`blocks.h`): selective
 	 * invalidation is what direct linking costs. */
-	fgl_unlink_all(state);
+	fgl_unlink_all(state, FGL_UNLINK_FREE);
 
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_code_alloc_lock(state);
@@ -1417,19 +1441,35 @@ static void lightrec_print_info(struct lightrec_state *state)
  * that implements it: the two that spend cycles inside C are entered and left
  * through `.Lsync_out`/`.Lsync_in`, and memset is not, because it reports its
  * cost as a return value and touches neither counter. */
+/* All three are bracketed as `svc` -- the C a block leaves generated code for.
+ * It is a child of `cpu`, not a sibling: the clock is already running inside
+ * `lightrec_execute` when these are entered.  The count is the number that
+ * matters, being how often the machine gave up on staying in emitted code. */
 u32 fgl_memset(struct lightrec_state *state)
 {
-	return lightrec_memset(state);
+	u32 r;
+	PERF_BEGIN(PERF_SVC);
+	r = lightrec_memset(state);
+	PERF_END(PERF_SVC);
+	return r;
 }
 
 u32 fgl_emulate_block(struct lightrec_state *state, struct block *block, u32 pc)
 {
-	return lightrec_emulate_block(state, block, pc);
+	u32 r;
+	PERF_BEGIN(PERF_SVC);
+	r = lightrec_emulate_block(state, block, pc);
+	PERF_END(PERF_SVC);
+	return r;
 }
 
 u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg)
 {
-	return lightrec_check_load_delay(state, pc, reg);
+	u32 r;
+	PERF_BEGIN(PERF_SVC);
+	r = lightrec_check_load_delay(state, pc, reg);
+	PERF_END(PERF_SVC);
+	return r;
 }
 
 /* ---------------------------------------------------------------- */
@@ -2130,58 +2170,104 @@ static u32 hw_shim_slow(struct lightrec_state *state, u32 op, u32 addr,
 			   NULL, NULL, 0);
 }
 
+/* THE EIGHT DOORS OUT OF GENERATED CODE THAT ARE NOT MISTAKES.
+ *
+ * A guest access the optimiser proved lands in the hardware register window
+ * comes here instead of being emitted inline, and that is the design, not a
+ * fallback.  They are bracketed as `hw` so the report can say how much of the
+ * 44 ms `cpu` bucket is MMIO rather than emitted instructions, and how many
+ * accesses a frame that is -- the count is the more useful of the two, since
+ * a DMA kick and a status poll cost wildly different amounts and only the
+ * count distinguishes a game that polls from one that does not.
+ *
+ * The DMA engines hang off these, so `gpu` (do_cmd_list) is INSIDE `hw`.
+ *
+ * The bracket is two timer reads on a path that runs thousands of times a
+ * frame, which is the most expensive instrumentation in the build.  Read the
+ * spread, do not quote the frame time. */
 u32 lightrec_hw_lb(u32 addr, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+	u32 v;
 
 	if (likely(ops))
-		return (u32)(s32)(s8)ops->lb(state, 0, NULL, kaddr);
-	return hw_shim_slow(state, OP_LB, addr, 0);
+		v = (u32)(s32)(s8)ops->lb(state, 0, NULL, kaddr);
+	else
+		v = hw_shim_slow(state, OP_LB, addr, 0);
+
+	PERF_END(PERF_HW);
+	return v;
 }
 
 u32 lightrec_hw_lbu(u32 addr, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+	u32 v;
 
 	if (likely(ops))
-		return (u8)ops->lb(state, 0, NULL, kaddr);
-	return hw_shim_slow(state, OP_LBU, addr, 0);
+		v = (u8)ops->lb(state, 0, NULL, kaddr);
+	else
+		v = hw_shim_slow(state, OP_LBU, addr, 0);
+
+	PERF_END(PERF_HW);
+	return v;
 }
 
 u32 lightrec_hw_lh(u32 addr, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+	u32 v;
 
 	if (likely(ops))
-		return (u32)(s32)(s16)ops->lh(state, 0, NULL, kaddr);
-	return hw_shim_slow(state, OP_LH, addr, 0);
+		v = (u32)(s32)(s16)ops->lh(state, 0, NULL, kaddr);
+	else
+		v = hw_shim_slow(state, OP_LH, addr, 0);
+
+	PERF_END(PERF_HW);
+	return v;
 }
 
 u32 lightrec_hw_lhu(u32 addr, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+	u32 v;
 
 	if (likely(ops))
-		return (u16)ops->lh(state, 0, NULL, kaddr);
-	return hw_shim_slow(state, OP_LHU, addr, 0);
+		v = (u16)ops->lh(state, 0, NULL, kaddr);
+	else
+		v = hw_shim_slow(state, OP_LHU, addr, 0);
+
+	PERF_END(PERF_HW);
+	return v;
 }
 
 u32 lightrec_hw_lw(u32 addr, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
+	u32 v;
 
 	if (likely(ops))
-		return ops->lw(state, 0, NULL, kaddr);
-	return hw_shim_slow(state, OP_LW, addr, 0);
+		v = ops->lw(state, 0, NULL, kaddr);
+	else
+		v = hw_shim_slow(state, OP_LW, addr, 0);
+
+	PERF_END(PERF_HW);
+	return v;
 }
 
 void lightrec_hw_sb(u32 addr, u32 val, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 
@@ -2189,10 +2275,13 @@ void lightrec_hw_sb(u32 addr, u32 val, struct lightrec_state *state)
 		ops->sb(state, 0, NULL, kaddr, val);
 	else
 		hw_shim_slow(state, OP_SB, addr, val);
+
+	PERF_END(PERF_HW);
 }
 
 void lightrec_hw_sh(u32 addr, u32 val, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 
@@ -2200,10 +2289,13 @@ void lightrec_hw_sh(u32 addr, u32 val, struct lightrec_state *state)
 		ops->sh(state, 0, NULL, kaddr, val);
 	else
 		hw_shim_slow(state, OP_SH, addr, val);
+
+	PERF_END(PERF_HW);
 }
 
 void lightrec_hw_sw(u32 addr, u32 val, struct lightrec_state *state)
 {
+	PERF_BEGIN(PERF_HW);
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 
@@ -2211,6 +2303,8 @@ void lightrec_hw_sw(u32 addr, u32 val, struct lightrec_state *state)
 		ops->sw(state, 0, NULL, kaddr, val);
 	else
 		hw_shim_slow(state, OP_SW, addr, val);
+
+	PERF_END(PERF_HW);
 }
 
 void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)
@@ -2231,12 +2325,20 @@ void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)
 		return;
 	}
 
+	/* Unlink first: see lightrec_invalidate_map.  Only the slots this is
+	 * about -- the window below and no more. */
+	fgl_unlink_range(state, lut_offset(kaddr), (len + 3) / 4,
+			 FGL_UNLINK_INV);
+
 	memset(lut_address(state, lut_offset(kaddr)), 0,
 	       ((len + 3) / 4) * lut_elm_size(state));
 }
 
 void lightrec_invalidate_all(struct lightrec_state *state)
 {
+	/* Every slot at once, so every link is certainly stale. */
+	fgl_unlink_all(state, FGL_UNLINK_INV_ALL);
+
 	memset(state->code_lut, 0, lut_elm_size(state) * CODE_LUT_SIZE);
 }
 

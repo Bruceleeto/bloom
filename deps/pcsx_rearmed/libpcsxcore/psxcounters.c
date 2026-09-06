@@ -24,6 +24,7 @@
 #include "psxcounters.h"
 #include "psxevents.h"
 #include "gpu.h"
+#include "perf.h"
 //#include "debug.h"
 #define DebugVSync()
 
@@ -392,16 +393,37 @@ void psxRcntUpdate()
         // VSync irq.
         if( hSyncCount == VBlankStart )
         {
+            /* THE FRAME BOUNDARY, WHICH IS NOT COUNTER WORK.
+             *
+             * psxRcntUpdate runs twenty-odd times a frame and this branch
+             * runs once, so everything bracketed below shows up in the
+             * profile as `rcnt` and none of it is counting.  A large `lace`
+             * in particular is the render thread being WAITED ON, which is
+             * not cost -- see the report in platform.c. */
             HW_GPU_STATUS &= SWAP32(~PSXGPU_LCF);
-            GPU_vBlank( 1, 0 );
+            {
+                PERF_BEGIN(PERF_VBLANK);
+                GPU_vBlank( 1, 0 );
+                PERF_END(PERF_VBLANK);
+            }
             setIrq( 0x01 );
 
-            EmuUpdate();
-            GPU_updateLace();
+            {
+                PERF_BEGIN(PERF_EMUUPDATE);
+                EmuUpdate();
+                PERF_END(PERF_EMUUPDATE);
+            }
+            {
+                PERF_BEGIN(PERF_LACE);
+                GPU_updateLace();
+                PERF_END(PERF_LACE);
+            }
 
             if( SPU_async )
             {
+                PERF_BEGIN(PERF_SPU);
                 SPU_async( cycle, 1 );
+                PERF_END(PERF_SPU);
             }
         }
         
@@ -413,7 +435,11 @@ void psxRcntUpdate()
             hSyncCount = 0;
             frame_counter++;
 
-            gpuSyncPluginSR();
+            {
+                PERF_BEGIN(PERF_VBLANK);
+                gpuSyncPluginSR();
+                PERF_END(PERF_VBLANK);
+            }
             status = SWAP32(HW_GPU_STATUS) | PSXGPU_FIELD;
             if ((status & PSXGPU_ILACE_BITS) == PSXGPU_ILACE_BITS) {
                 field = frame_counter & 1;
@@ -421,7 +447,11 @@ void psxRcntUpdate()
                 status ^= field << 13;
             }
             HW_GPU_STATUS = SWAP32(status);
-            GPU_vBlank(0, field);
+            {
+                PERF_BEGIN(PERF_VBLANK);
+                GPU_vBlank(0, field);
+                PERF_END(PERF_VBLANK);
+            }
             if ((s32)(psxRegs.gpuIdleAfter - psxRegs.cycle) < 0)
                 psxRegs.gpuIdleAfter = psxRegs.cycle - 1; // prevent overflow
 

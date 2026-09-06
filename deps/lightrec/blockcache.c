@@ -92,7 +92,7 @@ void remove_from_code_lut(struct blockcache *cache, struct block *block)
 		/* The slot is about to stop naming this block, and a patched
 		 * link does not read the slot -- so every link has to go back
 		 * before the table does.  See lightrec_free_code. */
-		fgl_unlink_all(state);
+		fgl_unlink_all(state, FGL_UNLINK_LUT);
 		memset(lut_address(state, offset), 0,
 		       block->nb_ops * lut_elm_size(state));
 	}
