@@ -322,6 +322,23 @@ static void maybe_flush_pool(fgl_emitter *e)
  * pins.h. */
 static void ld_guest(fgl_emitter *e, unsigned g, int rn)
 {
+	/* $zero IS A CONSTANT, AND `st_guest` ALREADY KNOWS IT.
+	 *
+	 * The store side has refused to write guest 0 since the beginning; the
+	 * load side did not, so every read of `$zero` was a d-cache access to a
+	 * word that is architecturally 0 and that nothing may ever change.  The
+	 * harness caught it after FGL_GBASE landed: 6,294,591 reads, third in
+	 * the whole register histogram at 6.7%, all of them in block bodies.
+	 *
+	 * Same instruction count on the GBASE path and one fewer without it,
+	 * but the count is not the point -- it removes 6.3M data reads and 6.3M
+	 * dependencies on the base register, and this machine pays for memory
+	 * rather than for issue slots. */
+	if (g == 0) {
+		sh4_emit_mov_imm(&e->cg, 0, rn);
+		return;
+	}
+
 #if FGL_GBASE
 	/* One instruction, straight to the destination, and R0 never involved
 	 * -- which is the dependency chain as much as the count.  See pins.h. */
