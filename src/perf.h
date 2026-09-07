@@ -79,12 +79,28 @@ enum { PERF_IN_FRAME, PERF_IN_CPU, PERF_IN_HW, PERF_IN_EVT, PERF_IN_NONE };
 
 extern uint64_t bloom_perf_us[PERF_N];
 extern uint32_t bloom_perf_cnt[PERF_N];
+
+/* WALL TIME IN A BUCKET IS NOT THE SAME AS COST, and `lace` is the row where
+ * the difference decides what to do next.  `GPU_updateLace` blocks until the
+ * render thread is done, so its 15 ms a frame is either the emulator standing
+ * still with work left to do -- the largest single item outside generated
+ * code -- or the SH-4 asleep on a vblank it was going to miss anyway, which
+ * is slack and cannot be reclaimed by making anything faster.
+ *
+ * The two are indistinguishable from a timer, so this samples the IDLE thread
+ * either side of the bracket as well.  Idle time that accrues while the
+ * bracket is open is time the scheduler had nothing to run: subtract it and
+ * what is left is what the bucket actually costs. */
+extern uint64_t bloom_perf_idle_us[PERF_N];
 extern uint64_t bloom_perf_evt_us[PERF_EVT_N];
 extern uint32_t bloom_perf_evt_cnt[PERF_EVT_N];
 
 /* Microseconds.  Defined in platform.c so that lightrec and pcsx_rearmed do
  * not have to see a KOS header to be bracketed. */
 uint64_t bloom_perf_now(void);
+
+/* Microseconds the idle thread has accumulated, from the same place. */
+uint64_t bloom_perf_idle_now(void);
 
 /* OFF BY DEFAULT, AND THE MACROS VANISH WHEN IT IS.
  *
@@ -113,6 +129,17 @@ uint64_t bloom_perf_now(void);
 	} while (0)
 
 /* The same, for a bucket chosen at run time. */
+/* The same pair, plus the idle delta.  Two extra reads, so it goes only on a
+ * bucket where the distinction is the question being asked. */
+#define PERF_BEGIN_I(b)         uint64_t perf_t0_##b = bloom_perf_now();     \
+				uint64_t perf_i0_##b = bloom_perf_idle_now()
+#define PERF_END_I(b)   do {                                             \
+		bloom_perf_us[b] += bloom_perf_now() - perf_t0_##b;      \
+		bloom_perf_idle_us[b] += bloom_perf_idle_now()           \
+				       - perf_i0_##b;                    \
+		bloom_perf_cnt[b]++;                                     \
+	} while (0)
+
 #define PERF_BEGIN_AT(v)        uint64_t v = bloom_perf_now()
 #define PERF_END_EVT(v, i)      do {                                     \
 		bloom_perf_evt_us[i] += bloom_perf_now() - (v);          \
@@ -123,6 +150,8 @@ uint64_t bloom_perf_now(void);
 
 #define PERF_BEGIN(b)           do { } while (0)
 #define PERF_END(b)             do { } while (0)
+#define PERF_BEGIN_I(b)         do { } while (0)
+#define PERF_END_I(b)           do { } while (0)
 #define PERF_BEGIN_AT(v)        do { } while (0)
 #define PERF_END_EVT(v, i)      do { } while (0)
 

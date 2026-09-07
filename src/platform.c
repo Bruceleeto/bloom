@@ -40,12 +40,19 @@ static uint64_t timer_ms;
 
 uint64_t bloom_perf_us[PERF_N];
 uint32_t bloom_perf_cnt[PERF_N];
+uint64_t bloom_perf_idle_us[PERF_N];
 uint64_t bloom_perf_evt_us[PERF_EVT_N];
 uint32_t bloom_perf_evt_cnt[PERF_EVT_N];
 
 uint64_t bloom_perf_now(void)
 {
 	return timer_us_gettime64();
+}
+
+/* KOS accounts the idle thread in nanoseconds. */
+uint64_t bloom_perf_idle_now(void)
+{
+	return thd_get_cpu_time(thd_get_idle()) / 1000u;
 }
 /* Whether the PVR, and not the emulator, is what the frame is waiting on.
  * Read by the renderer: cutting PVR work is only worth VRAM when this is
@@ -259,6 +266,14 @@ static void perf_col(int b, unsigned int nframes)
 	printf(" %s %5.2f (%u/f)", perf_row[b].name,
 	       bloom_perf_us[b] / 1000.0f / nframes,
 	       bloom_perf_cnt[b] / nframes);
+
+	/* Only the buckets that asked for it carry an idle figure, and it is
+	 * printed as "of which idle" rather than netted off, because the
+	 * subtraction is the reader's judgement: a row that is nearly all
+	 * idle is slack, a row that is nearly none is work. */
+	if (bloom_perf_idle_us[b])
+		printf("[idle %4.1f]",
+		       bloom_perf_idle_us[b] / 1000.0f / nframes);
 }
 
 /* Three lines a second, next to the fps counter, over the same window.
@@ -387,6 +402,7 @@ static void bloom_perf_report(uint64_t window_ms, unsigned int nframes)
 	for (i = 0; i < PERF_N; i++) {
 		bloom_perf_us[i] = 0;
 		bloom_perf_cnt[i] = 0;
+		bloom_perf_idle_us[i] = 0;
 	}
 	for (i = 0; i < PERF_EVT_N; i++) {
 		bloom_perf_evt_us[i] = 0;
@@ -525,6 +541,24 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		overlay_set("%.1f fps  %.2f ms",
 			    (float)frames * 1000.0f / (float)(new_timer - timer_ms),
 			    (float)(new_timer - timer_ms) / (float)frames);
+
+#if FGL_FAULT_IO
+		/* Faults per frame, and the last address one came from.  A
+		 * device-heavy frame is a few thousand; anything in the
+		 * millions is a poll loop that is not getting the answer it
+		 * wants, and the address says which one. */
+		{
+			extern unsigned int fgl_fault_io_count;
+			extern unsigned int fgl_fault_io_last;
+			static unsigned int last_count;
+			unsigned int now = fgl_fault_io_count;
+
+			fprintf(stderr, "fgl: io %u faults/frame last %08x\n",
+				frames ? (now - last_count) / frames : 0,
+				fgl_fault_io_last);
+			last_count = now;
+		}
+#endif
 
 		/* Idle on the SH-4 that the PVR is being waited on for. */
 		bloom_pvr_bound = idle_diff * 100 > cpu_diff * 10

@@ -414,9 +414,9 @@ void psxRcntUpdate()
                 PERF_END(PERF_EMUUPDATE);
             }
             {
-                PERF_BEGIN(PERF_LACE);
+                PERF_BEGIN_I(PERF_LACE);
                 GPU_updateLace();
-                PERF_END(PERF_LACE);
+                PERF_END_I(PERF_LACE);
             }
 
             if( SPU_async )

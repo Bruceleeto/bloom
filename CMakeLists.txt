@@ -86,6 +86,17 @@ set(ENABLE_CODE_BUFFER ON CACHE INTERNAL "" FORCE)
 # its own -- emitter.c and regcache.c are out of its source list and fgl's
 # sources are in -- but everything else it does, the optimiser above all, is
 # unchanged and is the reason fgl can be as small as it is.
+# BEFORE add_subdirectory, and that is the whole point of the position.
+# `add_compile_definitions` only reaches targets declared after it, and the
+# PERF_HW / PERF_RW timers live in lightrec.c -- so with this below the
+# subdirectory the shim columns compile out and read a confident `0.00 (0/f)`
+# whether or not the shims ran.  A zero that cannot be distinguished from
+# "never called" is worse than no column at all.
+option(WITH_PERF "Per-stage wall-clock breakdown down the serial port" OFF)
+if (WITH_PERF)
+	add_compile_definitions(BLOOM_PERF=1)
+endif (WITH_PERF)
+
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
@@ -223,10 +234,6 @@ if (WITH_FGL_NO_GBASE)
 	add_compile_definitions(FGL_GBASE=0)
 endif (WITH_FGL_NO_GBASE)
 
-option(WITH_PERF "Per-stage wall-clock breakdown down the serial port" OFF)
-if (WITH_PERF)
-	add_compile_definitions(BLOOM_PERF=1)
-endif (WITH_PERF)
 
 if (WITH_HYBRID_RENDERING)
 	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
