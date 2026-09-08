@@ -26,6 +26,7 @@
 #include "gpu.h"
 #include "perf.h"
 //#include "debug.h"
+#include "deadline.h"
 #define DebugVSync()
 
 /******************************************************************************/
@@ -416,6 +417,16 @@ void psxRcntUpdate()
             {
                 PERF_BEGIN_I(PERF_LACE);
                 GPU_updateLace();
+                fgl_deadline_report(psxRegs.cycle);
+                if (FGL_DL_TRACE) {
+                        /* Not here.  This runs inside the RCNT handler, with
+                         * that event's bit already cleared and psxRcntSet not
+                         * yet run, so the mask always reads 0 and next_interupt
+                         * always reads stale.  Ask the hook to dump instead --
+                         * that is a real crossing, before anything is drained. */
+                        static unsigned sec;
+                        if (++sec >= 60) { sec = 0; fgl_dump_pending = 1; }
+                }
                 PERF_END_I(PERF_LACE);
             }
 

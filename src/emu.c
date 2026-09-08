@@ -25,10 +25,12 @@
 
 #include <sys/stat.h>
 
+#include "deadline.h"
 #include "bloom-config.h"
 #include "emu.h"
 #include "gte_fpu.h"
 #include "pvr.h"
+#include "dlcheck.h"
 
 int fs_fat_init(void);
 void fs_fat_shutdown(void);
@@ -42,9 +44,16 @@ bool started;
 void SysPrintf(const char *fmt, ...) {
 	va_list list;
 
+	/* A print over dcload is tens of thousands of SH-4 instructions with
+	 * no guest cause.  Unbracketed it becomes guest cycles, and the jump
+	 * lands wherever the print happened to be called from. */
+	if (FGL_DL_MEASURE)
+		fgl_deadline_pause();
 	va_start(list, fmt);
 	vfprintf(stderr, fmt, list);   /* TEMP: stdout is block-buffered here */
 	va_end(list);
+	if (FGL_DL_MEASURE)
+		fgl_deadline_resume();
 }
 
 void SysMessage(const char *fmt, ...) {
@@ -156,6 +165,8 @@ static pvr_init_params_t pvr_init_params_fsaa = {
 
 int main(int argc, char **argv)
 {
+	fgl_dl_check_prfc1();
+
 	enum vid_display_mode_generic video_mode;
 	bool should_exit;
 

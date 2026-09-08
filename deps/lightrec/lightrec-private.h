@@ -551,6 +551,24 @@ extern unsigned fgl_link_bad_site;
 /* What that assembly calls back into. The last three exist because lightrec's
  * own functions are static; see the comment on them in lightrec.c. */
 void *fgl_get_next_block(struct lightrec_state *state, u32 pc);
+
+/* From src/deadline.h, declared here so lightrec needs no extra include. */
+#ifndef FGL_DEADLINE
+#define FGL_DEADLINE 0
+#endif
+#ifndef FGL_DL_FIT
+#define FGL_DL_FIT 0
+#endif
+#define FGL_DL_MEASURE (FGL_DEADLINE || FGL_DL_FIT)
+void fgl_deadline_pause(void);
+void fgl_deadline_resume(void);
+
+/* src/deadline.h, declared here so lightrec needs no extra include path. */
+#ifndef FGL_DEADLINE
+#define FGL_DEADLINE 0
+#endif
+void fgl_deadline_pause(void);
+void fgl_deadline_resume(void);
 u32 fgl_memset(struct lightrec_state *state);
 u32 fgl_emulate_block(struct lightrec_state *state, struct block *block, u32 pc);
 u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg);

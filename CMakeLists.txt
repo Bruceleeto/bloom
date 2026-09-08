@@ -229,6 +229,22 @@ option(WITH_FPS_OVERLAY "Draw an on-screen fps/frame-time counter" OFF)
 # instruction instead of the GBR/r0 pair, at the price of one rotating
 # allocator register.  OFF puts r3 back in the pool and every guest access back
 # on the pair.  This is the A/B for the 27.9% the pair costs.
+option(WITH_FGL_DEADLINE "fgl: flat per-block cycle charge instead of per-opcode" OFF)
+if (WITH_FGL_DEADLINE)
+	add_compile_definitions(FGL_DEADLINE=1)
+endif (WITH_FGL_DEADLINE)
+
+option(WITH_FGL_DL_FIT "fgl: sample PRFC1 and print the fitted K (counter build)" OFF)
+if (WITH_FGL_DL_FIT)
+	add_compile_definitions(FGL_DL_FIT=1)
+endif (WITH_FGL_DL_FIT)
+
+set(WITH_FGL_DL_K "1024" CACHE STRING "fgl: guest cycles per SH-4 instruction, in 1/1024ths (deadline only)")
+add_compile_definitions(FGL_DL_K=${WITH_FGL_DL_K})
+
+set(WITH_FGL_DL_OVERSHOOT "128" CACHE STRING "fgl: guest cycles the hook may run past next_interupt before carrying the rest (deadline only)")
+add_compile_definitions(FGL_DL_OVERSHOOT=${WITH_FGL_DL_OVERSHOOT})
+
 option(WITH_FGL_NO_GBASE "Put guest registers back on the GBR/r0 pair" OFF)
 if (WITH_FGL_NO_GBASE)
 	add_compile_definitions(FGL_GBASE=0)
@@ -272,6 +288,8 @@ add_executable(bloom
 	src/input.c
 	src/mcd.c
 	src/mmap.c
+	src/dlcheck.c
+	src/deadline.c
 	src/platform.c
 	src/plugins.c
 )

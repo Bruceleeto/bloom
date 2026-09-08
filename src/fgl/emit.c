@@ -2141,14 +2141,27 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	 * identical layout and the comparison is not confounded by it. */
 	n_ops += FGL_CYCLE_BIAS;
 
-	while (n_ops > FGL_CYCLE_ENTRIES - 1) {
-		sh4_emit_mov_l_load_gbr(&e->cg,
-					(int)(FGL_AT_CYCLES + FGL_CYCLE_ENTRIES - 1));
+	if (FGL_DEADLINE) {
+		/* THE DEADLINE.  Nothing is emitted.  r14 stops being a
+		 * countdown and becomes a pure gate: non-zero means run,
+		 * zero means go to the dispatcher, and the only things that
+		 * ever write it are the dispatcher itself and TMU2's handler.
+		 * The `cmp/pl r14; bf` at the link arms below and at the
+		 * dispatcher entry are unchanged, and are the only tests.
+		 *
+		 * The guest's clock is advanced at the crossings instead, from
+		 * PRFC1.  See src/deadline.c. */
+		(void)n_ops;
+	} else {
+		while (n_ops > FGL_CYCLE_ENTRIES - 1) {
+			sh4_emit_mov_l_load_gbr(&e->cg,
+						(int)(FGL_AT_CYCLES + FGL_CYCLE_ENTRIES - 1));
+			sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
+			n_ops -= FGL_CYCLE_ENTRIES - 1;
+		}
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
 		sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
-		n_ops -= FGL_CYCLE_ENTRIES - 1;
 	}
-	sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
-	sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
 
 	/* THE LINK, WHEN THE SUCCESSORS WERE KNOWN AT COMPILE TIME.
 	 *

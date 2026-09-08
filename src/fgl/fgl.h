@@ -250,6 +250,13 @@ uint32_t fgl_size(const fgl_emitter *e);
 
 /* Cycles added to every block's charge.  Zero is the real clock; a
  * non-zero value is the A/B described at the charge site in emit.c. */
+/* THE DEADLINE.  See src/deadline.h and src/deadline.c: generated code carries
+ * no cycle arithmetic, r14 is a gate closed from outside, and the guest is
+ * charged at the crossings for the work PRFC1 says it did. */
+#ifndef FGL_DEADLINE
+#define FGL_DEADLINE 0
+#endif
+
 #ifndef FGL_CYCLE_BIAS
 #define FGL_CYCLE_BIAS 0
 #endif

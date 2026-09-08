@@ -147,6 +147,8 @@ __api __cnst struct lightrec_registers *
 lightrec_get_registers(struct lightrec_state *state);
 
 __api u32 lightrec_current_cycle_count(const struct lightrec_state *state);
+__api void lightrec_cycle_pair(struct lightrec_state *state,
+			       volatile u32 **current, volatile u32 **target);
 __api void lightrec_reset_cycle_count(struct lightrec_state *state, u32 cycles);
 /* The guest PC the dispatcher is currently at.  fgl's in-place event service
  * needs to hand it to the pcsx side and take back whatever an exception moved

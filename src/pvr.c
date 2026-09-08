@@ -28,6 +28,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "overlay.h"
+#include "deadline.h"
 #include "perf.h"
 #include "pvr.h"
 
@@ -3074,7 +3075,17 @@ static void process_gpu_commands(void)
 int do_cmd_list(uint32_t *list, int list_len,
 		int *cycles_sum_out, int *cycles_last, int *last_cmd)
 {
+	/* THE RENDERER IS NOT THE GUEST.
+	 *
+	 * The third and last bracket.  bloom draws in the GP0 write handler,
+	 * so renderer time lands inside an MMIO crossing -- the one kind of C
+	 * work K is supposed to absorb, and the one kind it cannot: a single
+	 * GP0 write is a vertex or a whole textured poly depending on nothing
+	 * the guest can be charged for.  Both callers, the register write and
+	 * the DMA2 chain, come through here, so one bracket covers both. */
 	PERF_BEGIN(PERF_GPU);
+	fgl_deadline_pause();
+
 	bool multicolor, multiple, textured;
 	int cpu_cycles_sum = 0, cpu_cycles = *cycles_last;
 	uint32_t cmd = 0, len;
@@ -3208,6 +3219,7 @@ out:
 	*cycles_sum_out += cpu_cycles_sum;
 	*cycles_last = cpu_cycles;
 	*last_cmd = cmd;
+	fgl_deadline_resume();
 	PERF_END(PERF_GPU);
 	return list - list_start;
 }

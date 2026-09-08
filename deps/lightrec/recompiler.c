@@ -9,6 +9,7 @@
 #include "lightrec-private.h"
 #include "memmanager.h"
 #include "reaper.h"
+#include "deadline.h"
 #include "slist.h"
 
 #include <errno.h>
@@ -139,7 +140,15 @@ static void lightrec_compile_list(struct recompiler *rec,
 		pthread_mutex_unlock(&rec->mutex);
 
 		if (likely(!block_has_flag(block, BLOCK_IS_DEAD))) {
+			/* PRFC1 counts the whole chip, not one thread, so a
+			 * compile on this worker is charged to the guest even
+			 * though the main thread never left generated code.
+			 * Bracket it here, where it actually runs. */
+			if (FGL_DL_MEASURE)
+				fgl_deadline_pause();
 			ret = lightrec_compile_block(thd->cstate, block);
+			if (FGL_DL_MEASURE)
+				fgl_deadline_resume();
 			if (ret == -ENOMEM) {
 				/* Code buffer is full. Request the reaper to
 				 * flush it. */

@@ -23,6 +23,7 @@
 
 #include "psxhw.h"
 #include "psxevents.h"
+#include "deadline.h"
 #include "mdec.h"
 #include "cdrom.h"
 #include "gpu.h"
@@ -40,6 +41,27 @@ void psxHwReset() {
 void psxHwWriteIstat(u32 value)
 {
 	u32 stat = psxHu16(0x1070) & value;
+
+	if (FGL_DL_TRACE)
+		fgl_trace('I', value & 0xffff, psxHu16(0x1070));
+
+	/* THE CD LINE IS HELD, NOT PULSED.  setIrq only raises I_STAT bit 2 on
+	 * the edge where the controller's IrqStat goes non-zero, so once the
+	 * guest clears that bit while the CD is still holding an unacked
+	 * interrupt, nothing ever raises it again and the guest polls forever.
+	 * On real hardware the two writes -- ack the CD, then ack I_STAT --
+	 * are a handful of instructions apart and a CD response never lands
+	 * between them.  A deadline clock puts hundreds of guest cycles there,
+	 * so it does.  Refusing to clear the bit while the controller still
+	 * asserts makes the outcome independent of where the event lands. */
+	if (FGL_DEADLINE) {
+		u32 istat, imask, pend;
+
+		fgl_cdr_state(&istat, &imask, &pend);
+		if (istat & imask)
+			stat |= 0x4;
+	}
+
 	psxHu16ref(0x1070) = SWAPu16(stat);
 
 	psxRegs.CP0.n.Cause &= ~0x400;

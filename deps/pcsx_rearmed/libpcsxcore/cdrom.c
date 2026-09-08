@@ -29,6 +29,7 @@
 #include "ppf.h"
 #include "psxdma.h"
 #include "psxevents.h"
+#include "deadline.h"
 #include "arm_features.h"
 
 /* logging */
@@ -37,8 +38,11 @@
 #else
 #define CDR_LOG(...)
 #endif
+/* "irq miss" and "loaded on ack" are the two lines that say a sector arrived
+ * while the guest had not acknowledged the previous CD interrupt -- the shape
+ * of the BIOS CD wait hanging forever.  Flip to 1 with FGL_DL_TRACE. */
 #if 0
-#define CDR_LOG_I SysPrintf
+#define CDR_LOG_I(fmt, ...) SysPrintf("%u cdrom: " fmt, psxRegs.cycle, ##__VA_ARGS__)
 #else
 #define CDR_LOG_I(fmt, ...) \
 	log_unhandled("%u cdrom: " fmt, psxRegs.cycle, ##__VA_ARGS__)
@@ -248,6 +252,15 @@ enum drive_state {
 
 static struct CdrStat cdr_stat;
 
+/* For the stuck-point dump: the two flags that decide whether a delivered
+ * sector reaches the guest, plus the mask that gates them. */
+void fgl_cdr_state(u32 *irqstat, u32 *irqmask, u32 *irq1pending)
+{
+	*irqstat = cdr.IrqStat;
+	*irqmask = cdr.IrqMask;
+	*irq1pending = cdr.Irq1Pending;
+}
+
 static unsigned int msf2sec(const u8 *msf) {
 	return ((msf[0] * 60 + msf[1]) * 75) + msf[2];
 }
@@ -300,6 +313,9 @@ static void setIrq(u8 irq, int log_cmd)
 	cdr.IrqStat = irq;
 	if ((old ^ new_) & new_)
 		psxHu32ref(0x1070) |= SWAP32((u32)0x4);
+
+	if (FGL_DL_TRACE)
+		fgl_trace('S', irq, psxHu32(0x1070) & 0xffff);
 
 #ifdef CDR_LOG_CMD_IRQ
 	if (cdr.IrqStat)
@@ -1595,6 +1611,8 @@ void cdrWrite3(unsigned char rt) {
 	case 0:
 		break; // transfer
 	case 1:
+		if (FGL_DL_TRACE)
+			fgl_trace('A', rt, cdr.IrqStat);
 		if (cdr.IrqStat & rt) {
 			u32 nextCycle = psxRegs.intCycle[PSXINT_CDR].sCycle
 				+ psxRegs.intCycle[PSXINT_CDR].cycle;
@@ -1641,6 +1659,15 @@ void cdrWrite3(unsigned char rt) {
 		}
 		return;
 	}
+
+	/* THE SECTOR HANDSHAKE.  'B' is the guest asking for the sector it
+	 * believes has arrived; the offset/size pair says what the model
+	 * actually has.  A B whose offset is not already at the end of the
+	 * previous sector means the two disagree, and that is the short DMA
+	 * one step before it happens. */
+	if (FGL_DL_TRACE)
+		fgl_trace3('B', rt, ((u32)cdr.FifoOffset << 16) | cdr.FifoSize,
+			   ((u32)cdr.Reading << 8) | cdr.Mode);
 
 	// test: Viewpoint
 	if ((rt & 0x80) && cdr.FifoOffset < cdr.FifoSize) {
@@ -1696,6 +1723,11 @@ void psxDma3(u32 madr, u32 bcr, u32 chcr) {
 			- CdlPlay
 			- Spams DMA3 and gets buffer overrun
 			*/
+			if (FGL_DL_TRACE)
+				fgl_trace3('D', madr, cdsize,
+					   ((u32)cdr.FifoOffset << 16)
+					   | cdr.FifoSize);
+
 			size = DATA_SIZE - cdr.FifoOffset;
 			if (size > cdsize)
 				size = cdsize;

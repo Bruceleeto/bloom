@@ -839,7 +839,29 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
  * arrived at in `state->curr_pc` -- which the dispatcher re-reads rather than
  * trusting its own exit register, because this may have run the interpreter
  * and moved it. */
+/* THE COMPILER IS NOT THE GUEST.
+ *
+ * The second of the two brackets.  Block lookup and compilation are thousands
+ * of SH-4 instructions of host work with no guest instruction behind them, and
+ * cold boot does it thousands of times, so this is the one expensive thing that
+ * does not already run at the hook. */
+static void *fgl_get_next_block_inner(struct lightrec_state *state, u32 pc);
+
 void * fgl_get_next_block(struct lightrec_state *state, u32 pc)
+{
+	void *ret;
+
+	if (!FGL_DL_MEASURE)
+		return fgl_get_next_block_inner(state, pc);
+
+	fgl_deadline_pause();
+	ret = fgl_get_next_block_inner(state, pc);
+	fgl_deadline_resume();
+
+	return ret;
+}
+
+static void *fgl_get_next_block_inner(struct lightrec_state *state, u32 pc)
 {
 	struct block *block;
 	bool should_recompile;
@@ -2409,6 +2431,19 @@ void lightrec_set_curr_pc(struct lightrec_state *state, u32 pc)
 u32 lightrec_current_cycle_count(const struct lightrec_state *state)
 {
 	return state->current_cycle;
+}
+
+/* THE CYCLE PAIR, BY ADDRESS.
+ *
+ * bloom's deadline handler runs in an interrupt, on a stack that may be inside
+ * generated code, and its job is to collapse `target_cycle` onto
+ * `current_cycle` so the next test of the gate fails.  It cannot call in here
+ * to do it, so it takes the two addresses once at init. */
+void lightrec_cycle_pair(struct lightrec_state *state,
+			 volatile u32 **current, volatile u32 **target)
+{
+	*current = &state->current_cycle;
+	*target = &state->target_cycle;
 }
 
 void lightrec_reset_cycle_count(struct lightrec_state *state, u32 cycles)

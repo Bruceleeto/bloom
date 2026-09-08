@@ -43,6 +43,14 @@ union psxCP0Regs_;
 struct psxRegisters;
 
 u32  schedule_timeslice(struct psxRegisters *regs);
+void fgl_dump_events(void);
+void fgl_cdr_state(u32 *irqstat, u32 *irqmask, u32 *irq1pending);
+/* tags: 'S' cd setIrq, 'A' guest acks the cd register, 'I' guest writes I_STAT,
+ * 'B' guest requests sector data (BFRD), 'D' DMA3 moves it into guest RAM */
+void fgl_trace(char tag, u32 a, u32 b);
+void fgl_trace3(char tag, u32 a, u32 b, u32 c);
+extern u32 fgl_last_mmio;   /* address of the most recent MMIO crossing */
+extern int fgl_dump_pending;/* set once a second, consumed at the next hook */
 void irq_test(union psxCP0Regs_ *cp0);
 void gen_interupt(union psxCP0Regs_ *cp0);
 void events_restore(void);

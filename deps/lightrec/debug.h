@@ -9,6 +9,20 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "deadline.h"
+
+/* A LOG LINE IS NOT GUEST WORK.  These go straight to fprintf, so unbracketed
+ * they land on the guest clock as thousands of cycles at whatever point the
+ * compiler happened to print -- which is why K only ever wandered while a
+ * level was loading. */
+#define LIGHTREC_LOG(stream, ...) do {					\
+	if (FGL_DL_MEASURE)						\
+		fgl_deadline_pause();					\
+	fprintf(stream, __VA_ARGS__);					\
+	if (FGL_DL_MEASURE)						\
+		fgl_deadline_resume();					\
+} while (0)
+
 #define NOLOG_L 0
 #define ERROR_L 1
 #define WARNING_L 2
@@ -37,14 +51,14 @@
 # ifdef COLOR_DEBUG
 #  define pr_debug(str, ...) do {					\
 	if (isatty(STDOUT_FILENO))					\
-		fprintf(stdout, COLOR_DEBUG "DEBUG: " str COLOR_END,	\
+		LIGHTREC_LOG(stdout, COLOR_DEBUG "DEBUG: " str COLOR_END,	\
 			##__VA_ARGS__);					\
 	else								\
-		fprintf(stdout, "DEBUG: " str, ##__VA_ARGS__);		\
+		LIGHTREC_LOG(stdout, "DEBUG: " str, ##__VA_ARGS__);		\
 	} while (0)
 # else
 #  define pr_debug(...) \
-    fprintf(stdout, "DEBUG: " __VA_ARGS__)
+    LIGHTREC_LOG(stdout, "DEBUG: " __VA_ARGS__)
 # endif
 #else
 #define pr_debug(...)
@@ -53,10 +67,10 @@
 #if (LOG_LEVEL >= INFO_L)
 # ifdef COLOR_INFO
 #  define pr_info(str, ...) \
-    fprintf(stdout, COLOR_INFO str COLOR_END, ##__VA_ARGS__)
+    LIGHTREC_LOG(stdout, COLOR_INFO str COLOR_END, ##__VA_ARGS__)
 # else
 #  define pr_info(...) \
-    fprintf(stdout, __VA_ARGS__)
+    LIGHTREC_LOG(stdout, __VA_ARGS__)
 # endif
 #else
 #define pr_info(...)
@@ -66,14 +80,14 @@
 # ifdef COLOR_WARNING
 #  define pr_warn(str, ...) do {					\
 	if (isatty(STDERR_FILENO))					\
-		fprintf(stderr, COLOR_WARNING "WARNING: " str COLOR_END,\
+		LIGHTREC_LOG(stderr, COLOR_WARNING "WARNING: " str COLOR_END,\
 			##__VA_ARGS__);					\
 	else								\
-		fprintf(stderr, "WARNING: " str, ##__VA_ARGS__);	\
+		LIGHTREC_LOG(stderr, "WARNING: " str, ##__VA_ARGS__);	\
 	} while (0)
 # else
 #  define pr_warn(...) \
-    fprintf(stderr, "WARNING: " __VA_ARGS__)
+    LIGHTREC_LOG(stderr, "WARNING: " __VA_ARGS__)
 # endif
 #else
 #define pr_warn(...)
@@ -83,14 +97,14 @@
 # ifdef COLOR_ERROR
 #  define pr_err(str, ...) do {						\
 	if (isatty(STDERR_FILENO))					\
-		fprintf(stderr, COLOR_ERROR "ERROR: " str COLOR_END,	\
+		LIGHTREC_LOG(stderr, COLOR_ERROR "ERROR: " str COLOR_END,	\
 			##__VA_ARGS__);					\
 	else								\
-		fprintf(stderr, "ERROR: " str, ##__VA_ARGS__);		\
+		LIGHTREC_LOG(stderr, "ERROR: " str, ##__VA_ARGS__);		\
 	} while (0)
 # else
 #  define pr_err(...) \
-    fprintf(stderr, "ERROR: " __VA_ARGS__)
+    LIGHTREC_LOG(stderr, "ERROR: " __VA_ARGS__)
 # endif
 #else
 #define pr_err(...)
