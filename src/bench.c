@@ -12,7 +12,7 @@ void fgl_bench_vsync(unsigned int guest_cycle)
 {
 	static uint64_t t0;
 	static uint32_t c0, cprev, jump;
-	static uint32_t b0, bprev;
+	static uint32_t b0, bprev, r0_, i0_, n0_;
 	static uint64_t msprev;
 	static unsigned int vsyncs, beat, done;
 	uint64_t now, ms;
@@ -41,6 +41,9 @@ void fgl_bench_vsync(unsigned int guest_cycle)
 		c0 = guest_cycle;
 		cprev = guest_cycle;
 		b0 = bprev = fgl_blocks_run;
+		r0_ = fgl_blocks_ret;
+		i0_ = fgl_blocks_ind;
+		n0_ = fgl_blocks_nolink;
 		msprev = 0;
 		printf("bench: start at vsync %u, %u to go\n",
 		       vsyncs, FGL_BENCH_VSYNCS);
@@ -95,4 +98,20 @@ void fgl_bench_vsync(unsigned int guest_cycle)
 	       ms ? (unsigned)((uint64_t)FGL_BENCH_VSYNCS * 1000u / ms) : 0,
 	       jump, fgl_blocks_run - b0,
 	       ms ? (unsigned)((uint64_t)(fgl_blocks_run - b0) * 1000u / ms) : 0);
+
+	/* WHERE THE DISPATCHER ENTRIES COME FROM.  A capture-terminated block
+	 * can never be linked, so each of these is one entry; the remainder is
+	 * everything else that reaches `.Lrun`.  If `ret` is the bulk of it,
+	 * a return address stack is the fix and it is worth building. */
+	{
+		unsigned r = fgl_blocks_ret - r0_, i = fgl_blocks_ind - i0_;
+		unsigned nl = fgl_blocks_nolink - n0_;
+		unsigned t = fgl_blocks_run - b0;
+
+		printf("bench: entries %u | ret %u (%u%%) ind %u (%u%%)"
+		       " nolink %u (%u%%) other %u (%u%%)\n",
+		       t, r, t ? r * 100u / t : 0, i, t ? i * 100u / t : 0,
+		       nl, t ? nl * 100u / t : 0,
+		       t - r - i - nl, t ? (t - r - i - nl) * 100u / t : 0);
+	}
 }

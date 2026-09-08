@@ -2017,6 +2017,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		break;
 
 	case IR_CAPTURE:
+		e->cap_rs = (int)p->rs + 1;             /* see fgl.h */
 		rs = operand(e, p->hs, p->rs, FGL_R_XFER);
 		if (rs != FGL_R_EXIT)
 			sh4_emit_mov_reg(&e->cg, rs, FGL_R_EXIT);
@@ -2080,6 +2081,25 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 			emit_fixup(e, &a->fix[f++]);
 		maybe_flush_pool(e);
 		emit_node(e, &ir[i]);
+
+		/* PARK T ACROSS THE DELAY SLOT.
+		 *
+		 * The link arm below is chosen by the T bit IR_COND's
+		 * comparison left standing, and that only survives while
+		 * IR_COND is the last node.  The decoder puts a transfer AHEAD
+		 * of its delay slot, so whenever the slot decoded to anything
+		 * real there are nodes after this one and any of them may write
+		 * T -- which is why those blocks used to get no link site and
+		 * dispatched on every execution for ever.
+		 *
+		 * Two instructions here, two at the link point, in conditional
+		 * blocks only.  r0 is per-node scratch and nothing carries a
+		 * value in it across a node boundary. */
+		if (ir[i].op == IR_COND && i != n - 1) {
+			sh4_emit_movt(&e->cg, FGL_R_XFER);
+			sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_TSAVE);
+			e->cond_saved = 1;
+		}
 	}
 
 	while (f < a->n_fix)
@@ -2198,6 +2218,54 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	{
 		const ir_node *t = (n > 0) ? &ir[n - 1] : NULL;
 
+		/* THE BACKWARD SCAN, FOR UNCONDITIONAL JUMPS ONLY.
+		 *
+		 * The decoder puts a transfer AHEAD of its delay slot, so in
+		 * `j target; addiu $a0,$a0,1` the IR_JUMP is at n-2 and the
+		 * slot's node is last.  Testing only the last node meant a
+		 * block whose delay slot decoded to anything real got NO link
+		 * site and went round the dispatcher on every execution for
+		 * ever.  Measured: 95% of dispatcher entries -- 13.1M of 13.7M
+		 * in a 41-second run -- came from direct-branch blocks, which
+		 * are exactly the ones that are supposed to link and never come
+		 * back.  Most MIPS branches have a non-nop delay slot, so most
+		 * blocks were in that 95%.
+		 *
+		 * bleem links every direct branch with no such condition
+		 * (recompiler_backend.md, "Chaining is unconditional"), so this
+		 * is the shape to match.
+		 *
+		 * IR_JUMP ONLY, AND THAT IS NOT TIMIDITY.  The conditional arm
+		 * below reads the T bit that IR_COND's comparison left behind,
+		 * and T survives only while IR_COND is the last node -- a delay
+		 * slot's node emitted after it may write T.  An unconditional
+		 * jump has no T dependency, so widening it is independent of
+		 * that.  Widening IR_COND needs the condition recomputed rather
+		 * than carried in T, and that is a separate change with its own
+		 * hardware run. */
+		if (t && t->op != IR_JUMP && t->op != IR_COND &&
+		    t->op != IR_CAPTURE) {
+			int k;
+
+			for (k = n - 2; k >= 0; k--) {
+				if (ir[k].op == IR_JUMP) {
+					t = &ir[k];
+					break;
+				}
+				/* A conditional found back here is linkable
+				 * too, now that T is parked across the delay
+				 * slot above.  A capture is not: its target is
+				 * a register and there is nothing to patch to.
+				 * Stop rather than walk past the transfer. */
+				if (ir[k].op == IR_COND) {
+					t = &ir[k];
+					break;
+				}
+				if (ir[k].op == IR_CAPTURE)
+					break;
+			}
+		}
+
 		/* WHY THE LAST NODE AND NOT A BACKWARD SCAN FOR THE TRANSFER.
 		 *
 		 * The decoder puts a transfer's node AHEAD of its delay slot
@@ -2254,6 +2322,17 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 						     t->sub == CC_GTZ ||
 						     t->sub == CC_GEZ);
 
+				/* UNPARK T, when the delay slot emitted
+				 * anything.  `cmp/pl` and not `tst`: movt left
+				 * 1 or 0, and `T = (r0 > 0)` reproduces the
+				 * original bit, while `tst r0,r0` would invert
+				 * it and silently swap the two arms. */
+				if (e->cond_saved) {
+					sh4_emit_mov_l_load_gbr(&e->cg,
+							(int)FGL_AT_TSAVE);
+					sh4_emit_cmppl(&e->cg, FGL_R_XFER);
+				}
+
 				/* Which arm walks away from the site.  Mode 3
 				 * is the mirror of 1 and 2: the single site
 				 * below belongs to the fallthrough instead. */
@@ -2307,6 +2386,7 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 			 * and leaves these six bytes dead; nothing executes
 			 * them either way, because the `bf` above jumps over
 			 * the whole site. */
+			e->linked = 1;
 			emit_link_site(e);             /* taken, or the only one */
 
 			if (fall >= 0 && FGL_LINK_COND == 2) {
@@ -2327,6 +2407,46 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 				patch_fwd8(e, fall);
 		}
 	}
+
+#if FGL_BLOCK_COUNT
+	/* SPLITTING THE DISPATCHER ENTRIES.
+	 *
+	 * `.Lrun` in dispatch.S counts every entry but cannot say where it
+	 * came from -- it holds the TARGET pc, and a return's target looks
+	 * like any other address.  The block that is leaving knows, so it
+	 * says so here.
+	 *
+	 * Only capture-terminated blocks are counted, and that is the whole
+	 * point: a direct branch gets a link site and stops visiting the
+	 * dispatcher once it is patched, while a capture's target is a
+	 * register and can never be linked, so one execution is one entry.
+	 * `jr $ra` (register 31) is a return and gets its own counter; every
+	 * other register is a computed jump.  If returns dominate, a return
+	 * address stack removes most of the 29,000 entries a frame.
+	 *
+	 * Four instructions, in capture-terminated blocks only, in a build
+	 * that is already paying for the counter at `.Lrun`.  r0 and r1 are
+	 * both dead here -- the load below clobbers r0 immediately and r1 is
+	 * the emitter's temp -- and r2 carries the exit PC and is untouched.
+	 * The shape is emit.c's existing counter bump under IR_MTC_C. */
+	{
+		extern uint32_t fgl_blocks_ret, fgl_blocks_ind, fgl_blocks_nolink;
+		uint32_t *c = NULL;
+
+		if (e->cap_rs)
+			c = (e->cap_rs == 32) ? &fgl_blocks_ret
+					      : &fgl_blocks_ind;
+		else if (!e->linked)
+			c = &fgl_blocks_nolink;
+
+		if (c) {
+			emit_const(e, (uint32_t)(uintptr_t)c, FGL_R_XFER);
+			sh4_emit_mov_l_load(&e->cg, FGL_R_XFER, FGL_R_T1);
+			sh4_emit_add_imm(&e->cg, 1, FGL_R_T1);
+			sh4_emit_mov_l_store(&e->cg, FGL_R_T1, FGL_R_XFER);
+		}
+	}
+#endif
 
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
 	sh4_emit_jmp(&e->cg, FGL_R_XFER);

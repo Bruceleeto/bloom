@@ -86,6 +86,8 @@ FGL_ASSERT(FGL_AT_SHIM_ARG * 4
 	   == offsetof(struct lightrec_state, shim_arg), shim_arg);
 FGL_ASSERT(FGL_AT_LINK * 4
 	   == offsetof(struct lightrec_state, link), link);
+FGL_ASSERT(FGL_AT_TSAVE * 4
+	   == offsetof(struct lightrec_state, tsave), tsave);
 
 /* THE REACH ITSELF.  `mov.l @(disp,GBR),r0` has an eight-bit displacement
  * scaled by four, so the last word generated code can name is at +1020.
@@ -286,6 +288,18 @@ u32 fgl_pc_ring[1 + 64 * 4];
  * at the increment for why this is the only speed number a wall-clock build
  * can be compared on. */
 u32 fgl_blocks_run;
+
+/* The split of those entries, bumped by four instructions in the epilogue of
+ * capture-terminated blocks (emit.c).  `ret` is `jr $ra`; `ind` is every other
+ * register.  fgl_blocks_run minus the two is entries from everything else --
+ * link sites that never got patched, exceptions, and the outer loop coming
+ * back in. */
+u32 fgl_blocks_ret, fgl_blocks_ind;
+
+/* Blocks that ended in a DIRECT branch and got no link site -- the ones that
+ * go round the dispatcher every execution for ever.  This is the number the
+ * conditional-arm widening would take. */
+u32 fgl_blocks_nolink;
 
 static struct lightrec_state *fgl_crash_state;
 
@@ -909,8 +923,21 @@ void fgl_dump_mem_pub(u32 addr, unsigned words)
  *
  * It was briefly 16384, raised in the same change that added conditional
  * linking, on the guess that the edge count would triple.  Two variables at
- * once and the build faulted; this went back first because it was the guess. */
-#define FGL_MAX_LINKS 4096
+ * once and the build faulted; this went back first because it was the guess.
+ *
+ * AND THE CLIFF WAS REAL, MEASURED.  With the dispatcher-entry split turned
+ * on, 95% of entries came from blocks ending in a DIRECT branch -- 13.2M of
+ * 13.8M in a 41-second run -- which is the population that is supposed to be
+ * linked and never come back.  `near + far` was 33,263 over the run, which is
+ * eight times 4096: the table filled, every further edge was refused, a
+ * teardown emptied it, and it filled again.  Eight times.  So at most 4096
+ * edges in the whole program were linked at any moment while the game wanted
+ * tens of thousands, and every other hot edge paid a dispatcher round trip on
+ * every execution.  The ~1160 census above predates conditional linking.
+ *
+ * `full` in the links report is the refusal count and is the number to watch:
+ * if it is not zero, this is still too small. */
+#define FGL_MAX_LINKS 65536
 static uint32_t fgl_link_site[FGL_MAX_LINKS];
 
 /* WHICH TABLE SLOT EACH SITE BRANCHES AT, so that a teardown can be about the
@@ -924,6 +951,10 @@ static uint32_t fgl_link_site[FGL_MAX_LINKS];
  * right separately. */
 static uint32_t fgl_link_slot[FGL_MAX_LINKS];
 static unsigned fgl_n_links;
+
+/* Edges refused because the table was full.  Nonzero means FGL_MAX_LINKS is
+ * too small and the emulator is on the cliff described above. */
+unsigned fgl_link_full;
 
 /* DIAGNOSTIC: how the edges came out, printed by nothing yet but readable
  * from a debugger and cheap to keep. */
@@ -1061,8 +1092,10 @@ u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
 		return (u32)(uintptr_t)slot;
 	}
 
-	if (fgl_n_links >= FGL_MAX_LINKS)
+	if (fgl_n_links >= FGL_MAX_LINKS) {
+		fgl_link_full++;
 		return (u32)(uintptr_t)slot;
+	}
 
 	if (site & 3)                   /* the emitter's pad failed */
 		return (u32)(uintptr_t)slot;

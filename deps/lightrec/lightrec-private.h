@@ -204,6 +204,7 @@ struct lightrec_state {
 	u32 addr_mask;				/* +688 */
 	u32 shim_arg;				/* +692 */
 	u32 link;				/* +696 */
+	u32 tsave;				/* +700 */
 	u8 in_delay_slot_n;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;

@@ -154,21 +154,36 @@ void fgl_deadline_pause(void)
 	fgl_dl_crossings++;
 
 	/* CHARGE EVERYTHING: the clock never stops, so there is nothing to
-	 * close and nothing to reopen.  dl_accum still runs -- it keeps
-	 * dl_mark current, which is free here and saves the next settle a
-	 * peripheral read -- but the interval is never suspended.  See
-	 * FGL_DL_CHARGE_ALL in deadline.h. */
-	if (FGL_DL_CHARGE_ALL) {
-		dl_accum();
+	 * close, nothing to reopen, AND NOTHING TO SAMPLE.
+	 *
+	 * dl_accum used to run here.  It was pure waste.  With CHARGE_ALL,
+	 * dl_excluded is never incremented -- this function returns before the
+	 * increment and so does exclude_begin -- so dl_accum is always
+	 *
+	 *	dl_elapsed += dl_mark - now;  dl_mark = now;
+	 *
+	 * which telescopes: between two settles, calling it a hundred times
+	 * and calling it zero times leave dl_elapsed with the identical value,
+	 * because fgl_deadline_settle() calls dl_accum() itself before reading
+	 * it.  Every crossing was therefore paying a load from TCNT1 -- a
+	 * peripheral register on the external bus, one of the slowest loads the
+	 * SH-4 issues -- for a result that arithmetic discards.  At `cross`
+	 * ~30,000 per report interval against an alarm that fires ~230 times,
+	 * that is two orders of magnitude more clock sampling than bleem does:
+	 * it reads TCNT0 exactly once per collection and never at a block or
+	 * call boundary (dynarec_services.md 4.5).
+	 *
+	 * The old behaviour is not worth a toggle -- it is not a different
+	 * policy, it is the same policy computed the expensive way. */
+	if (FGL_DL_CHARGE_ALL)
 		return;
-	}
 
 	dl_accum();
 	dl_excluded++;
 }
 
-/* THE CHEAP HALF OF A PAUSE.  `pause` reads TMU1 to close the interval before
- * it stops counting.  At an MMIO crossing that read has already happened --
+/* THE CHEAP HALF OF A PAUSE.  In a non-CHARGE_ALL build `pause` reads TMU1 to
+ * close the interval before it stops counting.  At an MMIO crossing that read has already happened --
  * `lightrec_tansition_to_pcsx` charges (deadline) or settles (fit) on the way
  * in, and both go through dl_accum, so dl_mark is current -- and a second read
  * of the same value costs a peripheral access to learn nothing.

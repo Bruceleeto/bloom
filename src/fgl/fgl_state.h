@@ -191,7 +191,26 @@
 
 /* How many words of state block generated code can touch, so a harness knows
  * how much to allocate. */
-#define FGL_STATE_WORDS (FGL_AT_LINK + 1u)
+/* WHERE THE T BIT WAITS OUT A DELAY SLOT.
+ *
+ * A conditional block's link arm is chosen by the T bit that IR_COND's
+ * comparison left standing.  That works only while IR_COND is the last node:
+ * the decoder puts a transfer AHEAD of its delay slot, so a delay slot that
+ * decoded to anything real emits nodes after IR_COND, and any of them may
+ * write T.  Blocks in that shape got no link site at all and went round the
+ * dispatcher on every execution for ever -- measured at 95% of all dispatcher
+ * entries, 11.86M of 12.49M in a 41-second run.
+ *
+ * So T is parked here across the delay slot and restored at the link point.
+ * Four instructions in conditional blocks, against a dispatcher round trip on
+ * every single execution.
+ *
+ * NOT `shim_arg` AND NOT `temp_reg`: both are live across exactly the window
+ * this one needs (a hardware store's third argument, and a deferred load's
+ * parked value).  Two purposes that overlap in time need two words. */
+#define FGL_AT_TSAVE         (FGL_AT_LINK + 1u)                       /* +700 */
+
+#define FGL_STATE_WORDS (FGL_AT_TSAVE + 1u)
 
 /* The COP0 registers that are actually live.  Everything else reads zero and
  * discards writes. */

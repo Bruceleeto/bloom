@@ -1473,7 +1473,18 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 
 static void lightrec_print_info(struct lightrec_state *state)
 {
-	if ((state->current_cycle & ~0xfffffff) != state->old_cycle_counter) {
+	/* GROWTH, NOT A BIT PATTERN.  The original tested the top bits of
+	 * current_cycle so it would fire once per 256M cycles.  Under the
+	 * deadline that counter is not a running total: the gate is opened to
+	 * FGL_GATE_MAX_CYCLES * FGL_DL_SCALE (0x7ffffc00), the alarm collapses
+	 * target onto current so current_cycle lands on that value, and then
+	 * the plugin resets it to 0 for the next slice.  The top bits
+	 * therefore flip 0 -> 0x70000000 -> 0 every slice and this printed
+	 * twice a slice down the serial port, which is expensive enough to
+	 * ruin a benchmark.  Requiring real growth makes it fire once per 256M
+	 * cycles in a counter build, as intended, and never in a deadline
+	 * build, which is correct -- there the counter totals nothing. */
+	if (state->current_cycle >= state->old_cycle_counter + 0x10000000) {
 		pr_info("Lightrec RAM usage: IR %u KiB, CODE %u KiB, "
 			"MIPS %u KiB, TOTAL %u KiB, avg. IPI %f\n",
 			lightrec_get_mem_usage(MEM_FOR_IR) / 1024,
@@ -1481,7 +1492,7 @@ static void lightrec_print_info(struct lightrec_state *state)
 			lightrec_get_mem_usage(MEM_FOR_MIPS_CODE) / 1024,
 			lightrec_get_total_mem_usage() / 1024,
 		       lightrec_get_average_ipi());
-		state->old_cycle_counter = state->current_cycle & ~0xfffffff;
+		state->old_cycle_counter = state->current_cycle;
 	}
 }
 

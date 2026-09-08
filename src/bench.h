@@ -57,5 +57,6 @@ extern unsigned int fgl_bench_calls, fgl_bench_cycle;
  * affected by which perf bracket the work is billed to.  Zero unless the build
  * counts (-DWITH_FGL_BLOCK_COUNT=ON); turn it on for both sides of a pair. */
 extern unsigned int fgl_blocks_run;
+extern unsigned int fgl_blocks_ret, fgl_blocks_ind, fgl_blocks_nolink;
 
 #endif

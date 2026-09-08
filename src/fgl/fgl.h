@@ -203,6 +203,29 @@ typedef struct {
 	 * anything short; a block that needs several is one whose lowering is
 	 * materialising far too many constants. */
 	int pool_flushes;
+
+	/* THE TERMINATOR'S SOURCE REGISTER, PLUS ONE.  Zero means this block
+	 * does not end in an IR_CAPTURE.
+	 *
+	 * Only used by FGL_BLOCK_COUNT, to split dispatcher entries into
+	 * returns and computed jumps.  A capture-terminated block has an exit
+	 * PC that is only known at run time, so its jump can never be patched
+	 * into a link -- every execution of one is a dispatcher entry, which
+	 * is exactly what makes counting the block equivalent to counting the
+	 * entry.  Plus one because `fgl_init` memsets, and $zero is register
+	 * 0.  See the epilogue. */
+	int cap_rs;
+
+	/* Set when this block got a link site.  A block without one reaches
+	 * the dispatcher on every execution for ever, so under
+	 * FGL_BLOCK_COUNT the epilogue counts it -- that is the population
+	 * worth attacking, and guessing at its size has been wrong three
+	 * times. */
+	int linked;
+
+	/* Set when this block parked T across its delay slot, so the link
+	 * point knows to unpark it.  See FGL_AT_TSAVE. */
+	int cond_saved;
 } fgl_emitter;
 
 void     fgl_init(fgl_emitter *e, void *buf, uint32_t size, uint32_t base);
