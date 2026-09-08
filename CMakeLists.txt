@@ -234,16 +234,33 @@ if (WITH_FGL_DEADLINE)
 	add_compile_definitions(FGL_DEADLINE=1)
 endif (WITH_FGL_DEADLINE)
 
-option(WITH_FGL_DL_FIT "fgl: sample PRFC1 and print the fitted K (counter build)" OFF)
+option(WITH_FGL_DL_FIT "fgl: sample the clock and print the report in a counter build" OFF)
 if (WITH_FGL_DL_FIT)
 	add_compile_definitions(FGL_DL_FIT=1)
 endif (WITH_FGL_DL_FIT)
 
-set(WITH_FGL_DL_K "1024" CACHE STRING "fgl: guest cycles per SH-4 instruction, in 1/1024ths (deadline only)")
-add_compile_definitions(FGL_DL_K=${WITH_FGL_DL_K})
+# THE STRETCH.  See src/deadline.h -- how many times longer a guest cycle is
+# than a real PS1's, so the guest keeps getting enough work done between its own
+# deadlines on a host slower than 1:1.  Generous, not fitted: too large costs
+# slow motion, and nothing else.
+set(WITH_FGL_DL_STRETCH16 "32" CACHE STRING "fgl: guest cycle stretch, in 1/16ths (deadline only)")
+add_compile_definitions(FGL_DL_STRETCH16=${WITH_FGL_DL_STRETCH16})
 
-set(WITH_FGL_DL_OVERSHOOT "128" CACHE STRING "fgl: guest cycles the hook may run past next_interupt before carrying the rest (deadline only)")
-add_compile_definitions(FGL_DL_OVERSHOOT=${WITH_FGL_DL_OVERSHOOT})
+# Charge rendering, CD and the vblank wait to the guest clock instead of
+# bracketing them out -- one clock, everything on it, which is what a real PS1
+# does and what bleem did.  Makes the stretch mean what it says.  See the
+# comment on FGL_DL_CHARGE_ALL in src/deadline.h.
+set(WITH_FGL_DL_CHARGE_ALL "1" CACHE STRING "fgl: charge all host time to the guest clock, renderer included")
+add_compile_definitions(FGL_DL_CHARGE_ALL=${WITH_FGL_DL_CHARGE_ALL})
+
+# THE OWED CEILING.  See src/deadline.h -- guest cycles of unpaid time the pool
+# may hold before the excess is discarded.  Stops a host that cannot keep up
+# from accruing a debt it can only repay by starving the guest.
+set(WITH_FGL_RCNT_CATCHUP_MAX "8" CACHE STRING "fgl: base-counter periods rendered before the backlog is coalesced (deadline only)")
+add_compile_definitions(FGL_RCNT_CATCHUP_MAX=${WITH_FGL_RCNT_CATCHUP_MAX})
+
+set(WITH_FGL_SIO_BLEEM "1" CACHE STRING "fgl: pad IRQ7 at the JOY_STAT read with no scheduled SIO event, as bleem does")
+add_compile_definitions(FGL_SIO_BLEEM=${WITH_FGL_SIO_BLEEM})
 
 option(WITH_FGL_NO_GBASE "Put guest registers back on the GBR/r0 pair" OFF)
 if (WITH_FGL_NO_GBASE)
@@ -283,6 +300,7 @@ add_executable(bloom
 	src/cdr.c
 	src/copy32.s
 	src/dynload.c
+	src/bench.c
 	src/emu.c
 	src/genmenu.cpp
 	src/input.c
@@ -324,6 +342,18 @@ endif()
 option(WITH_FGL_DEBUG_RING "Record the last 64 guest block PCs for crash reports" OFF)
 if (WITH_FGL_DEBUG_RING)
 	target_compile_definitions(lightrec PRIVATE FGL_DEBUG_RING=1)
+endif()
+
+# THE SPEEDOMETER.  Counts guest block executions in the dispatcher and prints
+# blocks per WALL second on the bench lines.  Under a wall clock, vsync/s is
+# 60 over the delivered stretch -- a setting, not a measurement -- so it is the
+# only figure that can say which of two builds is actually faster.  Costs four
+# instructions on the hottest path, so turn it on for BOTH sides of a pair and
+# off again afterwards.
+option(WITH_FGL_BLOCK_COUNT "fgl: count guest block executions, report blocks/wall-s" OFF)
+if (WITH_FGL_BLOCK_COUNT)
+	target_compile_definitions(lightrec PRIVATE FGL_BLOCK_COUNT=1)
+	target_compile_definitions(bloom PRIVATE FGL_BLOCK_COUNT=1)
 endif()
 
 # DUMB MODE: fgl with its two clever parts switched off, to bisect a fault to
@@ -447,6 +477,16 @@ endif()
 
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
 set(WITH_GAME_PATH "" CACHE PATH "If set, auto-boot the CD image at the given path")
+
+# THE WORK BENCH.  See src/bench.h -- fixed vsyncs from a savestate, report
+# guest work and wall time, so deadline and counter builds can be compared on
+# work done rather than on frames per second.
+option(WITH_FGL_BENCH "fgl: fixed-vsync work benchmark" OFF)
+if (WITH_FGL_BENCH)
+	add_compile_definitions(FGL_BENCH=1)
+endif()
+set(WITH_FGL_BENCH_VSYNCS "1800" CACHE STRING "fgl: guest vsyncs in the benchmark window")
+add_compile_definitions(FGL_BENCH_VSYNCS=${WITH_FGL_BENCH_VSYNCS})
 set(WITH_BOOT_SSTATE "/rd/gt.sav" CACHE PATH "If set, load this savestate at boot")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")

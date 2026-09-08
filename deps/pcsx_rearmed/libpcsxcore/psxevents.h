@@ -52,6 +52,9 @@ void fgl_trace3(char tag, u32 a, u32 b, u32 c);
 extern u32 fgl_last_mmio;   /* address of the most recent MMIO crossing */
 extern int fgl_dump_pending;/* set once a second, consumed at the next hook */
 void irq_test(union psxCP0Regs_ *cp0);
+/* Fire everything already due, update Cause, do NOT deliver.  For an MMIO
+ * crossing, where the guest PC must not move.  See psxevents.c. */
+void events_run_due(union psxCP0Regs_ *cp0);
 void gen_interupt(union psxCP0Regs_ *cp0);
 void events_restore(void);
 

@@ -235,6 +235,40 @@ _fgl_dispatch_loop:
 
 .Lrun:
 
+#if FGL_BLOCK_COUNT
+	/* THE ONLY HONEST SPEEDOMETER UNDER A WALL CLOCK.
+	 *
+	 * fps, vsync/s and ms/f are all pinned by FGL_DL_STRETCH16: the guest
+	 * clock is driven by real time, so the frame rate is a SETTING and two
+	 * builds at the same stretch tie by construction no matter which one is
+	 * faster.  Every bracket-derived figure has the same disease -- moving
+	 * a perf timer from `evt` to `rest` changes the table without changing
+	 * the machine.
+	 *
+	 * Guest blocks per WALL second has neither problem.  It is not derived
+	 * from the clock, it is not sensitive to where the brackets sit, and it
+	 * is the thing being optimised: how much guest code the recompiler gets
+	 * through per real second.  Whichever build runs more is faster.  No
+	 * stretch fitting, no sweep.
+	 *
+	 * `.Lrun` is where every block in the program arrives -- both the entry
+	 * `bra` and the fall-through from the budget test land here -- so this
+	 * counts block EXECUTIONS, not compilations.
+	 *
+	 * Four instructions and two memory ops on the hottest path in the
+	 * emulator, so it is off by default and it does depress the number it
+	 * reports.  That is fine: turn it on for BOTH builds and the cost is
+	 * identical in both, which is the whole point of a matched pair.
+	 * -DWITH_FGL_BLOCK_COUNT=ON.
+	 *
+	 * r0 and r1 are the dispatcher's scratch (see the budget note under
+	 * FGL_DEBUG_CP below); r2 holds the PC and is not touched. */
+	mov.l	.Lblkctr, r1
+	mov.l	@r1, r0
+	add	#1, r0
+	mov.l	r0, @r1
+#endif
+
 #if FGL_DEBUG_RING
 	/* DEBUG: a ring of the last 64 guest block PCs.
 	 *
@@ -718,6 +752,10 @@ _fgl_link_stub:
 	 mov	r0, r14
 
 	.align	2
+#if FGL_BLOCK_COUNT
+.Lblkctr:	.long	_fgl_blocks_run
+#endif
+
 #if FGL_DEBUG_RING
 .Lringp:	.long	_fgl_pc_ring
 .Lsp0:		.long	0x1f800000

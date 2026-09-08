@@ -25,6 +25,7 @@
 #include "psxevents.h"
 #include "gpu.h"
 #include "perf.h"
+#include "bench.h"
 //#include "debug.h"
 #include "deadline.h"
 #define DebugVSync()
@@ -76,6 +77,11 @@ Rcnt rcnts[ CounterQuantity ];
 unsigned int hSyncCount = 0;
 unsigned int frame_counter = 0;
 static u32 hsync_steps = 0;
+
+/* Base-counter periods that arrived in a lump, and periods thrown away because
+ * they arrived faster than the guest can use them.  See psxRcntUpdate. */
+unsigned int fgl_rcnt_catchup;
+unsigned int fgl_rcnt_coalesced;
 
 /******************************************************************************/
 
@@ -353,6 +359,7 @@ static void scheduleRcntBase(void)
 void psxRcntUpdate()
 {
     u32 cycle, cycles_passed;
+    unsigned catchup = 0;
 
     cycle = psxRegs.cycle;
 
@@ -372,23 +379,77 @@ void psxRcntUpdate()
             psxRcntReset( 0 );
 
         cycles_passed = cycle - rcnts[0].cycleStart;
+
+        /* COALESCE, DO NOT QUEUE.  See FGL_RCNT_CATCHUP_MAX: the guest asked
+         * for one interrupt per period and the clock handed over several
+         * periods at once.  It has had its interrupt; delivering the repeats
+         * one at a time just starves it further behind. */
+        if( FGL_DEADLINE && cycles_passed >= rcnts[0].cycle )
+        {
+            rcnts[0].cycleStart = cycle;
+            fgl_rcnt_coalesced++;
+            break;
+        }
     }
 
     // rcnt 1.
     while( cycle - rcnts[1].cycleStart >= rcnts[1].cycle )
     {
         psxRcntReset( 1 );
+
+        if( FGL_DEADLINE && cycle - rcnts[1].cycleStart >= rcnts[1].cycle )
+        {
+            rcnts[1].cycleStart = cycle;
+            fgl_rcnt_coalesced++;
+            break;
+        }
     }
 
     // rcnt 2.
     while( cycle - rcnts[2].cycleStart >= rcnts[2].cycle )
     {
         psxRcntReset( 2 );
+
+        if( FGL_DEADLINE && cycle - rcnts[2].cycleStart >= rcnts[2].cycle )
+        {
+            rcnts[2].cycleStart = cycle;
+            fgl_rcnt_coalesced++;
+            break;
+        }
     }
 
-    // rcnt base.
-    if( cycle - rcnts[3].cycleStart >= rcnts[3].cycle )
+    /* THE BASE COUNTER CATCHES UP.  rcnt 0, 1 and 2 above are all `while`;
+     * this one was an `if`, and an `if` is only right when the clock never
+     * advances by more than one base period at a time.  Under the deadline it
+     * routinely does -- the charge lands in a lump at a crossing -- and every
+     * period past the first was simply dropped: hSyncCount took one step where
+     * it owed several, so the guest was handed a fraction of the vblanks its
+     * own clock said had happened.  A game reads that as time standing still
+     * between frames, which is what a pad that never answers looks like.
+     *
+     * Bounded, because unlike the other three this body is not cheap -- it
+     * renders a frame.  Past the bound the remaining periods are still owed
+     * and the next call takes them; the bound only stops one enormous jump
+     * (a savestate load, a long compile) from rendering a hundred frames in
+     * one go.  fgl_rcnt_catchup counts every pass past the first, so a build
+     * that needs a bigger bound says so. */
+    /* AND THE SAME FOR THE BASE COUNTER, BEFORE IT IS WALKED.  Each pass of
+     * the loop below can render a frame, so a lump that covers many periods
+     * used to buy a burst of rendering the guest could not use, followed by a
+     * stretch where it was still behind.  Keep one period and drop the rest.
+     * That is bleem's rule -- store the reload, discard the overshoot -- and it
+     * is what replaced dropping guest TIME in the deadline's owed pool. */
+    if( FGL_DEADLINE && rcnts[3].cycle &&
+        cycle - rcnts[3].cycleStart >= (u32)FGL_RCNT_CATCHUP_MAX * rcnts[3].cycle )
     {
+        rcnts[3].cycleStart = cycle - rcnts[3].cycle;
+        fgl_rcnt_coalesced++;
+    }
+
+    while( cycle - rcnts[3].cycleStart >= rcnts[3].cycle )
+    {
+        if (catchup++)
+            fgl_rcnt_catchup++;
         hSyncCount += hsync_steps;
 
         // VSync irq.
@@ -401,6 +462,8 @@ void psxRcntUpdate()
              * profile as `rcnt` and none of it is counting.  A large `lace`
              * in particular is the render thread being WAITED ON, which is
              * not cost -- see the report in platform.c. */
+            fgl_bench_vsync(psxRegs.cycle);
+
             HW_GPU_STATUS &= SWAP32(~PSXGPU_LCF);
             {
                 PERF_BEGIN(PERF_VBLANK);
@@ -485,6 +548,9 @@ void psxRcntUpdate()
         }
 
         scheduleRcntBase();
+
+        if (catchup >= FGL_RCNT_CATCHUP_MAX)
+            break;
     }
 
     psxRcntSet();

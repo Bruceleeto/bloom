@@ -25,6 +25,7 @@
 #include "psxcounters.h"
 #include "psxevents.h"
 #include "sio.h"
+#include "deadline.h"
 #include <sys/stat.h>
 
 #ifdef USE_LIBRETRO_VFS
@@ -79,6 +80,17 @@ char McdDisable[2];
 // TODO: add SioModePrescaler and BaudReg
 #define SIO_CYCLES		535
 
+/* THE PER-BYTE EVENT, WHICH BLEEM DOES NOT HAVE.  See FGL_SIO_BLEEM in
+ * deadline.h: under FGL_SIO_BLEEM the handshake carries no scheduled event at
+ * all, so there is nothing left for a real-time clock to deliver late.  IRQ7 is
+ * raised from sioReadStat16 instead, which is the ordering bleem uses and the
+ * only one the guest cannot ack away before it looks. */
+#if FGL_SIO_BLEEM
+#define SIO_KICK()	do { } while (0)
+#else
+#define SIO_KICK()	set_event(PSXINT_SIO, SIO_CYCLES)
+#endif
+
 void sioWrite8(unsigned char value) {
 	int more_data = 0;
 #if 0
@@ -101,7 +113,7 @@ void sioWrite8(unsigned char value) {
 
 				if (more_data) {
 					bufcount = parp + 1;
-					set_event(PSXINT_SIO, SIO_CYCLES);
+					SIO_KICK();
 				}
 			}
 			else padst = 0;
@@ -115,14 +127,14 @@ void sioWrite8(unsigned char value) {
 
 			if (more_data) {
 				bufcount = parp + 1;
-				set_event(PSXINT_SIO, SIO_CYCLES);
+				SIO_KICK();
 			}
 			return;
 	}
 
 	switch (mcdst) {
 		case 1:
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			if (rdwr) { parp++; return; }
 			parp = 1;
 			switch (value) {
@@ -132,7 +144,7 @@ void sioWrite8(unsigned char value) {
 			}
 			return;
 		case 2: // address H
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			adrH = value;
 			*buf = 0;
 			parp = 0;
@@ -140,7 +152,7 @@ void sioWrite8(unsigned char value) {
 			mcdst = 3;
 			return;
 		case 3: // address L
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			adrL = value;
 			*buf = adrH;
 			parp = 0;
@@ -148,7 +160,7 @@ void sioWrite8(unsigned char value) {
 			mcdst = 4;
 			return;
 		case 4:
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			parp = 0;
 			switch (rdwr) {
 				case 1: // read
@@ -198,7 +210,7 @@ void sioWrite8(unsigned char value) {
 			if (rdwr == 2) {
 				if (parp < 128) buf[parp + 1] = value;
 			}
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			return;
 	}
 
@@ -213,7 +225,7 @@ void sioWrite8(unsigned char value) {
 			bufcount = 1;
 			parp = 0;
 			padst = 1;
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			return;
 		case 0x81: // start memcard
 			if (CtrlReg & 0x2000)
@@ -233,7 +245,7 @@ void sioWrite8(unsigned char value) {
 			bufcount = 3;
 			mcdst = 1;
 			rdwr = 0;
-			set_event(PSXINT_SIO, SIO_CYCLES);
+			SIO_KICK();
 			return;
 		default:
 		no_device:
@@ -306,6 +318,17 @@ unsigned char sioRead8() {
 }
 
 unsigned short sioReadStat16() {
+	/* RAISE HERE, NOT AT THE WRITE.  The response byte is already in the
+	 * buffer -- sioWrite8 put it there -- so the only thing the 535-cycle
+	 * event ever did was delay the interrupt that says so.  Raising it at
+	 * the WRITE instead does not work: the guest acks the previous IRQ
+	 * through JOY_CTRL after writing, which wipes it, and the pad times
+	 * out.  The ack always precedes the status read, so raising it here
+	 * cannot be acked away. */
+	if (FGL_SIO_BLEEM && (StatReg & RX_RDY) && !(StatReg & IRQ)) {
+		StatReg |= IRQ;
+		psxHu32ref(0x1070) |= SWAPu32(0x80);
+	}
 	return StatReg;
 }
 

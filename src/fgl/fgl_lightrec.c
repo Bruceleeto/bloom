@@ -280,6 +280,13 @@ void fgl_rfe(u32 unused, struct lightrec_state *state)
  * instructions in `dispatch.S` at every block entry; read only here. */
 u32 fgl_pc_ring[1 + 64 * 4];
 
+/* Guest block executions, incremented by four instructions at `.Lrun` in
+ * dispatch.S when FGL_BLOCK_COUNT.  Always defined so bench.c links either
+ * way; it simply stays zero in a build that does not count.  See the comment
+ * at the increment for why this is the only speed number a wall-clock build
+ * can be compared on. */
+u32 fgl_blocks_run;
+
 static struct lightrec_state *fgl_crash_state;
 
 /* A window of guest RAM, for reading against a register that should have

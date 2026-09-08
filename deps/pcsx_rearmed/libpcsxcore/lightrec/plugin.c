@@ -57,8 +57,31 @@ static s32 fgl_slice(s32 cycles)
 	return cycles > FGL_GATE_MAX_CYCLES ? FGL_GATE_MAX_CYCLES : cycles;
 }
 
+/* THE GATE IS NOT A COUNTDOWN, AND UNDER THE DEADLINE IT MUST NOT LOOK LIKE ONE.
+ *
+ * dispatch.S brackets every C crossing with the cycle contract:
+ *
+ *	.Lsync_out:   current_cycle = target_cycle - r14
+ *	.Lsync_in:    r14 = target_cycle - current_cycle
+ *
+ * so r14 is REBUILT FROM THE ABSOLUTE PAIR on the way back in from every
+ * crossing.  Handing that pair the true `next_interupt - cycle` therefore turns
+ * the gate straight back into a countdown sourced from the guest clock: the
+ * `cmp/pl r14; bf .Lservice` at dispatch.S:233 then trips on the guest clock
+ * rather than on the alarm -- about a thousand times a frame -- and it also
+ * quietly undoes an alarm that had already zeroed r14, because the next
+ * .Lsync_in overwrites it.
+ *
+ * Deleting the per-block charge in emit.c is only half of making r14 a gate.
+ * This is the other half.  Saturate it: in deadline mode the slice is bounded
+ * by TMU2 and by the `cycles_left <= 0` test in the transition, both of which
+ * still work, so the gate's only job is to stay open until one of them says
+ * otherwise.  The counter build is untouched. */
 static u32 fgl_gate(s32 cycles)
 {
+	if (FGL_DEADLINE)
+		return (u32)FGL_GATE_MAX_CYCLES * (u32)FGL_DL_SCALE;
+
 	return (u32)fgl_slice(cycles) * (u32)FGL_DL_SCALE;
 }
 
@@ -192,16 +215,38 @@ static bool has_interrupt(void)
 static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
 	if (FGL_DEADLINE) {
-		/* THE CHARGE.  Generated code moves nothing, so the pair says
-		 * only how much budget was handed out -- a time quantity.
-		 * Charge the work PRFC1 counted instead, and never clamp it to
-		 * what was left: a clamp turns it back into a time quantity in
-		 * exactly the case that matters.
+		/* NOTHING HAPPENS HERE ANY MORE, AND THAT IS THE POINT.
 		 *
-		 * The charge samples the counter itself, so this crossing costs
-		 * one peripheral read, not the six a pause/resume pair cost. */
-		psxRegs.cycle += fgl_deadline_charge_upto(
-			(s32)(psxRegs.next_interupt - psxRegs.cycle));
+		 * This used to charge the clock and drain due events at every
+		 * MMIO crossing.  Both cost a read of TCNT1 -- settle() through
+		 * dl_accum, and the exclude/resume bracket below through
+		 * dl_mark -- and TCNT1 is an on-chip peripheral register: not
+		 * cached, over the peripheral bus, and it stalls.  At ~41,500
+		 * crossings a real second that is ~83,000 stalling reads, and
+		 * measured against the counter build it cost about 9 ms a
+		 * frame: emitted code ran 9.7% FEWER instructions and still
+		 * took 18% longer per guest frame.  Instructions were never the
+		 * problem; the clock reads were.
+		 *
+		 * So the clock advances at SLICE BOUNDARIES only.  TMU2 is
+		 * armed for exactly next_interupt - cycle, so the alarm already
+		 * fires when the next event is due -- the crossing was never
+		 * what made events timely, the alarm was.  The hook settles and
+		 * drains; see fgl_service_events.
+		 *
+		 * WHAT THIS COSTS, honestly: inside a slice psxRegs.cycle does
+		 * not move, so an MMIO read derived from it -- a root counter,
+		 * most of all -- reads stale.  A guest polling rcnt in a tight
+		 * loop sees it frozen and spins until the alarm ends the slice.
+		 * Bounded, because the alarm always fires, so it is a stall and
+		 * not a hang.  The staleness is also in the SAFE direction: the
+		 * clock lags rather than running past an event that has not
+		 * fired, which is the thing the old clamp existed to prevent.
+		 *
+		 * If that stall shows up, the fix is not to put the read back
+		 * everywhere -- it is to settle only on the crossings whose
+		 * handler actually reads the clock (rcnt, CD).  events_run_due
+		 * is still exported for exactly that. */
 		lightrec_reset_cycle_count(state, 0);
 		return;
 	}
@@ -261,19 +306,16 @@ s32 fgl_service_events(struct lightrec_state *state, s32 delta)
 	regs = lightrec_get_registers(state);
 	{
 		PERF_BEGIN(PERF_EVT);
-		/* Release whatever the clamped crossing charges could not fit.
-		 * The drain below has to see how overdue each event really is. */
+		/* Land the time since the last crossing.  A full settle now,
+		 * not a bounded one: gen_interupt below drains whatever that
+		 * puts behind the clock, so there is no longer a reason to keep
+		 * any of it back. */
 		if (FGL_DEADLINE) {
 			if (FGL_DL_TRACE && fgl_dump_pending) {
 				fgl_dump_pending = 0;
 				fgl_dump_events();
 			}
-			/* Bounded, not a full settle.  See FGL_DL_OVERSHOOT:
-			 * an unbounded lump here lands between two adjacent
-			 * guest instructions and races the device models. */
-			psxRegs.cycle += fgl_deadline_charge_upto(
-				(s32)(psxRegs.next_interupt - psxRegs.cycle)
-				+ FGL_DL_OVERSHOOT);
+			psxRegs.cycle += fgl_deadline_settle();
 		}
 
 		/* THE HOOK IS NOT THE GUEST.
@@ -291,16 +333,6 @@ s32 fgl_service_events(struct lightrec_state *state, s32 delta)
 		if (FGL_DL_MEASURE)
 			fgl_deadline_resume();
 
-		/* AND AGAIN, ON THE FRESH ROOM.  Before the drain the room is
-		 * zero -- that is why the gate closed -- so the bounded charge
-		 * above can only ever move the clock by the bound itself.  If
-		 * events keep coming due the guest gets a few hundred cycles
-		 * per hook and the backlog grows without limit (watch owedhi).
-		 * The drain has just pushed next_interupt forward, so charge
-		 * against that. */
-		if (FGL_DEADLINE)
-			psxRegs.cycle += fgl_deadline_charge_upto(
-				(s32)(psxRegs.next_interupt - psxRegs.cycle));
 		PERF_END(PERF_EVT);
 	}
 
@@ -325,7 +357,19 @@ s32 fgl_service_events(struct lightrec_state *state, s32 delta)
 		return 0;
 	}
 
-	lightrec_set_target_cycle_count(state, fgl_gate(cycles_pcsx));
+	/* RELATIVE, NOT ABSOLUTE.  r14 is target_cycle - current_cycle, and
+	 * lightrec_set_target_cycle_count clamps its argument UP to
+	 * current_cycle.  Handing it a bare budget therefore works only while
+	 * current_cycle is smaller than the budget -- and the alarm guarantees
+	 * it will not be, because zeroing r14 in the handler makes
+	 * lightrec_execute write back current_cycle = target_cycle.  From the
+	 * first fire onward every absolute target was clamped to current and
+	 * the gate came back at exactly zero, so the dispatcher exited at the
+	 * first boundary of every re-entry: 26,660 slice starts against 1,108
+	 * alarms, with room left and nothing due.  Add current and the budget
+	 * means what it says. */
+	lightrec_set_target_cycle_count(state,
+		lightrec_current_cycle_count(state) + fgl_gate(cycles_pcsx));
 
 	if (FGL_DEADLINE) {
 		/* A new slice starts here, so the alarm is armed here -- once,
@@ -336,15 +380,36 @@ s32 fgl_service_events(struct lightrec_state *state, s32 delta)
 	return 1;
 }
 
+/* WHAT ACTUALLY ENDS A SLICE.
+ *
+ * The alarm accounts for a twentieth of them, so something else is doing the
+ * work, and until it has a name the cost of the wall clock cannot be attributed.
+ * Four exits, four counters, printed in the dl: line.  Free when not measuring. */
+unsigned int fgl_dl_end_step, fgl_dl_end_room, fgl_dl_end_irq, fgl_dl_end_alarm;
+
 static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 {
 	s32 cycles_left = fgl_slice(psxRegs.next_interupt - psxRegs.cycle);
+	int stop = block_stepping || cycles_left <= 0 || has_interrupt()
+		   || (FGL_DEADLINE && fgl_deadline_fired());
+
+	if (FGL_DL_MEASURE && stop) {
+		/* Tested in the same order the condition short-circuits, so
+		 * each slice is charged to exactly one reason. */
+		if (block_stepping)
+			fgl_dl_end_step++;
+		else if (cycles_left <= 0)
+			fgl_dl_end_room++;
+		else if (has_interrupt())
+			fgl_dl_end_irq++;
+		else
+			fgl_dl_end_alarm++;
+	}
 
 	/* An alarm that went off while C had control already collapsed the pair
 	 * in memory; writing a fresh target here would quietly undo it and the
 	 * slice would run past its own alarm.  Ask, and leave instead. */
-	if (block_stepping || cycles_left <= 0 || has_interrupt()
-	    || (FGL_DEADLINE && fgl_deadline_fired()))
+	if (stop)
 		lightrec_set_exit_flags(state, LIGHTREC_EXIT_CHECK_INTERRUPT);
 	else {
 		/* DO NOT ARM.  This function runs on every MMIO wrapper return
@@ -352,8 +417,16 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 		 * new slice, it is the middle of one.  Arming here cost six
 		 * peripheral-bus accesses per crossing and moved the alarm's
 		 * deadline forward every time the guest touched hardware, which
-		 * is the one thing the alarm must not do. */
-		lightrec_set_target_cycle_count(state, fgl_gate(cycles_left));
+		 * is the one thing the alarm must not do.
+		 *
+		 * Relative for the same reason as the slice start above: an
+		 * absolute target is clamped to current_cycle and hands back a
+		 * spent gate.  This site is the hot one -- it runs on every
+		 * MMIO return -- so it is where the pinned gate turned into one
+		 * dispatcher teardown per crossing. */
+		lightrec_set_target_cycle_count(state,
+			lightrec_current_cycle_count(state)
+			+ fgl_gate(cycles_left));
 	}
 }
 
@@ -374,6 +447,38 @@ static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 static inline bool hw_is_irq_reg(u32 mem)
 {
 	return (mem & 0x1fff) == 0x1074;
+}
+
+/* EXACT FOR READS.  COARSE FOR INTERRUPTS.
+ *
+ * bleem's rule, and it is stated outright in its own timing model: interrupt
+ * generation is coarse -- one sample of the host counter per alarm, and an IRQ
+ * can only be raised at a block boundary -- while a guest read of a root
+ * counter recomputes from the hardware counter AT THAT INSTANT.  There is no
+ * stored counter value to go stale, and "the cost of the accurate half is zero
+ * when the guest is not reading a timer, which is the common case".
+ *
+ * We have the coarse half: the clock advances at slice boundaries, TMU2 sized
+ * to the exact time until the next event.  This is the other half.  Without it
+ * psxRegs.cycle is frozen for the length of a slice, psxRcntRcount derives the
+ * counter from it, and a guest polling that counter sees it stop and spins --
+ * measured as MMIO crossings going from 442 a frame to about 6000.
+ *
+ * The range is the three root counters, 0x1f801100-0x1f80112f: count, mode and
+ * target for each.  Writes as well as reads, because psxRcntWcount sets
+ * cycleStart from psxRegs.cycle and a stale base offsets the whole period --
+ * bleem takes a fresh snapshot on its write path for the same reason.
+ *
+ * Everything else keeps the zero-read path, which is the entire point. */
+static inline void fgl_mmio_note(u32 mem)
+{
+	if (!FGL_DEADLINE)
+		return;
+
+	fgl_last_mmio = mem;
+
+	if ((mem & 0x1fff) - 0x1100u < 0x30u)
+		psxRegs.cycle += fgl_deadline_settle();
 }
 
 static inline void hw_light_write_done(struct lightrec_state *state)
@@ -402,23 +507,34 @@ static inline void hw_light_write_done(struct lightrec_state *state)
  * This must be FGL_DL_MEASURE, not FGL_DEADLINE: a fit build has to exclude the
  * same work, or the K it reports is a K for a build that measured differently.
  */
+/* NOT UNDER THE DEADLINE.  exclude_begin is only correct straight after a
+ * charge or a settle -- it skips the counter read on the promise that dl_mark
+ * is already current -- and the deadline crossing above no longer settles, so
+ * that promise is gone.  Bracketing here would need a full pause(), which is
+ * the read this whole change exists to remove; and resume() is a second one.
+ *
+ * What goes unbracketed is psxHwRead/psxHwWrite itself, which is guest work by
+ * construction -- a handler runs because the guest touched hardware.  The
+ * expensive host work with no guest cause is the renderer, and that is still
+ * excluded, at the hook, where gen_interupt runs it.
+ *
+ * A fit build keeps the bracket: its K has to be measured the same way. */
 #define FGL_MMIO_ENTER()					\
 	do {							\
-		if (FGL_DL_MEASURE)				\
+		if (FGL_DL_MEASURE && !FGL_DEADLINE)		\
 			fgl_deadline_exclude_begin();		\
 	} while (0)
 
 #define FGL_MMIO_LEAVE()					\
 	do {							\
-		if (FGL_DL_MEASURE)				\
+		if (FGL_DL_MEASURE && !FGL_DEADLINE)		\
 			fgl_deadline_resume();			\
 	} while (0)
 
 static void hw_write_byte(struct lightrec_state *state,
 			  u32 op, void *host, u32 mem, u32 val)
 {
-	if (FGL_DEADLINE)
-		fgl_last_mmio = mem;
+	fgl_mmio_note(mem);
 	lightrec_tansition_to_pcsx(state);
 	FGL_MMIO_ENTER();
 
@@ -436,8 +552,7 @@ static void hw_write_half(struct lightrec_state *state,
 		hw_light_write_done(state);
 		return;
 	}
-	if (FGL_DEADLINE)
-		fgl_last_mmio = mem;
+	fgl_mmio_note(mem);
 	lightrec_tansition_to_pcsx(state);
 	FGL_MMIO_ENTER();
 
@@ -455,8 +570,7 @@ static void hw_write_word(struct lightrec_state *state,
 		hw_light_write_done(state);
 		return;
 	}
-	if (FGL_DEADLINE)
-		fgl_last_mmio = mem;
+	fgl_mmio_note(mem);
 	lightrec_tansition_to_pcsx(state);
 	FGL_MMIO_ENTER();
 
@@ -470,8 +584,7 @@ static u8 hw_read_byte(struct lightrec_state *state, u32 op, void *host, u32 mem
 {
 	u8 val;
 
-	if (FGL_DEADLINE)
-		fgl_last_mmio = mem;
+	fgl_mmio_note(mem);
 	lightrec_tansition_to_pcsx(state);
 	FGL_MMIO_ENTER();
 
@@ -490,8 +603,7 @@ static u16 hw_read_half(struct lightrec_state *state,
 
 	if (hw_is_irq_reg(mem))
 		return psxHu16(mem);
-	if (FGL_DEADLINE)
-		fgl_last_mmio = mem;
+	fgl_mmio_note(mem);
 	lightrec_tansition_to_pcsx(state);
 	FGL_MMIO_ENTER();
 
@@ -511,8 +623,7 @@ static u32 hw_read_word(struct lightrec_state *state,
 
 	if (hw_is_irq_reg(mem))
 		return psxHu32(mem);
-	if (FGL_DEADLINE)
-		fgl_last_mmio = mem;
+	fgl_mmio_note(mem);
 	lightrec_tansition_to_pcsx(state);
 	FGL_MMIO_ENTER();
 
@@ -923,19 +1034,16 @@ static void lightrec_plugin_execute_internal(bool block_only)
 	regs = lightrec_get_registers(lightrec_state);
 	{
 		PERF_BEGIN(PERF_EVT);
-		/* Release whatever the clamped crossing charges could not fit.
-		 * The drain below has to see how overdue each event really is. */
+		/* Land the time since the last crossing.  A full settle now,
+		 * not a bounded one: gen_interupt below drains whatever that
+		 * puts behind the clock, so there is no longer a reason to keep
+		 * any of it back. */
 		if (FGL_DEADLINE) {
 			if (FGL_DL_TRACE && fgl_dump_pending) {
 				fgl_dump_pending = 0;
 				fgl_dump_events();
 			}
-			/* Bounded, not a full settle.  See FGL_DL_OVERSHOOT:
-			 * an unbounded lump here lands between two adjacent
-			 * guest instructions and races the device models. */
-			psxRegs.cycle += fgl_deadline_charge_upto(
-				(s32)(psxRegs.next_interupt - psxRegs.cycle)
-				+ FGL_DL_OVERSHOOT);
+			psxRegs.cycle += fgl_deadline_settle();
 		}
 
 		/* THE HOOK IS NOT THE GUEST.
@@ -953,16 +1061,6 @@ static void lightrec_plugin_execute_internal(bool block_only)
 		if (FGL_DL_MEASURE)
 			fgl_deadline_resume();
 
-		/* AND AGAIN, ON THE FRESH ROOM.  Before the drain the room is
-		 * zero -- that is why the gate closed -- so the bounded charge
-		 * above can only ever move the clock by the bound itself.  If
-		 * events keep coming due the guest gets a few hundred cycles
-		 * per hook and the backlog grows without limit (watch owedhi).
-		 * The drain has just pushed next_interupt forward, so charge
-		 * against that. */
-		if (FGL_DEADLINE)
-			psxRegs.cycle += fgl_deadline_charge_upto(
-				(s32)(psxRegs.next_interupt - psxRegs.cycle));
 		PERF_END(PERF_EVT);
 	}
 	if (!block_only && psxRegs.stop)

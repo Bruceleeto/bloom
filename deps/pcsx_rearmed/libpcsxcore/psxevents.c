@@ -178,6 +178,47 @@ static void fire_due_events(psxRegisters *regs)
 	}
 }
 
+/* THE DRAIN AT A CROSSING, AND WHY IT REPLACES HOLDING THE CLOCK BACK.
+ *
+ * A device model must never see a clock that has already run past an event
+ * that has not fired -- cdrom.c does arithmetic against pending event cycles
+ * and none of it was written for `now` to be on the far side.  There are only
+ * two ways to honour that.  The old one was to CLAMP the charge to the room
+ * before the next event and carry the rest in a pool, which is where owed,
+ * OWED_MAX, OVERSHOOT and the dropped-time accounting all came from: the pool
+ * grows whenever the guest's own schedule leaves smaller gaps than real time
+ * fills, and then the excess has to be thrown away.
+ *
+ * This is the other way, and it is what bleem does: let the clock be where it
+ * really is and FIRE the events that are behind it, before the handler runs.
+ * Nothing is owed because nothing is held back, so the pool and every constant
+ * attached to it go away.
+ *
+ * NOT irq_test: that ends in psxException, which moves the guest PC.  Here the
+ * guest is mid-block at an MMIO access and the PC must not move.  Cause is
+ * still updated, and that is the entire point -- it is what makes
+ * has_interrupt() true on the way back in, so the slice ends at the next block
+ * boundary and the exception is delivered there.  Which is where bleem
+ * delivers it too.
+ *
+ * The loop is gen_interupt's: a handler can reschedule itself for now
+ * (psxRcntSet does whenever a counter ran late), and schedule_timeslice only
+ * reports that by handing back next_interupt == cycle. */
+void events_run_due(psxCP0Regs *cp0)
+{
+	psxRegisters *regs = cp0TOpsxRegs(cp0);
+	int guard = 1024;
+
+	do {
+		fire_due_events(regs);
+	} while (schedule_timeslice(regs) == regs->cycle && !regs->stop
+		 && --guard > 0);
+
+	cp0->n.Cause &= ~0x400;
+	if (psxHu32(0x1070) & psxHu32(0x1074))
+		cp0->n.Cause |= 0x400;
+}
+
 void irq_test(psxCP0Regs *cp0)
 {
 	psxRegisters *regs = cp0TOpsxRegs(cp0);
