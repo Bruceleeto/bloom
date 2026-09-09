@@ -1511,19 +1511,7 @@ _gte_nclip_leaf_call:
 /* The leaf prologue: save what the body uses beyond r0/r1, find the file,
  * load XMTRX, then RTP_ENTER's bases and constants with ofx/ofy taken from
  * the file instead of gte_hot. */
-.macro RTP_ENTER_LEAF
-	mov.l	r2, @-r15
-	mov.l	r3, @-r15
-	mov.l	r4, @-r15
-	mov.l	r6, @-r15
-	mov.l	r7, @-r15
-	mov.l	r8, @-r15
-	mov.l	r9, @-r15
-	mov.l	r10, @-r15
-	mov.w	2f, r0			/* FGL_AT_CP2D * 4 */
-	stc	gbr, r4
-	add	r0, r4			/* r4 = the file */
-	RTP_XMTRX_LOAD
+.macro RTP_LEAF_CONST
 	mov	r4, r2
 	add	#32, r2
 	mov	r4, r6
@@ -1538,6 +1526,55 @@ _gte_nclip_leaf_call:
 	fmov.s	@r0+, fr11
 	fmov	fr11, fr5
 	fneg	fr5
+.endm
+
+/* The leaf prologue: save what the body uses beyond r0/r1, find the file,
+ * then EITHER take XMTRX and ofx/ofy as they stand OR rebuild them.
+ *
+ * THE LEAF'S CACHE.  Rebuilding XMTRX from the file is ~90 instructions
+ * and the offsets another 10, a third of an RTPS, and the control file
+ * changes once per object, not once per vertex (Spyro: 823k RTPS per 300
+ * vsyncs, 178k after a control write).  So the leaf publishes what it
+ * loaded in gte_hot, on the C cache's own protocol: xmtrx_key = -2 means
+ * "XMTRX holds rotation matrix 0 with its translation, as the leaf loads
+ * it", xmtrx_serial = the psxCP2CtrlGen it was loaded at, ofx/ofy/ofs_gen
+ * as gte_offsets_rebuild writes them (bit-identical: float, times 1/65536).
+ * The C side never matches -2 against its own keys, so it reloads after a
+ * leaf, and the leaf reloads after C (key >= 0), a reset (key -1), or a
+ * CTC2 (generation moved).  xmtrx_mx stays -1 so the column-only reload in
+ * gte_mtx_use_slow never fires on the leaf's matrix. */
+.macro RTP_ENTER_LEAF
+	mov.l	r2, @-r15
+	mov.l	r3, @-r15
+	mov.l	r4, @-r15
+	mov.l	r6, @-r15
+	mov.l	r7, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.w	2f, r0			/* FGL_AT_CP2D * 4 */
+	stc	gbr, r4
+	add	r0, r4			/* r4 = the file */
+	mov.l	6f, r1
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	7f, r0			/* &gte_hot */
+	mov.l	@(16, r0), r8		/* xmtrx_key */
+	mov	#-2, r9
+	cmp/eq	r9, r8
+	bf	8f
+	mov.l	@(24, r0), r8		/* xmtrx_serial */
+	cmp/eq	r1, r8
+	bf	8f
+	/* hit: XMTRX is ours at this generation, the offsets with it */
+	RTP_LEAF_CONST
+	mov.l	7f, r0
+	add	#4, r0
+	fmov.s	@r0+, fr6		/* ofx */
+	bra	1f
+	 fmov.s	@r0, fr7		/* ofy */
+8:	/* miss: rebuild from the file, then publish */
+	RTP_XMTRX_LOAD
+	RTP_LEAF_CONST
 	mov.w	5f, r0			/* cp2c[24]: OFX */
 	mov.l	@(r0, r4), r1
 	lds	r1, fpul
@@ -1547,8 +1584,21 @@ _gte_nclip_leaf_call:
 	mov.l	@(r0, r4), r1
 	lds	r1, fpul
 	float	fpul, fr7
+	fmul	fr9, fr7		/* ofy */
+	mov.l	6f, r1
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	7f, r0			/* &gte_hot */
+	mov.l	r1, @(12, r0)		/* ofs_gen */
+	mov.l	r1, @(24, r0)		/* xmtrx_serial */
+	mov	#-2, r1
+	mov.l	r1, @(16, r0)		/* xmtrx_key: the leaf's */
+	mov	#-1, r1
+	mov.l	r1, @(20, r0)		/* xmtrx_mx */
+	add	#4, r0
+	fmov.s	fr6, @r0		/* ofx */
+	add	#4, r0
 	bra	1f
-	 fmul	fr9, fr7		/* ofy */
+	 fmov.s	fr7, @r0		/* ofy */
 2:	.word	264
 3:	.word	232
 5:	.word	224
@@ -1557,6 +1607,8 @@ _gte_nclip_leaf_call:
 	.long	0x37800000	/* 1/65536 */
 	.long	0x3f000000	/* 0.5 */
 	.long	0x47000000	/* 32768.0 */
+6:	.long	_psxCP2CtrlGen
+7:	.long	_gte_hot
 1:
 .endm
 
@@ -1589,10 +1641,6 @@ _gte_nclip_leaf_call:
 	mov	r9, r0
 3:	mov.w	r0, @(0, r2)		/* IR0 */
 	mov.l	r7, @(20, r3)		/* FLAG */
-	mov.l	5f, r0			/* &gte_hot */
-	mov	#-1, r1
-	mov.l	r1, @(16, r0)		/* xmtrx_key: XMTRX is ours now */
-	mov.l	r1, @(20, r0)		/* xmtrx_mx */
 	mov.l	@r15+, r10
 	mov.l	@r15+, r9
 	mov.l	@r15+, r8
@@ -1611,8 +1659,6 @@ _gte_nclip_leaf_call:
 	bra	3b
 	 mov	#0, r0
 4:	.word	0x1000			/* limH bound, and its flag bit */
-	.align	2
-5:	.long	_gte_hot
 .endm
 
 	.balign	4
@@ -2297,12 +2343,79 @@ _gte_avsz4_leaf:
 
 /* runColor2 over MAC1..3 as they stand in the file.  r8 = dest | 0x400 for
  * the writeback pass.  Preserves r13, r14. */
+/*
+ * The same component when sf = 1 (r14 = -12), which is every DPCS, INTPL,
+ * DCPL and DPCT a game issues.  Two identities make the 64-bit arithmetic
+ * above unnecessary:
+ *
+ *   ((FC << 12) - mac) >> 12  ==  FC + ((-mac) >> 12)      (FC << 12 is a
+ *   multiple of 4096, so the floor moves through the sum), and the 44-bit
+ *   overflow of the left side is exactly the 32-bit signed overflow of the
+ *   right (v >= 2^43  <=>  v >> 12 >= 2^31), which `addv` reports in T.
+ *
+ *   (mac + IR0 * ir) >> 12 needs no high word: |IR0 * ir| <= 2^30 and every
+ *   caller's mac is bounded -- RGB << 4 (< 2^12), IR << 12 (<= 2^27),
+ *   (C * IR) << 4 (<= 2^27) -- so the sum fits in 32 bits.
+ *
+ * r1 = -0x8000 for the whole pass (r14 is DPCT's and must survive).
+ */
+.macro RC2_CORE_SF n
+	mov.l	@(4 * (\n - 1), r9), r11	/* FC */
+	neg	r5, r10
+	mov	#-12, r0
+	shad	r0, r10			/* (-mac) >> 12 */
+	addv	r10, r11		/* FC + that, T = 44-bit overflow */
+	bf	8f
+	cmp/pz	r11
+	bt	1f
+	FLAG_A_POS \n
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:	LIMB	r11, \n, r1		/* ir, lm ignored as above */
+	mul.l	r7, r11
+	sts	macl, r0		/* IR0 * ir */
+	add	r0, r5
+	mov	#-12, r0
+	shad	r0, r5			/* mac */
+.endm
+
+.macro RC2_COMP_SF n
+	mov.l	@(32 + 4 * \n, r6), r5
+	RC2_CORE_SF \n
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn, every pass */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	20f			/* IR only on the writeback pass */
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+20:	LIMC	r5, \n
+.endm
+
 gl_rc2:
 	mov	#106, r9
 	shll	r9
 	add	r4, r9			/* file + 212 */
 	mov.w	@r2, r7			/* IR0 */
 	mov	#0, r12
+	tst	r14, r14
+	bt	gl_rc2_sf0
+	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1			/* -0x8000 */
+	RC2_COMP_SF 1
+	RC2_COMP_SF 2
+	RC2_COMP_SF 3
+	RGB_OUT
+	rts
+	 nop
+gl_rc2_sf0:
 	RC2_COMP 1
 	RC2_COMP 2
 	RC2_COMP 3

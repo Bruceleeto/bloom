@@ -1,10 +1,14 @@
-/* CACHE MISSES IN EMITTED CODE ONLY.
+/* WHAT EMITTED CODE COSTS, AND NOTHING ELSE'S.
  *
- * One counter pair -- PRFC0 icache misses, PRFC1 operand cache misses -- run
- * across a 300-vsync window but PAUSED wherever the machine is not executing
- * emitted code.  The pause points are the doors out of it: `fgl_service_events`
+ * A counter pair run across a window but PAUSED wherever the machine is not
+ * executing emitted code.  The window runs three times with a different pair
+ * loaded each lap -- misses, then the cycles those misses froze, then elapsed
+ * cycles and instructions issued as the denominator -- so one run prices the
+ * recompiler's own memory behaviour and its own CPI.  See emitmiss.c.
+ *
+ * The pause points are the doors out of emitted code: `fgl_service_events`
  * and the four shims (hw, rw, cop, svc).  What is left is the JIT's own
- * misses, which is the number a code-layout change has to move.
+ * traffic, which is the number a code-layout change has to move.
  *
  * PAUSE, NOT SAMPLE.  `perf_cntr_stop` retains the count and `perf_cntr_resume`
  * carries on, so a door costs two register writes instead of four 48-bit reads
@@ -32,7 +36,7 @@ extern uint32_t fgl_blocks_run;
 #if defined(BLOOM_EMITMISS) && defined(__sh__)
 
 #ifndef EMITMISS_VSYNCS
-#define EMITMISS_VSYNCS 300
+#define EMITMISS_VSYNCS 120
 #endif
 
 /* Presented frames to let go by before the window opens.  The first few
@@ -40,7 +44,7 @@ extern uint32_t fgl_blocks_run;
  * against a steady 13.7, and its misses land on whichever thread the counters
  * happen to be running for.  Measuring a warm JIT means starting after it. */
 #ifndef EMITMISS_SKIP
-#define EMITMISS_SKIP 300
+#define EMITMISS_SKIP 120
 #endif
 
 void bloom_emitmiss_vsync(void);
