@@ -30,6 +30,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "perf.h"
+#include "emitmiss.h"
 
 /*
  * Bumped on every write to a COP2 control register, wherever the write comes
@@ -420,8 +421,13 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 				/* Same reason as remove_from_code_lut: a
 				 * patched link does not go through the slot,
 				 * so clearing the slot alone would leave the
-				 * stale code reachable. */
-				fgl_unlink_all(state, FGL_UNLINK_SMC);
+				 * stale code reachable.  This block's slots
+				 * and no others -- the code stays allocated
+				 * until it is recompiled. */
+				fgl_unlink_range(state,
+						 lut_offset(block->pc),
+						 block->nb_ops,
+						 FGL_UNLINK_SMC);
 				lut_write(state, lut_offset(block->pc), NULL);
 			}
 		}
@@ -839,7 +845,24 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
  * arrived at in `state->curr_pc` -- which the dispatcher re-reads rather than
  * trusting its own exit register, because this may have run the interpreter
  * and moved it. */
+/* THE COMPILER DOOR.  Everything behind this -- the block cache lookup, the
+ * disassembler, lightrec's IR, fgl's emitter -- is C, and none of it is
+ * emitted code.  Split so the cache counters can be paused across the whole of
+ * it without threading a stop onto each return.  See src/emitmiss.h. */
+static void *fgl_get_next_block_inner(struct lightrec_state *state, u32 pc);
+
 void * fgl_get_next_block(struct lightrec_state *state, u32 pc)
+{
+	void *r;
+
+	EMITMISS_OUT_BEGIN();
+	r = fgl_get_next_block_inner(state, pc);
+	EMITMISS_OUT_END();
+
+	return r;
+}
+
+static void *fgl_get_next_block_inner(struct lightrec_state *state, u32 pc)
 {
 	struct block *block;
 	bool should_recompile;
@@ -988,13 +1011,18 @@ static void lightrec_realloc_code(struct lightrec_state *state,
 
 void lightrec_free_code(struct lightrec_state *state, void *ptr)
 {
-	/* BEFORE THE FREE, AND THAT ORDER IS THE WHOLE POINT.  A patched link
-	 * is a `bra` baked into another block's code with no indirection left
-	 * to redirect, so the only way to take one back is to rewrite the site
-	 * -- and the site has to still be code we own when we do it.  Undoing
-	 * every link on any free is bloop's answer too (`blocks.h`): selective
-	 * invalidation is what direct linking costs. */
-	fgl_unlink_all(state, FGL_UNLINK_FREE);
+	/* NO SWEEP HERE ANY MORE.  This used to undo every link in the program
+	 * on every free, because it is handed a bare pointer and cannot say
+	 * which block it belongs to.  That cost 200 times more teardown than
+	 * the links that were actually stale, and on the Dreamcast it is what
+	 * kept refilling the link table until it refused edges.
+	 *
+	 * The two callers that free a block's code -- lightrec_free_block and
+	 * the recompile path in lightrec_compile_block -- know the block, so
+	 * they call fgl_unlink_block first.  Both do it BEFORE the free, which
+	 * is the order that matters: a patched link is a `bra` baked into
+	 * another block with no indirection left to redirect, so taking one
+	 * back means rewriting the site while it is still memory we own. */
 
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_code_alloc_lock(state);
@@ -1435,6 +1463,14 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 		pr_debug("Block "X32_FMT" recompiled, reaping old code.\n",
 			 block->pc);
 
+		/* Before the free, and before the reaper is handed it: the old
+		 * code is unreachable from here on either way, and a site
+		 * living inside it must leave the table while we can still
+		 * tell that it does.  See lightrec_free_code. */
+		fgl_unlink_block(state, lut_offset(block->pc), block->nb_ops,
+				 (uintptr_t)old_fn, old_code_size,
+				 FGL_UNLINK_FREE);
+
 		if (ENABLE_THREADED_COMPILER)
 			lightrec_reaper_add(state->reaper,
 					    lightrec_reap_function, old_fn);
@@ -1481,27 +1517,27 @@ static void lightrec_print_info(struct lightrec_state *state)
 u32 fgl_memset(struct lightrec_state *state)
 {
 	u32 r;
-	PERF_BEGIN(PERF_SVC);
+	PERF_BEGIN(PERF_SVC); EMITMISS_OUT_BEGIN();
 	r = lightrec_memset(state);
-	PERF_END(PERF_SVC);
+	EMITMISS_OUT_END(); PERF_END(PERF_SVC);
 	return r;
 }
 
 u32 fgl_emulate_block(struct lightrec_state *state, struct block *block, u32 pc)
 {
 	u32 r;
-	PERF_BEGIN(PERF_SVC);
+	PERF_BEGIN(PERF_SVC); EMITMISS_OUT_BEGIN();
 	r = lightrec_emulate_block(state, block, pc);
-	PERF_END(PERF_SVC);
+	EMITMISS_OUT_END(); PERF_END(PERF_SVC);
 	return r;
 }
 
 u32 fgl_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg)
 {
 	u32 r;
-	PERF_BEGIN(PERF_SVC);
+	PERF_BEGIN(PERF_SVC); EMITMISS_OUT_BEGIN();
 	r = lightrec_check_load_delay(state, pc, reg);
-	PERF_END(PERF_SVC);
+	EMITMISS_OUT_END(); PERF_END(PERF_SVC);
 	return r;
 }
 
@@ -1961,6 +1997,10 @@ void lightrec_free_block(struct lightrec_state *state, struct block *block)
 	if (!(old_flags & BLOCK_NO_OPCODE_LIST))
 		lightrec_free_opcode_list(state, block->opcode_list);
 	if (block->function) {
+		/* Before the free: see lightrec_free_code. */
+		fgl_unlink_block(state, lut_offset(block->pc), block->nb_ops,
+				 (uintptr_t)block->function, block->code_size,
+				 FGL_UNLINK_FREE);
 		lightrec_free_function(state, block->function);
 		lightrec_unregister(MEM_FOR_CODE, block->code_size);
 	}
@@ -2220,7 +2260,7 @@ static u32 hw_shim_slow(struct lightrec_state *state, u32 op, u32 addr,
  * spread, do not quote the frame time. */
 u32 lightrec_hw_lb(u32 addr, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 	u32 v;
@@ -2230,13 +2270,13 @@ u32 lightrec_hw_lb(u32 addr, struct lightrec_state *state)
 	else
 		v = hw_shim_slow(state, OP_LB, addr, 0);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 	return v;
 }
 
 u32 lightrec_hw_lbu(u32 addr, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 	u32 v;
@@ -2246,13 +2286,13 @@ u32 lightrec_hw_lbu(u32 addr, struct lightrec_state *state)
 	else
 		v = hw_shim_slow(state, OP_LBU, addr, 0);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 	return v;
 }
 
 u32 lightrec_hw_lh(u32 addr, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 	u32 v;
@@ -2262,13 +2302,13 @@ u32 lightrec_hw_lh(u32 addr, struct lightrec_state *state)
 	else
 		v = hw_shim_slow(state, OP_LH, addr, 0);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 	return v;
 }
 
 u32 lightrec_hw_lhu(u32 addr, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 	u32 v;
@@ -2278,13 +2318,13 @@ u32 lightrec_hw_lhu(u32 addr, struct lightrec_state *state)
 	else
 		v = hw_shim_slow(state, OP_LHU, addr, 0);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 	return v;
 }
 
 u32 lightrec_hw_lw(u32 addr, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 	u32 v;
@@ -2294,13 +2334,13 @@ u32 lightrec_hw_lw(u32 addr, struct lightrec_state *state)
 	else
 		v = hw_shim_slow(state, OP_LW, addr, 0);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 	return v;
 }
 
 void lightrec_hw_sb(u32 addr, u32 val, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 
@@ -2309,12 +2349,12 @@ void lightrec_hw_sb(u32 addr, u32 val, struct lightrec_state *state)
 	else
 		hw_shim_slow(state, OP_SB, addr, val);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 }
 
 void lightrec_hw_sh(u32 addr, u32 val, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 
@@ -2323,12 +2363,12 @@ void lightrec_hw_sh(u32 addr, u32 val, struct lightrec_state *state)
 	else
 		hw_shim_slow(state, OP_SH, addr, val);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 }
 
 void lightrec_hw_sw(u32 addr, u32 val, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_HW);
+	PERF_BEGIN(PERF_HW); EMITMISS_OUT_BEGIN();
 	u32 kaddr = kunseg(addr);
 	const struct lightrec_mem_map_ops *ops = hw_shim_ops(state, kaddr);
 
@@ -2337,7 +2377,7 @@ void lightrec_hw_sw(u32 addr, u32 val, struct lightrec_state *state)
 	else
 		hw_shim_slow(state, OP_SW, addr, val);
 
-	PERF_END(PERF_HW);
+	EMITMISS_OUT_END(); PERF_END(PERF_HW);
 }
 
 void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)

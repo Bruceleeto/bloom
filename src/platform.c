@@ -24,6 +24,7 @@
 #include "emu.h"
 #include "overlay.h"
 #include "perf.h"
+#include "emitmiss.h"
 #include "pvr.h"
 
 #define MAX_LAG_FRAMES 3
@@ -256,7 +257,7 @@ static const struct {
  * platform.c out of lightrec's private header. */
 extern unsigned fgl_link_patched, fgl_link_uncompiled;
 extern unsigned fgl_link_undone, fgl_link_bad_site;
-extern unsigned fgl_link_range, fgl_link_calls;
+extern unsigned fgl_link_range, fgl_link_calls, fgl_link_full;
 
 /* Mirrors the enum in lightrec-private.h; see the unlink line below. */
 extern unsigned fgl_unlink_calls[6], fgl_unlink_links[6];
@@ -377,9 +378,9 @@ static void bloom_perf_report(uint64_t window_ms, unsigned int nframes)
 	 * inside a `bra`'s reach -- the population the FAR-only experiment is
 	 * about -- and it is counted even when the far path is forced. */
 	printf("  links  | near %u far %u uncompiled %u undone %u"
-	       " badsite %u calls %u\n",
+	       " badsite %u calls %u full %u\n",
 	       fgl_link_patched, fgl_link_range, fgl_link_uncompiled,
-	       fgl_link_undone, fgl_link_bad_site, fgl_link_calls);
+	       fgl_link_undone, fgl_link_bad_site, fgl_link_calls, fgl_link_full);
 
 	/* WHO KEEPS KILLING THE LINKS.  A teardown is global -- freeing or
 	 * invalidating anything puts every patched site in the program back --
@@ -517,6 +518,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	new_timer = timer_ms_gettime64();
 
 	frames++;
+	EMITMISS_VSYNC();
 
 	if (timer_ms == 0) {
 		timer_ms = new_timer;

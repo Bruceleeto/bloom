@@ -204,6 +204,7 @@ struct lightrec_state {
 	u32 addr_mask;				/* +688 */
 	u32 shim_arg;				/* +692 */
 	u32 link;				/* +696 */
+	u32 tsave;				/* +700 */
 	u8 in_delay_slot_n;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
@@ -526,6 +527,12 @@ void fgl_unlink_all(struct lightrec_state *state, unsigned why);
  * an invalidation actually cleared.  See fgl_lightrec.c. */
 void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
 		      unsigned why);
+
+/* Tear down one block: sites pointing at slots [first, first + n) are put
+ * back, sites living inside [code, code + code_size) are dropped untouched.
+ * Runs BEFORE the code is freed.  See fgl_lightrec.c. */
+void fgl_unlink_block(struct lightrec_state *state, u32 first, u32 n,
+		      uintptr_t code, u32 code_size, unsigned why);
 u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site);
 /* Why a link teardown happened.  Every one of these wipes EVERY link in the
  * program, so the interesting number is not how many links died but which

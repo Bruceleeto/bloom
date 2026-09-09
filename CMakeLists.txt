@@ -97,6 +97,14 @@ if (WITH_PERF)
 	add_compile_definitions(BLOOM_PERF=1)
 endif (WITH_PERF)
 
+# CACHE MISSES IN EMITTED CODE ONLY (src/emitmiss.h).  One counter pair over a
+# 300-vsync window, paused at every door out of generated code.  Brings the
+# dispatcher-entry counter at .Lrun with it, for the denominator.
+option(WITH_EMITMISS "Cache misses attributed to emitted code alone" OFF)
+if (WITH_EMITMISS)
+	add_compile_definitions(BLOOM_EMITMISS=1 FGL_BLOCK_COUNT=1)
+endif (WITH_EMITMISS)
+
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
@@ -273,6 +281,7 @@ add_executable(bloom
 	src/mcd.c
 	src/mmap.c
 	src/platform.c
+	src/emitmiss.c
 	src/plugins.c
 )
 if (WITH_FPS_OVERLAY)

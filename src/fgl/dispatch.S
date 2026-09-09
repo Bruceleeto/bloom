@@ -235,6 +235,17 @@ _fgl_dispatch_loop:
 
 .Lrun:
 
+#if FGL_BLOCK_COUNT
+	/* DISPATCHER ENTRIES.  Every arrival here, and nothing else -- a
+	 * patched link branches straight to a block's entry point and never
+	 * reaches this label.  r2 holds the guest PC and must survive; r0 and
+	 * r1 are reloaded from scratch below. */
+	mov.l	.Lblkctr, r1
+	mov.l	@r1, r0
+	add	#1, r0
+	mov.l	r0, @r1
+#endif
+
 #if FGL_DEBUG_RING
 	/* DEBUG: a ring of the last 64 guest block PCs.
 	 *
@@ -718,6 +729,9 @@ _fgl_link_stub:
 	 mov	r0, r14
 
 	.align	2
+#if FGL_BLOCK_COUNT
+.Lblkctr:	.long	_fgl_blocks_run
+#endif
 #if FGL_DEBUG_RING
 .Lringp:	.long	_fgl_pc_ring
 .Lsp0:		.long	0x1f800000

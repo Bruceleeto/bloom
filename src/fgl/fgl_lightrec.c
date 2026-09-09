@@ -24,6 +24,7 @@
 
 #include "fgl_state.h"
 #include "perf.h"
+#include "emitmiss.h"
 #include "fgl.h"
 #include "decode_int.h"
 
@@ -86,6 +87,8 @@ FGL_ASSERT(FGL_AT_SHIM_ARG * 4
 	   == offsetof(struct lightrec_state, shim_arg), shim_arg);
 FGL_ASSERT(FGL_AT_LINK * 4
 	   == offsetof(struct lightrec_state, link), link);
+FGL_ASSERT(FGL_AT_TSAVE * 4
+	   == offsetof(struct lightrec_state, tsave), tsave);
 
 /* THE REACH ITSELF.  `mov.l @(disp,GBR),r0` has an eight-bit displacement
  * scaled by four, so the last word generated code can name is at +1020.
@@ -187,7 +190,7 @@ static u32 fgl_gte_body(void *user, u32 op)
  * Implementing it here as well would be a second mechanism for one thing. */
 void fgl_rw(u32 opcode, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_RW);
+	PERF_BEGIN(PERF_RW); EMITMISS_OUT_BEGIN();
 	union code op = { .opcode = opcode };
 	u32 ret;
 
@@ -210,7 +213,7 @@ void fgl_rw(u32 opcode, struct lightrec_state *state)
 		break;
 	}
 
-	PERF_END(PERF_RW);
+	EMITMISS_OUT_END(); PERF_END(PERF_RW);
 }
 
 /* A write to COP0 Status or Cause.  `lightrec_mtc_cb`'s job, minus its LWC2
@@ -221,11 +224,11 @@ void fgl_rw(u32 opcode, struct lightrec_state *state)
  * Status.  See ir.h on IR_MTC_C. */
 void fgl_mtc(u32 opcode, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_COP);
+	PERF_BEGIN(PERF_COP); EMITMISS_OUT_BEGIN();
 	union code op = { .opcode = opcode };
 
 	lightrec_mtc(state, op, op.r.rd, state->regs.gpr[op.r.rt]);
-	PERF_END(PERF_COP);
+	EMITMISS_OUT_END(); PERF_END(PERF_COP);
 }
 
 /* A COP2 read that is not a load: `IRGB` and `ORGB`.  `lightrec_mfc2`'s job,
@@ -233,12 +236,12 @@ void fgl_mtc(u32 opcode, struct lightrec_state *state)
  * write -- the same shape `fgl_rw` has for the same reason. */
 void fgl_mfc(u32 opcode, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_COP);
+	PERF_BEGIN(PERF_COP); EMITMISS_OUT_BEGIN();
 	union code op = { .opcode = opcode };
 
 	if (op.r.rt)
 		state->regs.gpr[op.r.rt] = lightrec_mfc(state, op);
-	PERF_END(PERF_COP);
+	EMITMISS_OUT_END(); PERF_END(PERF_COP);
 }
 
 /* Returning from an exception.  `lightrec_rfe` pops the interrupt-enable
@@ -246,12 +249,12 @@ void fgl_mfc(u32 opcode, struct lightrec_state *state)
  * pending-interrupt check lives.  See ir.h on IR_RFE. */
 void fgl_rfe(u32 unused, struct lightrec_state *state)
 {
-	PERF_BEGIN(PERF_COP);
+	PERF_BEGIN(PERF_COP); EMITMISS_OUT_BEGIN();
 
 	(void) unused;
 
 	lightrec_rfe(state);
-	PERF_END(PERF_COP);
+	EMITMISS_OUT_END(); PERF_END(PERF_COP);
 }
 
 /* ---------------------------------------------------------------- */
@@ -279,6 +282,12 @@ void fgl_rfe(u32 unused, struct lightrec_state *state)
  * entered -- youngest at index.  Written by eight
  * instructions in `dispatch.S` at every block entry; read only here. */
 u32 fgl_pc_ring[1 + 64 * 4];
+
+/* Dispatcher entries, bumped by four instructions at `.Lrun` when
+ * FGL_BLOCK_COUNT.  Always defined so the reporter links either way; it stays
+ * zero in a build that does not count.  See src/emitmiss.h for why this is
+ * dispatcher entries and NOT blocks executed. */
+u32 fgl_blocks_run;
 
 static struct lightrec_state *fgl_crash_state;
 
@@ -902,8 +911,24 @@ void fgl_dump_mem_pub(u32 addr, unsigned words)
  *
  * It was briefly 16384, raised in the same change that added conditional
  * linking, on the guess that the edge count would triple.  Two variables at
- * once and the build faulted; this went back first because it was the guess. */
-#define FGL_MAX_LINKS 4096
+ * once and the build faulted; this went back first because it was the guess.
+ *
+ * AND THE GUESS WAS RIGHT, JUST UNMEASURED AT THE TIME.  4096 is what the
+ * census counted before conditional linking and before the backward scan; now
+ * every direct branch gets a site and the live set runs well past it.  What
+ * kept the old table on the cliff was not only its size but the global sweep
+ * on every free, which emptied and refilled it: 253,424 links torn down in a
+ * 600-vsync run against 1,156 once teardown became block-scoped.  With the
+ * sweep gone the table holds the live set instead of a churn of dead ones.
+ *
+ * NOT 65536.  Two uint32_t arrays of that length is 512 KiB of bss, and with
+ * it Spyro died at `sbrk` during boot -- "Unable to allocate memory", then
+ * "Unable to recompile block".  The link table competes with the code heap for
+ * the same 16 MiB, so it is bounded by what is left over.  16384 is 128 KiB.
+ *
+ * `full` in the links report is the refusal count and is the number to watch:
+ * if it is not zero, this is too small and the emulator is on the cliff. */
+#define FGL_MAX_LINKS 16384
 static uint32_t fgl_link_site[FGL_MAX_LINKS];
 
 /* WHICH TABLE SLOT EACH SITE BRANCHES AT, so that a teardown can be about the
@@ -917,6 +942,10 @@ static uint32_t fgl_link_site[FGL_MAX_LINKS];
  * right separately. */
 static uint32_t fgl_link_slot[FGL_MAX_LINKS];
 static unsigned fgl_n_links;
+
+/* Edges refused because the table was full.  Nonzero means FGL_MAX_LINKS is
+ * too small and the emulator is on the cliff described above. */
+unsigned fgl_link_full;
 
 /* DIAGNOSTIC: how the edges came out, printed by nothing yet but readable
  * from a debugger and cheap to keep. */
@@ -974,10 +1003,9 @@ void fgl_unlink_all(struct lightrec_state *state, unsigned why)
  * nothing -- it is walked whole or not at all -- so compacting is just a
  * second index.
  *
- * THIS IS NOT A LICENCE TO SKIP THE GLOBAL SWEEP WHERE CODE IS FREED.  It is
- * sound here only because invalidation retires a block without releasing its
- * memory; `lightrec_free_code` hands the arena back and cannot know which
- * sites pointed into it, so that path still unlinks everything. */
+ * FREEING CODE IS THE OTHER CASE, and it is `fgl_unlink_block` below.  This
+ * one restores sites, which means writing to them, so it is only sound while
+ * every site in the table is still live memory. */
 void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
 		      unsigned why)
 {
@@ -987,6 +1015,62 @@ void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
 	fgl_unlink_calls[why]++;
 
 	for (i = 0; i < fgl_n_links; i++) {
+		if (fgl_link_slot[i] >= first && fgl_link_slot[i] < last) {
+			fgl_link_restore(state, fgl_link_site[i]);
+			hit++;
+			continue;
+		}
+
+		fgl_link_site[keep] = fgl_link_site[i];
+		fgl_link_slot[keep] = fgl_link_slot[i];
+		keep++;
+	}
+
+	fgl_n_links = keep;
+	fgl_unlink_links[why] += hit;
+	fgl_link_undone += hit;
+}
+
+/* ONE BLOCK'S CODE IS ABOUT TO BE HANDED BACK TO THE ARENA.
+ *
+ * Two different populations die with it, and they need opposite treatment:
+ *
+ *   - Sites POINTING AT it.  Their target slot is inside [first, first + n),
+ *     they live in some other block that is still perfectly good memory, and
+ *     they must be rewritten back into a call to the stub.  Same as a range
+ *     unlink.
+ *
+ *   - Sites LIVING IN it, anywhere in [code, code + code_size).  These must be
+ *     forgotten WITHOUT being touched.  Restoring one means storing into
+ *     memory that is being freed this instant, and a later teardown that still
+ *     had it in the table would store into whatever the arena handed out next.
+ *     That is the hazard the old global sweep avoided by running before every
+ *     free and taking the entire table with it.
+ *
+ * A site can be in both sets -- a block that branches to itself -- and the
+ * living-in test wins, because not writing is always safe and writing into
+ * freed memory never is.
+ *
+ * MUST RUN BEFORE THE FREE.  The first population is rewritten here and the
+ * addresses have to still be ours. */
+void fgl_unlink_block(struct lightrec_state *state, u32 first, u32 n,
+		      uintptr_t code, u32 code_size, unsigned why)
+{
+	unsigned i, keep = 0, hit = 0;
+	u32 last = first + n;
+
+	fgl_unlink_calls[why]++;
+
+	for (i = 0; i < fgl_n_links; i++) {
+		uintptr_t site = (uintptr_t)fgl_link_site[i];
+
+		/* Living in the dying code: drop it, do not write it. */
+		if (code_size && site >= code && site < code + code_size) {
+			hit++;
+			continue;
+		}
+
+		/* Pointing at the dying code: put it back. */
 		if (fgl_link_slot[i] >= first && fgl_link_slot[i] < last) {
 			fgl_link_restore(state, fgl_link_site[i]);
 			hit++;
@@ -1021,7 +1105,24 @@ void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
  * DISPATCHER to jump to, because the dispatcher asks again next time -- but
  * baking it into a `bra` would freeze the edge on the sentinel for ever and
  * the real block would never be reached. */
+static u32 fgl_link_resolve_inner(struct lightrec_state *state, u32 target,
+				  u32 site);
+
+/* Reached from emitted code through `fgl_link_stub`, so it is another door
+ * out.  Wrapped rather than bracketed inline because it has several returns. */
 u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
+{
+	u32 r;
+
+	EMITMISS_OUT_BEGIN();
+	r = fgl_link_resolve_inner(state, target, site);
+	EMITMISS_OUT_END();
+
+	return r;
+}
+
+static u32 fgl_link_resolve_inner(struct lightrec_state *state, u32 target,
+				  u32 site)
 {
 	void *slot = lut_read(state, lut_offset(target));
 	int32_t d;
@@ -1054,8 +1155,10 @@ u32 fgl_link_resolve(struct lightrec_state *state, u32 target, u32 site)
 		return (u32)(uintptr_t)slot;
 	}
 
-	if (fgl_n_links >= FGL_MAX_LINKS)
+	if (fgl_n_links >= FGL_MAX_LINKS) {
+		fgl_link_full++;
 		return (u32)(uintptr_t)slot;
+	}
 
 	if (site & 3)                   /* the emitter's pad failed */
 		return (u32)(uintptr_t)slot;

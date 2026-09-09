@@ -30,6 +30,7 @@
 #include "bloom-config.h"
 #include "gte_fpu.h"
 #include "perf.h"
+#include "../../../../src/emitmiss.h"
 
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
@@ -191,7 +192,22 @@ static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
  */
 volatile int fgl_service_inline = 1;
 
+/* THE SERVICE DOOR.  Split in two so the cache counters can be paused across
+ * the whole of it without threading a stop onto each of the four returns. */
+static s32 fgl_service_events_inner(struct lightrec_state *state, s32 delta);
+
 s32 fgl_service_events(struct lightrec_state *state, s32 delta)
+{
+	s32 ret;
+
+	EMITMISS_OUT_BEGIN();
+	ret = fgl_service_events_inner(state, delta);
+	EMITMISS_OUT_END();
+
+	return ret;
+}
+
+static s32 fgl_service_events_inner(struct lightrec_state *state, s32 delta)
 {
 	struct lightrec_registers *regs;
 	s32 cycles_pcsx;
@@ -803,8 +819,10 @@ static void lightrec_plugin_execute_internal(bool block_only)
 					 && !lightrec_exit_flags(lightrec_state));
 			} else {
 			PERF_BEGIN(PERF_CPU);
+			EMITMISS_ENTER();
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
+			EMITMISS_LEAVE();
 			PERF_END(PERF_CPU);
 			}
 #ifdef __sh__

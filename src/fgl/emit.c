@@ -2017,6 +2017,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		break;
 
 	case IR_CAPTURE:
+		e->cap_rs = (int)p->rs + 1;             /* see fgl.h */
 		rs = operand(e, p->hs, p->rs, FGL_R_XFER);
 		if (rs != FGL_R_EXIT)
 			sh4_emit_mov_reg(&e->cg, rs, FGL_R_EXIT);
@@ -2080,6 +2081,25 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 			emit_fixup(e, &a->fix[f++]);
 		maybe_flush_pool(e);
 		emit_node(e, &ir[i]);
+
+		/* PARK T ACROSS THE DELAY SLOT.
+		 *
+		 * The link arm below is chosen by the T bit IR_COND's
+		 * comparison left standing, and that only survives while
+		 * IR_COND is the last node.  The decoder puts a transfer AHEAD
+		 * of its delay slot, so whenever the slot decoded to anything
+		 * real there are nodes after this one and any of them may write
+		 * T -- which is why those blocks used to get no link site and
+		 * dispatched on every execution for ever.
+		 *
+		 * Two instructions here, two at the link point, in conditional
+		 * blocks only.  r0 is per-node scratch and nothing carries a
+		 * value in it across a node boundary. */
+		if (ir[i].op == IR_COND && i != n - 1) {
+			sh4_emit_movt(&e->cg, FGL_R_XFER);
+			sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_TSAVE);
+			e->cond_saved = 1;
+		}
 	}
 
 	while (f < a->n_fix)
@@ -2185,27 +2205,43 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	{
 		const ir_node *t = (n > 0) ? &ir[n - 1] : NULL;
 
-		/* WHY THE LAST NODE AND NOT A BACKWARD SCAN FOR THE TRANSFER.
+		/* THE BACKWARD SCAN.
 		 *
-		 * The decoder puts a transfer's node AHEAD of its delay slot
-		 * (decode.c, `ir_decode`), so `j target; addiu $a0,$a0,1`
-		 * leaves IR_JUMP at n-2 and the slot's node last.  Testing the
-		 * last node therefore links only the transfers whose delay
-		 * slot decoded to no nodes at all -- a `nop`, or a pair the
-		 * constant folder ate -- and leaves the rest going round the
-		 * dispatcher.  That is a real amount of the win still on the
-		 * table and it is the obvious next thing to take.
+		 * The decoder puts a transfer AHEAD of its delay slot, so in
+		 * `j target; addiu $a0,$a0,1` the IR_JUMP is at n-2 and the
+		 * slot's node is last.  Testing only the last node meant a
+		 * block whose delay slot decoded to anything real got NO link
+		 * site and went round the dispatcher on every execution for
+		 * ever.  Measured: 95% of dispatcher entries -- 11.86M of
+		 * 12.49M in a 41-second run -- came from direct-branch blocks,
+		 * which are exactly the ones that are supposed to link and
+		 * never come back.  Most MIPS branches have a non-nop delay
+		 * slot, so most blocks were in that 95%.
 		 *
-		 * IT IS NOT TAKEN HERE, ON PURPOSE.  Scanning back for the
-		 * transfer was tried and Spyro faulted during BIOS boot; the
-		 * cause was never established, and widening the test at the
-		 * same time as adding the conditional arm made the two
-		 * indivisible.  Re-widening is a separate change so that its
-		 * own hardware run means something.
+		 * bleem links every direct branch with no such condition
+		 * (recompiler_backend.md, "Chaining is unconditional"), so this
+		 * is the shape to match.
 		 *
-		 * IT IS ALSO WHAT MAKES THE CONDITIONAL ARM BELOW WORK.  That
-		 * arm reads the T bit the IR_COND comparison left behind, and
-		 * T only survives to here because IR_COND is the last node. */
+		 * A conditional found back here is linkable too, now that T is
+		 * parked across the delay slot above.  A capture is not: its
+		 * target is a register and there is nothing to patch to, so
+		 * stop rather than walk past the transfer. */
+		if (t && t->op != IR_JUMP && t->op != IR_COND &&
+		    t->op != IR_CAPTURE) {
+			int k;
+
+			for (k = n - 2; k >= 0; k--) {
+				if (ir[k].op == IR_JUMP || ir[k].op == IR_COND) {
+					t = &ir[k];
+					break;
+				}
+				if (ir[k].op == IR_CAPTURE)
+					break;
+			}
+		}
+
+		/* `t` is the transfer the scan above found, which is the last
+		 * node only when the delay slot decoded to nothing. */
 		if (t && (t->op == IR_JUMP ||
 			  (FGL_LINK_COND && t->op == IR_COND))) {
 			int fall = -1, out1, out2 = -1;
@@ -2240,6 +2276,17 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 				int t_means_taken = (t->sub == CC_EQ ||
 						     t->sub == CC_GTZ ||
 						     t->sub == CC_GEZ);
+
+				/* UNPARK T, when the delay slot emitted
+				 * anything.  `cmp/pl` and not `tst`: movt left
+				 * 1 or 0, and `T = (r0 > 0)` reproduces the
+				 * original bit, while `tst r0,r0` would invert
+				 * it and silently swap the two arms. */
+				if (e->cond_saved) {
+					sh4_emit_mov_l_load_gbr(&e->cg,
+							(int)FGL_AT_TSAVE);
+					sh4_emit_cmppl(&e->cg, FGL_R_XFER);
+				}
 
 				/* Which arm walks away from the site.  Mode 3
 				 * is the mirror of 1 and 2: the single site
@@ -2294,6 +2341,7 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 			 * and leaves these six bytes dead; nothing executes
 			 * them either way, because the `bf` above jumps over
 			 * the whole site. */
+			e->linked = 1;
 			emit_link_site(e);             /* taken, or the only one */
 
 			if (fall >= 0 && FGL_LINK_COND == 2) {

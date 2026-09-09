@@ -203,6 +203,19 @@ typedef struct {
 	 * anything short; a block that needs several is one whose lowering is
 	 * materialising far too many constants. */
 	int pool_flushes;
+
+	/* THE TERMINATOR'S SOURCE REGISTER, PLUS ONE.  Zero means this block
+	 * does not end in an IR_CAPTURE.  Plus one because `fgl_init`
+	 * memsets, and $zero is register 0. */
+	int cap_rs;
+
+	/* Set when this block got a link site.  A block without one reaches
+	 * the dispatcher on every execution for ever. */
+	int linked;
+
+	/* Set when this block parked T across its delay slot, so the link
+	 * point knows to unpark it.  See FGL_AT_TSAVE. */
+	int cond_saved;
 } fgl_emitter;
 
 void     fgl_init(fgl_emitter *e, void *buf, uint32_t size, uint32_t base);
