@@ -54,7 +54,13 @@ static void or_word_at(fgl_emitter *e, int at, uint16_t bits)
 
 static int bt_fwd(fgl_emitter *e) { int s = here(e); sh4_emit_bt(&e->cg, 0); return s; }
 static int bf_fwd(fgl_emitter *e) { int s = here(e); sh4_emit_bf(&e->cg, 0); return s; }
-static int bra_fwd(fgl_emitter *e) { int s = here(e); sh4_emit_bra(&e->cg, 0); sh4_emit_nop(&e->cg); return s; }
+
+static int emit_delayed(fgl_emitter *e, uint16_t branch, uint32_t reads);
+static void slot_barrier(fgl_emitter *e) { e->slot_floor = here(e); }
+
+/* `bra` with its slot filled from what preceded it when that is possible;
+ * returns the index the `bra` landed on. */
+static int bra_fwd(fgl_emitter *e) { return emit_delayed(e, 0xa000u, 0); }
 
 static void patch_fwd8(fgl_emitter *e, int site)
 {
@@ -64,6 +70,7 @@ static void patch_fwd8(fgl_emitter *e, int site)
 		e->overflow = 3;
 	else
 		or_word_at(e, site, (uint16_t)(disp & 0xff));
+	slot_barrier(e);
 }
 
 static void patch_fwd12(fgl_emitter *e, int site)
@@ -74,7 +81,357 @@ static void patch_fwd12(fgl_emitter *e, int site)
 		e->overflow = 4;
 	else
 		or_word_at(e, site, (uint16_t)(disp & 0xfff));
+	slot_barrier(e);
 }
+
+
+/* ---------------------------------------------------------------- */
+/* Delay-slot filling                                                */
+/* ---------------------------------------------------------------- */
+
+/* A LABEL IS A BARRIER.  Both patchers land a branch HERE, so nothing emitted
+ * before this point may be lifted past it: a path arriving at the label would
+ * skip the lifted instruction on the way in and then execute it in the slot
+ * on the way out. */
+/* WHAT ONE EMITTED WORD READS AND WRITES, for the filler and nothing else.
+ *
+ * Only the encodings sh4.h can produce are decoded; anything else is
+ * `unknown`, which means "not liftable, and a wall for anything behind it".
+ * Registers are bits 0-15.  T, the MAC pair and the M/Q divide bits get bits
+ * of their own so a `cmp` cannot slide past a `bt` or a `div1` past its
+ * `div0s`.  PC-relative loads are the one legal instruction a delay slot may
+ * not hold (they and `mova` raise a slot-illegal exception on the hardware,
+ * and the interpreter would silently read the wrong PC); they are decoded so
+ * something else can be lifted OVER them, which is the whole point -- every
+ * service call ends in two or three of them. */
+#define SI_T    (1u << 16)
+#define SI_MACL (1u << 17)
+#define SI_MACH (1u << 18)
+#define SI_MQ   (1u << 19)
+
+enum { SM_NONE, SM_STATE, SM_STACK, SM_GUEST, SM_POOL };
+
+typedef struct {
+	uint32_t rd, wr;
+	int      mem;           /* SM_*                              */
+	int      mem_wr;        /* 1 = store                         */
+	int      mem_off;       /* SM_STATE: byte offset, -1 = any   */
+	int      legal;         /* may sit in a delay slot           */
+	int      unknown;       /* not decoded: a wall               */
+} slot_info;
+
+/* r3 is the guest-file base only under FGL_GBASE; otherwise it is an
+ * ordinary pool register and a memory operand off it is a guest access. */
+#if FGL_GBASE
+#define SLOT_GBASE FGL_R_GBASE
+#else
+#define SLOT_GBASE (-1)
+#endif
+
+static int slot_mem_class(int base, int off_words, int scale, slot_info *si)
+{
+	if (base == SLOT_GBASE) {
+		si->mem = SM_STATE;
+		si->mem_off = off_words < 0 ? -1 : off_words * scale;
+	} else if (base == 15) {
+		si->mem = SM_STACK;
+	} else {
+		si->mem = SM_GUEST;
+	}
+	return 0;
+}
+
+static void slot_decode(uint16_t w, slot_info *si)
+{
+	unsigned hi = w >> 12, n = (w >> 8) & 15, m = (w >> 4) & 15;
+	unsigned lo = w & 15, d8 = w & 0xff;
+#define R(x) (1u << (x))
+
+	memset(si, 0, sizeof(*si));
+	si->legal = 1;
+	si->mem_off = -1;
+
+	switch (hi) {
+	case 0x0:
+		switch (w & 0xff) {
+		case 0x09: return;                              /* nop */
+		case 0x08: case 0x18: si->wr = SI_T; return;    /* clrt sett */
+		case 0x19: si->wr = SI_T | SI_MQ; return;       /* div0u */
+		case 0x28: si->wr = SI_MACL | SI_MACH; return;  /* clrmac */
+		case 0x29: si->rd = SI_T; si->wr = R(n); return; /* movt */
+		case 0x0a: si->rd = SI_MACH; si->wr = R(n); return;
+		case 0x1a: si->rd = SI_MACL; si->wr = R(n); return;
+		case 0x07: si->rd = R(n) | R(m); si->wr = SI_MACL; return;
+		}
+		switch (lo) {
+		case 0xc: case 0xd: case 0xe:   /* mov.x @(r0,Rm),Rn */
+			si->rd = R(0) | R(m); si->wr = R(n);
+			slot_mem_class((int)m, -1, 1, si);
+			return;
+		case 0x4: case 0x5: case 0x6:   /* mov.x Rm,@(r0,Rn) */
+			si->rd = R(0) | R(m) | R(n);
+			slot_mem_class((int)n, -1, 1, si);
+			si->mem_wr = 1;
+			return;
+		}
+		break;
+	case 0x1:                               /* mov.l Rm,@(d,Rn) */
+		si->rd = R(m) | R(n);
+		slot_mem_class((int)n, (int)lo, 4, si);
+		si->mem_wr = 1;
+		return;
+	case 0x2:
+		switch (lo) {
+		case 0x0: case 0x1: case 0x2:   /* mov.x Rm,@Rn */
+			si->rd = R(m) | R(n);
+			slot_mem_class((int)n, (int)n == SLOT_GBASE ? 0 : -1, 1, si);
+			si->mem_wr = 1;
+			return;
+		case 0x4: case 0x5: case 0x6:   /* mov.x Rm,@-Rn */
+			si->rd = R(m) | R(n); si->wr = R(n);
+			slot_mem_class((int)n, -1, 1, si);
+			si->mem_wr = 1;
+			return;
+		case 0x7: si->rd = R(n) | R(m); si->wr = SI_T | SI_MQ; return;
+		case 0x8: case 0xc: si->rd = R(n) | R(m); si->wr = SI_T; return;
+		case 0x9: case 0xa: case 0xb: case 0xd:
+			si->rd = R(n) | R(m); si->wr = R(n); return;
+		}
+		break;
+	case 0x3:
+		switch (lo) {
+		case 0x0: case 0x2: case 0x3: case 0x6: case 0x7:
+			si->rd = R(n) | R(m); si->wr = SI_T; return;
+		case 0x4:                       /* div1 */
+			si->rd = R(n) | R(m) | SI_T | SI_MQ;
+			si->wr = R(n) | SI_T | SI_MQ; return;
+		case 0x5: case 0xd:
+			si->rd = R(n) | R(m); si->wr = SI_MACL | SI_MACH; return;
+		case 0x8: case 0xc:
+			si->rd = R(n) | R(m); si->wr = R(n); return;
+		case 0xa: case 0xe:             /* subc addc */
+			si->rd = R(n) | R(m) | SI_T; si->wr = R(n) | SI_T; return;
+		case 0xb: case 0xf:             /* subv addv */
+			si->rd = R(n) | R(m); si->wr = R(n) | SI_T; return;
+		}
+		break;
+	case 0x4:
+		switch (w & 0xff) {
+		case 0x00: case 0x01: case 0x04: case 0x05:
+		case 0x20: case 0x21: case 0x10:
+			si->rd = R(n); si->wr = R(n) | SI_T; return;
+		case 0x24: case 0x25:
+			si->rd = R(n) | SI_T; si->wr = R(n) | SI_T; return;
+		case 0x08: case 0x09: case 0x18: case 0x19: case 0x28: case 0x29:
+			si->rd = R(n); si->wr = R(n); return;
+		case 0x11: case 0x15:
+			si->rd = R(n); si->wr = SI_T; return;
+		case 0x0a: si->rd = R(n); si->wr = SI_MACH; return;
+		case 0x1a: si->rd = R(n); si->wr = SI_MACL; return;
+		}
+		if (lo == 0xc || lo == 0xd) {   /* shad shld */
+			si->rd = R(n) | R(m); si->wr = R(n); return;
+		}
+		break;
+	case 0x5:                               /* mov.l @(d,Rm),Rn */
+		si->rd = R(m); si->wr = R(n);
+		slot_mem_class((int)m, (int)lo, 4, si);
+		return;
+	case 0x6:
+		switch (lo) {
+		case 0x0: case 0x1: case 0x2:   /* mov.x @Rm,Rn */
+			si->rd = R(m); si->wr = R(n);
+			slot_mem_class((int)m, (int)m == SLOT_GBASE ? 0 : -1, 1, si);
+			return;
+		case 0x6:                       /* mov.l @Rm+,Rn */
+			si->rd = R(m); si->wr = R(n) | R(m);
+			slot_mem_class((int)m, -1, 1, si);
+			return;
+		case 0xa:                       /* negc */
+			si->rd = R(m) | SI_T; si->wr = R(n) | SI_T; return;
+		case 0x3: case 0x7: case 0x8: case 0x9: case 0xb:
+		case 0xc: case 0xd: case 0xe: case 0xf:
+			si->rd = R(m); si->wr = R(n); return;
+		}
+		break;
+	case 0x7: si->rd = R(n); si->wr = R(n); return;   /* add #imm */
+	case 0x8:
+		switch (n) {
+		case 0x0: case 0x1:             /* mov.x r0,@(d,Rn) */
+			si->rd = R(0) | R(m);
+			slot_mem_class((int)m, -1, 1, si);
+			si->mem_wr = 1;
+			return;
+		case 0x4: case 0x5:             /* mov.x @(d,Rm),r0 */
+			si->rd = R(m); si->wr = R(0);
+			slot_mem_class((int)m, -1, 1, si);
+			return;
+		case 0x8: si->rd = R(0); si->wr = SI_T; return;
+		}
+		break;                          /* bt bf bt/s bf/s */
+	case 0x9:                               /* mov.w @(d,pc),Rn */
+		si->wr = R(n); si->mem = SM_POOL; si->legal = 0; return;
+	case 0xc:
+		switch (n) {
+		case 0x0: case 0x1:             /* mov.b/w r0,@(d,gbr) */
+			si->rd = R(0); si->mem = SM_STATE; si->mem_wr = 1;
+			si->mem_off = -1; return;
+		case 0x2:                       /* mov.l r0,@(d,gbr) */
+			si->rd = R(0); si->mem = SM_STATE; si->mem_wr = 1;
+			si->mem_off = (int)d8 * 4; return;
+		case 0x4: case 0x5:
+			si->wr = R(0); si->mem = SM_STATE; si->mem_off = -1;
+			return;
+		case 0x6:
+			si->wr = R(0); si->mem = SM_STATE;
+			si->mem_off = (int)d8 * 4; return;
+		case 0x7:                       /* mova */
+			si->wr = R(0); si->mem = SM_POOL; si->legal = 0; return;
+		case 0x8: si->rd = R(0); si->wr = SI_T; return;
+		case 0x9: case 0xa: case 0xb:
+			si->rd = R(0); si->wr = R(0); return;
+		}
+		break;
+	case 0xd:                               /* mov.l @(d,pc),Rn */
+		si->wr = R(n); si->mem = SM_POOL; si->legal = 0; return;
+	case 0xe: si->wr = R(n); return;        /* mov #imm,Rn */
+	}
+	si->unknown = 1;
+	si->legal = 0;
+#undef R
+}
+
+/* May `a` (earlier) and `b` (later) change places? */
+static int slot_independent(const slot_info *a, const slot_info *b)
+{
+	if (a->unknown || b->unknown)
+		return 0;
+	if ((a->wr & b->rd) || (a->rd & b->wr) || (a->wr & b->wr))
+		return 0;
+	if (a->mem == SM_NONE || b->mem == SM_NONE)
+		return 1;
+	if (!a->mem_wr && !b->mem_wr)
+		return 1;
+	if (a->mem == SM_POOL || b->mem == SM_POOL)
+		return 1;                       /* nothing stores to a pool */
+	if (a->mem != b->mem)
+		return 1;                       /* the state block, the stack
+						 * and guest memory are three
+						 * different places */
+	if (a->mem == SM_STATE && a->mem_off >= 0 && b->mem_off >= 0)
+		return a->mem_off != b->mem_off;
+	return 0;
+}
+
+static uint16_t word_at(const fgl_emitter *e, int at)
+{
+	const uint8_t *p = e->start + 2 * at;
+
+	return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static void set_word_at(fgl_emitter *e, int at, uint16_t w)
+{
+	uint8_t *p = e->start + 2 * at;
+
+	p[0] = (uint8_t)(w & 0xff);
+	p[1] = (uint8_t)(w >> 8);
+}
+
+/* A DELAYED BRANCH WITH ITS SLOT FILLED FROM WHAT CAME BEFORE IT.
+ *
+ * `branch` is the word to emit and `reads` what it reads -- the target
+ * register of a `jmp`/`jsr`, nothing for `bra`.  The filler looks back up to
+ * SLOT_DEPTH words for one it can move: legal in a slot, independent of every
+ * word between it and the branch, not writing anything the branch reads, and
+ * not separated from the branch by a label (`slot_floor`).  It then rotates
+ * that word into the slot and returns the index the branch landed on, which
+ * is one less than `here` was when it was called.  With nothing to lift it
+ * emits the branch and a `nop`, exactly as before.
+ *
+ * The slot runs BEFORE the transfer on SH-4 and in the interpreter alike, so
+ * `A; B` and `B; A-in-slot` are the same program whenever A and B commute --
+ * which the dependency test is.  Pool fixups whose sites slide down a word
+ * are renumbered; tags travel with their words.
+ *
+ * The depth is small because everything a service call materialises is two
+ * or three PC-relative loads, and past those is the instruction that built
+ * the argument -- which is the one worth having. */
+#define SLOT_DEPTH 4
+
+/* The bisection switch.  1 puts a `nop` in every slot, exactly as before the
+ * filler existed; the emitted code is then word-for-word the old code. */
+#ifndef FGL_NO_SLOT
+#define FGL_NO_SLOT 0
+#endif
+
+static int emit_delayed(fgl_emitter *e, uint16_t branch, uint32_t reads)
+{
+	int b = here(e), k, i, lo;
+	slot_info si[SLOT_DEPTH];               /* si[k - lo] is word k */
+
+	/* A lift needs two bytes of room, a `nop` four: the exact-size second
+	 * pass must reach the same decision as the first, so room is not a
+	 * criterion here.  `sh4_word` flags a full buffer on its own. */
+	if (e->cg.overflow || FGL_NO_SLOT)
+		goto plain;
+
+	lo = b - SLOT_DEPTH;
+	if (lo < e->slot_floor)
+		lo = e->slot_floor;
+	if (lo < 0)
+		lo = 0;
+
+	for (k = lo; k < b; k++)
+		slot_decode(word_at(e, k), &si[k - lo]);
+
+	for (k = b - 1; k >= lo; k--) {
+		const slot_info *c = &si[k - lo];
+		uint16_t a = word_at(e, k);
+		int ok = 1;
+
+		if (c->unknown)
+			break;                  /* a wall: nothing behind it */
+		if (!c->legal || (c->wr & reads) || a == 0x0009)
+			continue;               /* stays put; must commute */
+		for (i = k + 1; i < b && ok; i++)
+			ok = slot_independent(c, &si[i - lo]);
+		if (!ok)
+			continue;
+
+		/* Lift: the words after A move down one, the branch takes
+		 * the vacated slot before A, and A becomes the slot. */
+		{
+			int f;
+
+			for (i = k; i < b - 1; i++)
+				set_word_at(e, i, word_at(e, i + 1));
+			for (f = 0; f < e->n_fix; f++)
+				if (e->fix[f].at > k && e->fix[f].at < b)
+					e->fix[f].at--;
+			set_word_at(e, b - 1, branch);
+			sh4_word(&e->cg, a);
+			e->slots_filled++;
+			/* A SLOT IS A BARRIER.  The next branch must not lift
+			 * this instruction a second time: that would leave a
+			 * branch in this branch's delay slot. */
+			slot_barrier(e);
+			return b - 1;
+		}
+	}
+
+plain:
+	sh4_word(&e->cg, branch);
+	sh4_emit_nop(&e->cg);
+	slot_barrier(e);
+	return b;
+}
+
+static int emit_jsr_slot(fgl_emitter *e, int rs)
+{
+	return emit_delayed(e, SH4_N(0x400b, rs), 1u << rs);
+}
+
 
 /* HOW MUCH OF A CONDITIONAL EXIT GETS A LINK.
  *
@@ -175,6 +532,8 @@ static void emit_link_site(fgl_emitter *e)
 	sh4_word(&e->cg, 0x0000u);             /* pad, data */
 	sh4_word(&e->cg, 0x0000u);             /* the target host address, */
 	sh4_word(&e->cg, 0x0000u);             /* filled in by the patcher */
+
+	slot_barrier(e);                       /* data: nothing lifts past it */
 }
 
 /* ---------------------------------------------------------------- */
@@ -256,6 +615,7 @@ static void emit_pool(fgl_emitter *e)
 	}
 
 	e->n_fix = 0;
+	slot_barrier(e);                        /* data */
 }
 
 /* A LITERAL POOL THAT DOES NOT HAVE TO SIT AT THE END.
@@ -1266,8 +1626,7 @@ static void emit_hw_load(fgl_emitter *e, const ir_node *p)
 	emit_addr_raw(e, p, FGL_R_T1, FGL_R_XFER);
 	emit_const(e, fn, FGL_R_XFER);
 	emit_const(e, e->tgt->shim_call, rs);
-	sh4_emit_jsr(&e->cg, rs);
-	sh4_emit_nop(&e->cg);           /* delay slot */
+	emit_jsr_slot(e, rs);
 
 	/* The value comes back in r0, and from here this is the tail of an
 	 * ordinary load: parked for the shadow if deferred, otherwise written
@@ -1309,8 +1668,7 @@ static void emit_hw_store(fgl_emitter *e, const ir_node *p)
 	emit_addr_raw(e, p, FGL_R_T1, FGL_R_XFER);
 	emit_const(e, fn, FGL_R_XFER);
 	emit_const(e, e->tgt->shim_call_st, rs);
-	sh4_emit_jsr(&e->cg, rs);
-	sh4_emit_nop(&e->cg);           /* delay slot */
+	emit_jsr_slot(e, rs);
 }
 
 /* The whole access, done by C.
@@ -1433,8 +1791,7 @@ static void emit_rw(fgl_emitter *e, const ir_node *p)
 	emit_const(e, e->tgt->rw, FGL_R_XFER);
 	emit_const(e, p->imm, FGL_R_T1);        /* the guest instruction word */
 	emit_const(e, e->tgt->shim_call, rs);
-	sh4_emit_jsr(&e->cg, rs);
-	sh4_emit_nop(&e->cg);                   /* delay slot */
+	emit_jsr_slot(e, rs);
 	emit_reload_pinned(e);
 }
 
@@ -1517,8 +1874,7 @@ static void emit_gte(fgl_emitter *e, const ir_node *p)
 	emit_const(e, body, FGL_R_XFER);
 	emit_const(e, p->imm, FGL_R_T1);
 	emit_const(e, e->tgt->shim_gte, rs);
-	sh4_emit_jsr(&e->cg, rs);
-	sh4_emit_nop(&e->cg);           /* delay slot */
+	emit_jsr_slot(e, rs);
 }
 
 static void emit_fixup(fgl_emitter *e, const ir_fixup *f)
@@ -1735,8 +2091,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		emit_const(e, e->tgt->mtc, FGL_R_XFER);
 		emit_const(e, p->imm, FGL_R_T1);   /* the guest instruction */
 		emit_const(e, e->tgt->shim_call, rs);
-		sh4_emit_jsr(&e->cg, rs);
-		sh4_emit_nop(&e->cg);              /* delay slot */
+		emit_jsr_slot(e, rs);
 		break;
 
 	case IR_MTC0:
@@ -1839,8 +2194,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		}
 		emit_const(e, e->tgt->rfe, FGL_R_XFER);
 		emit_const(e, e->tgt->shim_call, rs);
-		sh4_emit_jsr(&e->cg, rs);
-		sh4_emit_nop(&e->cg);
+		emit_jsr_slot(e, rs);
 		break;
 
 	case IR_MFC2:
@@ -1879,8 +2233,7 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		emit_const(e, e->tgt->mfc, FGL_R_XFER);
 		emit_const(e, p->imm, FGL_R_T1);
 		emit_const(e, e->tgt->shim_call, rs);
-		sh4_emit_jsr(&e->cg, rs);
-		sh4_emit_nop(&e->cg);
+		emit_jsr_slot(e, rs);
 		emit_reload_pinned(e);
 		break;
 
@@ -2364,8 +2717,7 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	}
 
 	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
-	sh4_emit_jmp(&e->cg, FGL_R_XFER);
-	sh4_emit_nop(&e->cg);                                  /* delay slot */
+	emit_delayed(e, SH4_N(0x402b, FGL_R_XFER), 1u << FGL_R_XFER);
 
 	emit_pool(e);
 

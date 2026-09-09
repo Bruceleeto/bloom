@@ -216,6 +216,13 @@ typedef struct {
 	/* Set when this block parked T across its delay slot, so the link
 	 * point knows to unpark it.  See FGL_AT_TSAVE. */
 	int cond_saved;
+
+	/* DELAY-SLOT FILLING.  `slot_floor` is the earliest word index the
+	 * filler may lift from: a label, a filled slot and any run of data
+	 * all move it forward, because nothing may be hoisted past a point
+	 * some other path can arrive at.  `slots_filled` is the census. */
+	int      slot_floor;
+	uint32_t slots_filled;
 } fgl_emitter;
 
 void     fgl_init(fgl_emitter *e, void *buf, uint32_t size, uint32_t base);
