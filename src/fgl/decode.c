@@ -466,8 +466,29 @@ void ir_decode_op(ir_ctx *c, uint32_t insn, uint32_t pc)
                                 return;
                         p->rd = (uint8_t)rt;
                         p->imm = cop2_disp(rd, rs == 0x02);
-                        p->sub = (uint8_t)(rs == 0x02 ? CP2_RAW
-                                                      : cop2_read_kind(rd));
+                        /* A CONTROL READ NARROWS TOO, BECAUSE FGL DOES NOT
+                         * OWN EVERY WRITE.
+                         *
+                         * Sign-extending on the way in (see `cop2_is_half`)
+                         * makes a bare load correct only while every write
+                         * went through fgl.  It does not: lightrec's own C
+                         * writes these seven with `store_u16`
+                         * (`lightrec_ctc2`, lightrec.c) and leaves the upper
+                         * half whatever it was, because its convention is to
+                         * extend on the READ side instead (`lightrec_mfc`).
+                         * Every block is interpreted once before it is
+                         * compiled, so that C path runs in every game.
+                         *
+                         * Reading raw then hands back a positive number where
+                         * the guest wrote a negative one.  Spyro's display
+                         * list opens with `cfc2 ZSF4` / `blez`, so it took
+                         * the wrong arm and emitted a different scene.
+                         * Extending here as well costs one `exts.w` and makes
+                         * the two conventions agree whichever side wrote. */
+                        p->sub = (uint8_t)(rs == 0x02
+                                        ? (cop2_is_half(rd, 1) ? CP2_SX
+                                                               : CP2_RAW)
+                                        : cop2_read_kind(rd));
                         return;
                 case 0x04:                              /* MTC2 rt,rd */
                 case 0x06:                              /* CTC2 rt,rd */

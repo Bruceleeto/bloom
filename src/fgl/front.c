@@ -560,7 +560,17 @@ static int lower_slot(ir_ctx *c, const struct opcode *op, uint32_t pc)
                 return 0;
 
         default:
+                /* AND AN OPCODE THE DECODER DOES NOT KNOW IS A REFUSAL, NOT A
+                 * NO-OP.  The main loop tests `c->unknown` after every decode
+                 * and exits the block to C; this second decode site did not,
+                 * so a `syscall` or `break` sitting in a delay slot was
+                 * dropped without a word. */
+                c->unknown = 0;
                 ir_decode_op(c, op->opcode, pc);
+                if (c->unknown) {
+                        c->unknown = 0;
+                        return 0;
+                }
                 return 1;
         }
 }
@@ -1022,7 +1032,37 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                         if (ir_decode_transfer(&c, word, branch_at)) {
                                 ir_shadow_fix(&c, pend, pend_insn, hword, mark);
                                 if (!op_flag_no_ds(op->flags) && i + 1 < nb) {
+                                        int dmark = c.n;
+
                                         if (!lower_slot(&c, &ops[i + 1], at + 4)) {
+                                                note_unsupported(info, &ops[i + 1],
+                                                                 at + 4);
+                                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                                info->ended_early = 1;
+                                                return c.n;
+                                        }
+                                        /* THE SLOT'S FLAGS MATTER HERE TOO.
+                                         *
+                                         * The general transfer path below
+                                         * applies them; this one did not, so
+                                         * an access in the delay slot of a
+                                         * LOCAL branch kept `io` at
+                                         * FGL_IO_UNKNOWN -- and the emitter
+                                         * reads that as "ordinary memory",
+                                         * which is the one thing ir.h
+                                         * promises it never has to.  A device
+                                         * or scratchpad access in that slot
+                                         * was then performed against the flat
+                                         * map: the store went nowhere and the
+                                         * load read a dead array.
+                                         *
+                                         * Before regions a local branch ended
+                                         * the block, so this path was rarely
+                                         * reached; regions send every local
+                                         * branch through it. */
+                                        if (!apply_flags(&c, dmark,
+                                                         ops[i + 1].flags,
+                                                         ops[i + 1].opcode)) {
                                                 note_unsupported(info, &ops[i + 1],
                                                                  at + 4);
                                                 info->stop_reason = FGL_STOP_UNSUPPORTED;

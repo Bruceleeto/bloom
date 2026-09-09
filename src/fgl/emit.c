@@ -429,7 +429,171 @@ plain:
 
 static int emit_jsr_slot(fgl_emitter *e, int rs)
 {
+	/* A crossing into C rebuilds r14 on return, so an interrupt raised
+	 * in there is a zero budget from here on.  A region edge after this
+	 * must test it. */
+	e->may_exit = 1;
 	return emit_delayed(e, SH4_N(0x400b, rs), 1u << rs);
+}
+
+/* ---------------------------------------------------------------- */
+/* Regions: local branches as host branches                          */
+/* ---------------------------------------------------------------- */
+
+void fgl_region_begin(fgl_emitter *e, const uint32_t *pcs, int n)
+{
+	int i;
+
+	e->region = 1;
+	e->n_lbl = n > FGL_MAX_LABELS ? FGL_MAX_LABELS : n;
+	for (i = 0; i < e->n_lbl; i++) {
+		e->lbl[i].pc = pcs[i];
+		e->lbl[i].at = -1;
+	}
+	e->n_lref = 0;
+}
+
+int fgl_region_end(const fgl_emitter *e)
+{
+	int i, left = 0;
+
+	for (i = 0; i < e->n_lref; i++)
+		left += e->lref[i].lbl >= 0;
+	return left;
+}
+
+int fgl_region_label_at(const fgl_emitter *e, int i)
+{
+	return (i >= 0 && i < e->n_lbl) ? e->lbl[i].at : -1;
+}
+
+static int region_find(const fgl_emitter *e, uint32_t pc)
+{
+	int i;
+
+	if (!e->region)
+		return -1;
+	for (i = 0; i < e->n_lbl; i++)
+		if (e->lbl[i].pc == pc)
+			return i;
+	return -1;
+}
+
+/* Patch one `bra` at `site` to land at word `at`.
+ *
+ * NO slot_barrier HERE, unlike patch_fwd8/patch_fwd12.  Those two patch a
+ * branch to land at `here`, which makes `here` a join and therefore a fence.
+ * This one patches a branch to land at `at`, somewhere else entirely, so
+ * `here` gains no arriving path from it.  The fences a region needs are set
+ * where the joins actually are: region_define at a label, and emit_delayed
+ * after it fills a slot. */
+static void patch_bra12(fgl_emitter *e, int site, int at)
+{
+	int disp = at - site - 2;
+
+	if (!sh4_disp12_fits(disp))
+		e->overflow = 5;
+	else
+		or_word_at(e, site, (uint16_t)(disp & 0xfff));
+}
+
+/* The basic block starting at `pc` begins HERE.  A label is a barrier for
+ * the slot filler: nothing may be lifted past a point another path can
+ * arrive at. */
+static void region_define(fgl_emitter *e, uint32_t pc)
+{
+	int l = region_find(e, pc), i;
+
+	if (l < 0)
+		return;
+	if (e->lbl[l].at >= 0) {
+		e->overflow = 7;                /* defined twice */
+		return;
+	}
+	e->lbl[l].at = here(e);
+	for (i = 0; i < e->n_lref; i++) {
+		if (e->lref[i].lbl != l)
+			continue;
+		patch_bra12(e, e->lref[i].site, e->lbl[l].at);
+		e->lref[i].lbl = -1;
+	}
+	slot_barrier(e);
+}
+
+/* AN EDGE TO A LABEL, in place of a link site.
+ *
+ * Backward (the label is behind us): this closes a loop, so it carries the
+ * budget test the link arms carry, and for the same reason -- nothing else
+ * between here and the loop's next trip round looks at the timeslice.  A
+ * budget miss leaves through the dispatcher with the target in r2.
+ *
+ * Forward: a plain `bra`, patched when the label is reached.  No test,
+ * unless this basic block crossed into C (`may_exit`): a collection
+ * requested in there has to be honoured at the next boundary, which is
+ * this one.
+ *
+ * NOTHING LOADS r2 HERE, unlike the Linux emitter: bloom's IR_COND
+ * materialises the exit pc into r2 on each arm at the node, and IR_JUMP
+ * does it at the node too, so the miss path already carries it.
+ *
+ * Returns the budget test's `bf` site for the CALLER to patch at the
+ * dispatcher exit, or -1 when there was no test.  Patching it here would
+ * land a taken arm's budget miss on the fallthrough arm's code. */
+/* THE TRANSFER THE EPILOGUE WILL LINK, found the same way in both places.
+ *
+ * The decoder puts a transfer AHEAD of its delay slot, so the last node is
+ * usually the slot and not the branch.  The epilogue's own scan is the
+ * original; this exists because the node loop has to reach the same answer
+ * BEFORE the epilogue runs, to know whether an arm's exit-register constant
+ * is dead.  Two copies of the walk would be two chances to disagree. */
+static const ir_node *term_node(const ir_node *ir, int n)
+{
+	const ir_node *t = (n > 0) ? &ir[n - 1] : NULL;
+	int k;
+
+	if (!t || t->op == IR_JUMP || t->op == IR_COND || t->op == IR_CAPTURE)
+		return t;
+
+	for (k = n - 2; k >= 0; k--) {
+		if (ir[k].op == IR_JUMP || ir[k].op == IR_COND)
+			return &ir[k];
+		if (ir[k].op == IR_CAPTURE)
+			break;
+	}
+	return t;
+}
+
+static void emit_const(fgl_emitter *e, uint32_t v, int rn);
+
+static int emit_local_edge(fgl_emitter *e, uint32_t pc)
+{
+	int l = region_find(e, pc);
+	int backward = e->lbl[l].at >= 0;
+	int out = -1, site;
+
+	if (backward || e->may_exit) {
+		/* r2 = the target, FOR THE MISS ONLY.  A local edge is a
+		 * `bra` and reads nothing, but the budget miss below falls
+		 * out to the dispatcher, which takes the guest pc in r2.  So
+		 * the node no longer materialises it for a local arm and this
+		 * does, on the one path that reads it.  A forward edge with
+		 * no budget test pays nothing at all. */
+		emit_const(e, pc, FGL_R_EXIT);
+		sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
+		out = bf_fwd(e);
+	}
+
+	site = bra_fwd(e);
+	if (backward) {
+		patch_bra12(e, site, e->lbl[l].at);
+	} else if (e->n_lref < FGL_MAX_LREFS) {
+		e->lref[e->n_lref].site = site;
+		e->lref[e->n_lref].lbl = l;
+		e->n_lref++;
+	} else {
+		e->overflow = 6;
+	}
+	return out;
 }
 
 
@@ -2330,6 +2494,11 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		break;
 
 	case IR_JUMP:
+		/* A LOCAL EDGE LOADS r2 ITSELF, AND ONLY WHEN IT MISSES.
+		 * See emit_local_edge; `local_last` says the epilogue will
+		 * take that path for this transfer. */
+		if (p == e->term && e->local_last)
+			break;
 		emit_const(e, p->imm, FGL_R_EXIT);
 		break;
 
@@ -2394,18 +2563,45 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		default:     e->unsupported = 1; e->unsupported_op = p->op; return;
 		}
 
-		/* T now says "the easy sense"; whether that is taken or not
-		 * depends on the condition, so the branch is chosen rather
-		 * than the comparison inverted. */
-		taken = (p->sub == CC_EQ || p->sub == CC_GTZ || p->sub == CC_GEZ)
-			      ? bf_fwd(e)       /* T set = taken: skip on clear */
-			      : bt_fwd(e);      /* T set = not taken */
-
-		emit_const(e, p->imm, FGL_R_EXIT);              /* taken */
+		/* WHICH ARMS STILL NEED r2, AND THE SELECT THAT PICKS ONE.
+		 *
+		 * An arm that leaves through a local `bra` reads no exit
+		 * register -- emit_local_edge loads it on the miss path -- so
+		 * its constant is dead.  With one arm local the other's value
+		 * can be stored unconditionally: the local arm does not care
+		 * what r2 holds, so the branch and the join that used to
+		 * select between them go too.  With both local nothing is
+		 * emitted here at all and the compare above stands alone. */
 		{
-			int over = bra_fwd(e);
+			int lt = (p == e->term) && e->local_last;
+			int lf = (p == e->term) && e->local_fall;
+
+			int over;
+
+			if (lt && lf)
+				break;          /* the compare stands alone */
+			if (lt) {
+				emit_const(e, p->imm2, FGL_R_EXIT);
+				break;
+			}
+			if (lf) {
+				emit_const(e, p->imm, FGL_R_EXIT);
+				break;
+			}
+
+			/* Neither arm is local: select, as before.  T says
+			 * "the easy sense"; whether that is taken depends on
+			 * the condition, so the branch is chosen rather than
+			 * the comparison inverted. */
+			taken = (p->sub == CC_EQ || p->sub == CC_GTZ ||
+				 p->sub == CC_GEZ)
+				      ? bf_fwd(e)   /* T set = taken */
+				      : bt_fwd(e);  /* T set = not taken */
+
+			emit_const(e, p->imm, FGL_R_EXIT);
+			over = bra_fwd(e);
 			patch_fwd8(e, taken);
-			emit_const(e, p->imm2, FGL_R_EXIT);     /* fallthrough */
+			emit_const(e, p->imm2, FGL_R_EXIT);
 			patch_fwd12(e, over);
 		}
 		break;
@@ -2422,9 +2618,41 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 		  unsigned n_ops)
 {
 	uint32_t entry;
-	int i, f = 0;
+	int i, f = 0, need_exit = 1;
 
 	entry = e->base + fgl_size(e);
+	slot_barrier(e);
+	/* EVERY PER-BLOCK FIELD RESETS HERE, NOT IN fgl_init.  A region calls
+	 * fgl_emit once per range on the same emitter, so a flag left set by
+	 * one range is read by the next.  cond_saved is the one that bit:
+	 * a range that parked T left it set, every later range unparked a
+	 * stale FGL_AT_TSAVE, and the loop at 8004b8cc never saw its
+	 * `bne a1,a0` fail -- a3 walked off the scratchpad and faulted at
+	 * 1f800400. */
+	e->cond_saved = 0;
+	e->may_exit = 0;
+	e->local_last = 0;
+	e->local_fall = 0;
+	e->term = NULL;
+	region_define(e, e->charge_pc ? e->charge_pc : (n > 0 ? ir[0].pc : 0));
+
+	/* WHICH OF THE TERMINATOR'S ARMS LEAVE WITHOUT READING r2.
+	 *
+	 * Decided here because the node that would materialise the constant
+	 * is emitted long before the epilogue that chooses the edge.  Every
+	 * label's pc is registered by fgl_region_begin before the first
+	 * range, so a forward label answers as readily as a backward one. */
+	{
+		const ir_node *t = term_node(ir, n);
+
+		e->term = t;
+		if (t && t->op == IR_JUMP) {
+			e->local_last = region_find(e, t->imm) >= 0;
+		} else if (t && t->op == IR_COND && FGL_LINK_COND) {
+			e->local_last = region_find(e, t->imm) >= 0;
+			e->local_fall = region_find(e, t->imm2) >= 0;
+		}
+	}
 
 	for (i = 0; i < a->n_preload; i++)
 		emit_fixup(e, &a->preload[i]);
@@ -2556,9 +2784,11 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	 * back, and they are paid only by blocks that can actually link.  One
 	 * test covers both arms of a conditional. */
 	{
-		const ir_node *t = (n > 0) ? &ir[n - 1] : NULL;
+		const ir_node *t = term_node(ir, n);
 
-		/* THE BACKWARD SCAN.
+		/* THE BACKWARD SCAN, now in term_node() above -- the node loop
+		 * needs the same answer before the epilogue runs, and one copy
+		 * cannot disagree with itself.
 		 *
 		 * The decoder puts a transfer AHEAD of its delay slot, so in
 		 * `j target; addiu $a0,$a0,1` the IR_JUMP is at n-2 and the
@@ -2578,26 +2808,15 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 		 * A conditional found back here is linkable too, now that T is
 		 * parked across the delay slot above.  A capture is not: its
 		 * target is a register and there is nothing to patch to, so
-		 * stop rather than walk past the transfer. */
-		if (t && t->op != IR_JUMP && t->op != IR_COND &&
-		    t->op != IR_CAPTURE) {
-			int k;
-
-			for (k = n - 2; k >= 0; k--) {
-				if (ir[k].op == IR_JUMP || ir[k].op == IR_COND) {
-					t = &ir[k];
-					break;
-				}
-				if (ir[k].op == IR_CAPTURE)
-					break;
-			}
-		}
+		 * term_node stops rather than walking past the transfer. */
 
 		/* `t` is the transfer the scan above found, which is the last
 		 * node only when the delay slot decoded to nothing. */
 		if (t && (t->op == IR_JUMP ||
 			  (FGL_LINK_COND && t->op == IR_COND))) {
-			int fall = -1, out1, out2 = -1;
+			int fall = -1, out1 = -1, out2 = -1;
+
+			need_exit = 0;
 
 			/* THE ARM IS CHOSEN BY THE T BIT, NOT BY RE-ASKING.
 			 *
@@ -2661,6 +2880,15 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 			 * own copy: `cmp/pl` writes T, so one test shared
 			 * ahead of the arm branch would destroy the very bit
 			 * the arm branch reads. */
+			/* THE ARM IS A HOST BRANCH WHEN ITS TARGET IS IN THE
+			 * REGION (fgl.h, "REGION").  bleem's shape for a
+			 * block-internal branch, and lightning's: no site, no
+			 * stub, no dispatcher. */
+			if (region_find(e, t->imm) >= 0) {
+				out1 = emit_local_edge(e, t->imm);
+				goto taken_done;
+			}
+
 			sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
 			out1 = bf_fwd(e);
 
@@ -2696,28 +2924,48 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 			 * the whole site. */
 			e->linked = 1;
 			emit_link_site(e);             /* taken, or the only one */
+taken_done:
 
 			if (fall >= 0 && FGL_LINK_COND == 2) {
 				patch_fwd8(e, fall);
+				if (region_find(e, t->imm2) >= 0) {
+					out2 = emit_local_edge(e, t->imm2);
+					goto fall_done;
+				}
 				sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
 				out2 = bf_fwd(e);
+				e->linked = 1;
 				emit_link_site(e);     /* the fallthrough */
+fall_done:
+				;
 			}
 
-			patch_fwd8(e, out1);
-			if (out2 >= 0)
+			if (out1 >= 0) {
+				patch_fwd8(e, out1);
+				need_exit = 1;
+			}
+			if (out2 >= 0) {
 				patch_fwd8(e, out2);
+				need_exit = 1;
+			}
 
 			/* Mode 1: the fallthrough arm was never given a site,
 			 * so its branch lands here, at the dispatcher, exactly
 			 * as it did before linking existed. */
-			if (fall >= 0 && FGL_LINK_COND != 2)
+			if (fall >= 0 && FGL_LINK_COND != 2) {
 				patch_fwd8(e, fall);
+				need_exit = 1;
+			}
 		}
 	}
 
-	sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
-	emit_delayed(e, SH4_N(0x402b, FGL_R_XFER), 1u << FGL_R_XFER);
+	/* THE DISPATCHER EXIT, when any path still reaches it.  A basic block
+	 * whose every edge is a forward `bra` into its own region has none;
+	 * the words would be dead. */
+	if (need_exit) {
+		sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
+		emit_delayed(e, SH4_N(0x402b, FGL_R_XFER), 1u << FGL_R_XFER);
+	}
 
 	emit_pool(e);
 

@@ -81,6 +81,8 @@
 #define FGL_R_CYCLE 14
 
 #define FGL_MAX_LITERALS 64
+#define FGL_MAX_LABELS 32
+#define FGL_MAX_LREFS  64
 
 /* WHERE THE SERVICES ARE, AND WHY THE EMITTER IS TOLD RATHER THAN LINKED.
  *
@@ -223,7 +225,46 @@ typedef struct {
 	 * some other path can arrive at.  `slots_filled` is the census. */
 	int      slot_floor;
 	uint32_t slots_filled;
+
+	/* --- REGION: SEVERAL BASIC BLOCKS IN ONE CODE BLOCK ---
+	 *
+	 * lightrec's block is a whole loop body; fgl used to compile only its
+	 * first basic block and let every internal branch leave through the
+	 * dispatcher (or a link site) to a block of its own.  A region is the
+	 * lightrec block compiled as ONE code block: every basic block in it
+	 * is a label, and a transfer whose target is a label becomes a host
+	 * `bra` to it instead of an exit.  See fgl_compile_block.
+	 *
+	 * `lbl[]` is set before emission (`fgl_region_begin`); each `at` is
+	 * filled when `fgl_emit` reaches that basic block.  A forward edge is
+	 * a `bra` recorded in `lref[]` and patched when its label is defined;
+	 * a backward edge is patched on the spot and carries the budget test,
+	 * because it closes a loop.  `may_exit` says the current basic block
+	 * crossed into C, after which r14 may have been zeroed to request a
+	 * collection -- a forward edge then tests the budget too. */
+	/* The guest pc this basic block is ENTERED at -- set by the caller
+	 * per range, and what region_define matches a label against.  Not
+	 * ir[0].pc: a constant fold can eat the leading nodes. */
+	uint32_t charge_pc;
+
+	int region;
+	struct { uint32_t pc; int at; } lbl[FGL_MAX_LABELS];
+	int n_lbl;
+	struct { int site; int lbl; } lref[FGL_MAX_LREFS];
+	int n_lref;
+	int local_last;         /* the terminator's taken arm is a label    */
+	int local_fall;         /* ...and its fallthrough arm is one too    */
+	const void *term;       /* the transfer node the epilogue will use  */
+	int may_exit;
 } fgl_emitter;
+
+/* Declare the labels a region will define, in emission order.  Call after
+ * fgl_init on every pass.  Then one fgl_emit per basic block; then
+ * fgl_region_end returns the number of edges left unresolved (0 = good). */
+void fgl_region_begin(fgl_emitter *e, const uint32_t *pcs, int n);
+int  fgl_region_end(const fgl_emitter *e);
+/* The word offset of label `i` after emission, for the profiler's ops map. */
+int  fgl_region_label_at(const fgl_emitter *e, int i);
 
 void     fgl_init(fgl_emitter *e, void *buf, uint32_t size, uint32_t base);
 

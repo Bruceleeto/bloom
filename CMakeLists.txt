@@ -105,6 +105,15 @@ if (WITH_EMITMISS)
 	add_compile_definitions(BLOOM_EMITMISS=1 FGL_BLOCK_COUNT=1)
 endif (WITH_EMITMISS)
 
+# THE HEAD-TO-HEAD AGAINST GNU LIGHTNING (src/perfcmp.c).  The same five
+# SH7750 events the lightning tree rotates through, one per one-second window,
+# printed in the same units so the two logs line up.  Both trees load the same
+# savestate.  See build/docs/issue_not_cache.md.
+option(WITH_PERFCMP "Five-event counter rotation, comparable with the lightning tree" OFF)
+if (WITH_PERFCMP)
+	add_compile_definitions(BLOOM_PERFCMP=1)
+endif (WITH_PERFCMP)
+
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
 
 set(CODE_BUFFER_SIZE_MB 3 CACHE STRING "Code buffer size in MiB")
@@ -282,6 +291,7 @@ add_executable(bloom
 	src/mmap.c
 	src/platform.c
 	src/emitmiss.c
+	src/perfcmp.c
 	src/plugins.c
 )
 if (WITH_FPS_OVERLAY)

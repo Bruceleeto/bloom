@@ -25,6 +25,7 @@
 #include "overlay.h"
 #include "perf.h"
 #include "emitmiss.h"
+#include "perfcmp.h"
 #include "pvr.h"
 
 #define MAX_LAG_FRAMES 3
@@ -526,6 +527,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	}
 
 	if (new_timer > (timer_ms + 1000)) {
+		perfcmp_report(frames);
 		bloom_perf_report(new_timer - timer_ms, frames);
 		pvr_get_stats(&pvr_stats);
 
@@ -539,6 +541,13 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   (float)frames, screen_w, screen_h, screen_bpp,
 			   (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
+
+		if (BLOOM_PERFCMP)
+			printf("BENCH fps %5.1f frame %6.2f ms pvr %5.2f%% sh4 %5.2f%%\n",
+			       (float)frames * 1000.0f / (float)(new_timer - timer_ms),
+			       (float)(new_timer - timer_ms) / (float)frames,
+			       (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
+			       100.0f - 100.0f * idle_diff / cpu_diff);
 
 		overlay_set("%.1f fps  %.2f ms",
 			    (float)frames * 1000.0f / (float)(new_timer - timer_ms),

@@ -226,6 +226,7 @@ struct lightrec_state {
 	u32 opt_flags;
 	_Bool with_32bit_lut;
 	_Bool mirrors_mapped;
+	void *alloc_base;
 	void *code_lut[];
 };
 

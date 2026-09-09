@@ -622,10 +622,23 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         scratch(&s, p, 1);
                         break;
 
-                case IR_MTC_C:
-                case IR_MFC2_C:
-                case IR_RFE:
                 case IR_RW:
+                case IR_MFC2_C:
+                        /* C WRITES THE DESTINATION, AND THE HOIST RULE HAS
+                         * TO KNOW.  The node claims no operands, so nothing
+                         * below marks `defined` for the register the load
+                         * lands in -- and a later read of it then looks like
+                         * the first touch in the block, which `take` hoists
+                         * to block entry: a load of the value from BEFORE
+                         * the call.  Spyro 0x80052318: `lb a3,5(t8)` through
+                         * C, `bne a2,a3` compared the a3 the block started
+                         * with.  Same hole the comment in `take` describes,
+                         * one node type further along. `imm` is the guest
+                         * word; its rt is what C writes. */
+                        s.defined[(p->imm >> 16) & 31] = 1;
+                        /* fallthrough */
+                case IR_MTC_C:
+                case IR_RFE:
                         /* C performs the whole access against the state
                          * block, so every guest register the allocator is
                          * holding has to be there before the call -- and

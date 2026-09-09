@@ -131,70 +131,9 @@ static void __segfault_cb(struct lightrec_state *state, u32 addr,
 	lightrec_set_exit_flags(state, LIGHTREC_EXIT_SEGFAULT);
 	pr_err("Segmentation fault in recompiled code: invalid "
 	       "load/store at address "PC_FMT"\n", addr);
-	{	/* DEBUG: the ordering table the walk was following, and the
-		 * scratchpad word that heads it. */
-		extern void fgl_dump_mem_pub(u32 addr, unsigned words);
-		fgl_dump_mem_pub(0x8004bec4u, 24);
-	}
 	if (block)
-		pr_err("Was executing block "PC_FMT"\n", block->pc);
-	{	/* DEBUG: everything needed to read this without a second run --
-		 * the blocks that led here, the register file, and the list
-		 * fgl was actually given for the offending block. */
-		int i;
-
-		fgl_dump_ring();
-
-		for (i = 0; i < 32; i += 8)
-			fprintf(stderr, "SEG $%-2u %08x %08x %08x %08x "
-				"%08x %08x %08x %08x\n", i,
-				state->regs.gpr[i + 0], state->regs.gpr[i + 1],
-				state->regs.gpr[i + 2], state->regs.gpr[i + 3],
-				state->regs.gpr[i + 4], state->regs.gpr[i + 5],
-				state->regs.gpr[i + 6], state->regs.gpr[i + 7]);
-
-		/* The offending block, and the four before it: a wild base
-		 * register was written somewhere upstream, not here. */
-		for (i = 5; i >= 1; i--) {
-			unsigned idx = fgl_pc_ring[0] & 63u;
-			unsigned e = (idx + 1u - i) & 63u;
-			u32 bpc = fgl_pc_ring[1 + 4 * e];
-			struct block *b;
-			u16 k;
-
-			if (!bpc)
-				continue;
-			b = lightrec_find_block(state->block_cache, bpc);
-			fprintf(stderr, "SEG --- block %08x, %u ops\n", bpc,
-				b ? b->nb_ops : 0);
-
-			if (b && !block_has_flag(b, BLOCK_NO_OPCODE_LIST) &&
-			    b->opcode_list) {
-				for (k = 0; k < b->nb_ops && k < 32; k++)
-					fprintf(stderr, "SEG op %2u  %08x "
-						"flags=%08x\n", k,
-						b->opcode_list[k].c.opcode,
-						b->opcode_list[k].flags);
-				continue;
-			}
-
-			/* The optimised list is gone once the block is
-			 * compiled; guest RAM still has the instructions. */
-			{
-				const struct lightrec_mem_map *ram =
-					&state->maps[PSX_MAP_KERNEL_USER_RAM];
-				u32 off = kunseg(bpc) - ram->pc;
-				const u32 *w;
-
-				if (off >= ram->length)
-					continue;
-				w = (const u32 *)((u8 *)ram->address + off);
-				for (k = 0; k < (b ? b->nb_ops : 24) && k < 24; k++)
-					fprintf(stderr, "SEG raw %08x  %08x\n",
-						bpc + 4u * k, w[k]);
-			}
-		}
-	}
+		pr_err("Was executing block "PC_FMT", %u ops, curr_pc "PC_FMT
+		       "\n", block->pc, block->nb_ops, state->curr_pc);
 }
 
 static void lightrec_swl(struct lightrec_state *state,
@@ -1383,6 +1322,16 @@ int lightrec_compile_block(struct lightrec_cstate *cstate,
 	if (ENABLE_THREADED_COMPILER)
 		lightrec_reaper_pause(state->reaper);
 
+	/* BLOCK CENSUS.  One line per compiled block, identical in both trees,
+	 * so a run of the same savestate on fgl and on GNU lightning can be
+	 * joined by guest pc:  BLK <pc> <guest ops> <host bytes>.  Set to 0
+	 * when the census is not being taken. */
+#define BLK_CENSUS 0
+#if BLK_CENSUS
+	printf("BLK %08x %u %u\n", (unsigned)block->pc,
+	       (unsigned)block->nb_ops, (unsigned)block->code_size);
+#endif
+
 	block->function = new_fn;
 	block_clear_flags(block, BLOCK_SHOULD_RECOMPILE);
 
@@ -2087,9 +2036,35 @@ struct lightrec_state * lightrec_init(char *argv0,
 	else
 		lut_size = CODE_LUT_SIZE * sizeof(void *);
 
-	state = calloc(1, sizeof(*state) + lut_size);
-	if (!state)
-		goto err_free_tlsf;
+	/* THE STATE BLOCK IS PLACED, NOT LEFT WHERE MALLOC DROPS IT.
+	 *
+	 * The SH-4 operand cache is 16 KiB, 512 lines, direct-mapped on bits
+	 * 5..13 of the address, so only `addr & 0x3fff` decides which line a
+	 * datum owns.  Bloom maps the guest 1:1, which puts the PSX scratchpad
+	 * at 0x1f800000 -- index 0 -- and it is 1 KiB, so it owns lines 0..31
+	 * outright.  A malloc-aligned state block starts at index 0x3f90 and
+	 * its 520-byte register file wraps straight into those same lines:
+	 * every flush and preload around a C crossing evicts scratchpad that
+	 * the guest is about to read back, and the other way round.
+	 *
+	 * So over-allocate a cache's worth and slide the base until the
+	 * register file sits at index 0x470 -- immediately past the
+	 * scratchpad's 32 lines.  The LUT is the flexible member at the end
+	 * of the struct and moves with it.  Costs 16 KiB of address space,
+	 * one add at init, and nothing at run time. */
+	{
+		char *raw = calloc(1, sizeof(*state) + lut_size + 0x4000u);
+		uintptr_t want, adj;
+
+		if (!raw)
+			goto err_free_tlsf;
+
+		want = (uintptr_t) raw + lightrec_offset(regs.gpr);
+		adj = (0x470u - (want & 0x3fffu)) & 0x3fffu;
+
+		state = (struct lightrec_state *) (raw + adj);
+		state->alloc_base = raw;
+	}
 
 	lightrec_register(MEM_FOR_LIGHTREC, sizeof(*state) + lut_size);
 
@@ -2142,6 +2117,7 @@ struct lightrec_state * lightrec_init(char *argv0,
 	 * inside GBR's 1020-byte reach; fgl_lightrec.c asserts it. */
 	state->dispatch  = (u32)(uintptr_t)fgl_dispatch_loop;
 	state->lut_base  = (u32)(uintptr_t)state->code_lut;
+
 	state->addr_mask = 0x1fffffff;
 	state->link      = (u32)(uintptr_t)fgl_link_stub;
 
@@ -2190,7 +2166,7 @@ err_free_block_cache:
 err_free_state:
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
 			    lut_elm_size(state) * CODE_LUT_SIZE);
-	free(state);
+	free(state->alloc_base);
 err_free_tlsf:
 	if (ENABLE_CODE_BUFFER && tlsf)
 		tlsf_destroy(tlsf);
@@ -2217,7 +2193,7 @@ void lightrec_destroy(struct lightrec_state *state)
 
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
 			    lut_elm_size(state) * CODE_LUT_SIZE);
-	free(state);
+	free(state->alloc_base);
 }
 
 /* An IO_HW tag records where the op's FIRST access landed (or that its

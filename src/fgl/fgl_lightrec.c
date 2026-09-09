@@ -188,14 +188,67 @@ static u32 fgl_gte_body(void *user, u32 op)
  * delay slot; fgl declines that case in `front.c` rather than lowering it, so
  * reaching here with one would mean the front end let something through.
  * Implementing it here as well would be a second mechanism for one thing. */
+/* THE BLOCK AND OP INDEX OF A GENERIC ACCESS, from the pc the node published
+ * (`emit_publish_pc`, FGL_AT_CURR_PC).  lightrec's own generic wrapper gets
+ * both handed to it at compile time; here the pc is any address inside the
+ * block, so the block is found by walking back from it.  The index is the
+ * list slot at that address, checked against the word: a swapped delay-slot
+ * pair puts the branch and its slot in each other's slots, so the
+ * neighbours are tried. */
+static struct opcode *fgl_rw_op(struct lightrec_state *state, u32 opcode,
+				struct block **out, u16 *offset)
+{
+	u32 pc = state->curr_pc, k;
+
+	/* A lightrec block can be far longer than what fgl lowers of it:
+	 * `nb_ops` runs to the first unconditional transfer.  Blocks also
+	 * start at every address something once jumped to, so a block found
+	 * at a small distance may end before the access: keep walking. */
+	for (k = 0; k < 4096; k++) {
+		struct block *block =
+			lightrec_find_block(state->block_cache, pc - 4u * k);
+		int i, d[3] = { 0, 1, -1 };
+
+		if (!block || !block->opcode_list ||
+		    block_has_flag(block, BLOCK_NO_OPCODE_LIST) ||
+		    k >= block->nb_ops)
+			continue;
+		for (i = 0; i < 3; i++) {
+			int idx = (int)k + d[i];
+
+			if (idx < 0 || idx >= (int)block->nb_ops)
+				continue;
+			if (block->opcode_list[idx].c.opcode == opcode) {
+				*out = block;
+				*offset = (u16)idx;
+				return &block->opcode_list[idx];
+			}
+		}
+	}
+	return NULL;
+}
+
 void fgl_rw(u32 opcode, struct lightrec_state *state)
 {
 	PERF_BEGIN(PERF_RW); EMITMISS_OUT_BEGIN();
 	union code op = { .opcode = opcode };
+	struct block *block = NULL;
+	struct opcode *lop;
+	u16 offset = 0;
 	u32 ret;
 
+	/* TAG THE ACCESS, AS LIGHTREC'S GENERIC WRAPPER DOES.  An access the
+	 * optimiser could not place is performed by C once, `lightrec_rw`
+	 * records where it went in the op's flags and marks the block for
+	 * recompilation, and the recompiled block lowers it for real.  With
+	 * NULL flags none of that happened: every untagged access stayed on
+	 * this path for ever, and a region -- compiled from a list nothing has
+	 * run yet -- is made of untagged accesses.  Spyro's pad routine made
+	 * 68k generic calls per 40 vsyncs against 4.5k after the fix. */
+	lop = fgl_rw_op(state, opcode, &block, &offset);
 	ret = lightrec_rw(state, op, state->regs.gpr[op.i.rs],
-			  state->regs.gpr[op.i.rt], NULL, NULL, 0);
+			  state->regs.gpr[op.i.rt], lop ? &lop->flags : NULL,
+			  block, offset);
 
 	switch (op.i.op) {
 	case OP_LB:
@@ -628,63 +681,176 @@ static int dumb_is_load(uint32_t insn)
 }
 #endif
 
-/* Lower and emit every basic block of `block`'s opcode list, in order, into
- * one emitter -- so the emitted function covers the whole list, exactly as
- * lightrec's own compiler did and as lightrec's bookkeeping assumes.
+/* FGL_STATS: how blocks were cut. */
+unsigned long fgl_region_blocks, fgl_region_ranges, fgl_region_fallbacks;
+
+/* ONE lightrec BLOCK, AS SEVERAL BASIC BLOCKS IN ONE CODE BLOCK.
  *
- * `fgl_front` stops at the first control transfer and reports how far it got
- * in `info.n_ops`; this is the loop that calls it again from there, which is
- * what front.h has always asked its caller to do.  Each basic block is
- * allocated and emitted independently: nothing is pinned across one, so every
- * guest register is in the state block at each boundary and concatenation is
- * sound with no fixups between them.
+ * `fgl_front` lowers up to the first control transfer.  Called once, that
+ * compiled the first basic block of a lightrec block and left every internal
+ * branch to exit.  Measured against GNU lightning on the same savestate:
+ * 4135 fgl blocks against 1722, and the hot loop at 800269cc is one 780-byte
+ * lightning block against 22 fgl blocks of 2240 bytes, every branch target
+ * in the loop restarting a block with its own entry, publish, exit and pool.
  *
- * Returns 1 on success, 0 if a basic block could not be lowered -- and then
- * `*info` describes the one that failed, for the caller's diagnostic.  There
- * is no partial success: a function that stops halfway through the list is
- * the bug this exists to remove. */
-/* ONE BASIC BLOCK, WHICH IS ALL LIGHTREC CAN REACH.
+ * So the whole opcode list is lowered here, one `fgl_front` per basic block,
+ * and emitted into one code block as a REGION (fgl.h): every basic block
+ * start is a label, and a branch to a label is a host `bra`.  The cuts are
+ * (a) the target of every LIGHTREC_LOCAL_BRANCH, so each is a label, and (b)
+ * wherever `fgl_front` stops on its own -- a transfer, a full IR array, an
+ * opcode it hands to C.  A range that fails to lower ends the region there;
+ * branches to anything past it are ordinary link sites, and the tail is
+ * compiled as its own block when it is reached, as before.
  *
- * `fgl_front` stops at the first control transfer, so a lightrec block holding
- * several basic blocks needs several calls to cover it.  This used to make
- * them all, concatenating the code into one function -- and it was wasted
- * work: lightrec publishes ONE entry per block (`lut_write(lut_offset(
- * block->pc), block->function)`), so basic blocks 2..N were unreachable.  On
- * Spyro's block at 0x34e0 that was 664 bytes emitted against 40 reachable,
- * and on the 200-op blocks in level load it overran `FGL_MAX_ENTRIES` and
- * refused the block outright rather than compiling its first block.
+ * Registers: each basic block preloads and flushes on its own, exactly as
+ * separate blocks did, so a label sees the same machine a block entry does
+ * -- pins in their registers, the pool written back.  Cycles: each basic
+ * block charges its own guest instructions.  Budget: backward edges test
+ * r14 (a loop), forward edges only after a crossing into C; see
+ * emit_local_edge. */
+#define FGL_MAX_RANGES 24
+
+/* THE BISECTION SWITCH.  0 is the pre-region shape: one basic block per
+ * compiled block, every internal branch leaving through the dispatcher.
+ * The other three changes of this port (the alloc.c hoist fix, fgl_rw
+ * tagging, the delay-slot filler) are unaffected by it, so flipping this
+ * says which half a fault belongs to.
  *
- * The entry array stays because publishing the rest is the real answer, and
- * the type is the contract for it -- but the loop does not come back until
- * `lightrec.c` can write those entries into the LUT without the BIOS boot
- * faulting.  A partially reachable function is worse than a short one. */
-static int fgl_emit_all(fgl_emitter *e, struct block *block, unsigned nb,
-			ir_node *ir, ir_alloc *alloc, fgl_front_info *info,
-			struct fgl_entry *ent, unsigned int *n_ent, int *n_out)
+ * 1 IS THE WHOLE BLOCK, AND IT COMPILES CODE THAT NEVER RUNS.  A range that
+ * ends on an unconditional transfer is followed by whatever the opcode list
+ * holds next, reachable or not, and the region keeps going to the end of the
+ * block.  Measured against no regions on the same savestate: twice the guest
+ * instructions compiled, 751 KiB of host code against 470, and the DC pays
+ * the difference in data stalls -- 73.4 ms a frame against 66.6.
+ *
+ * 3 IS LEADERS ONLY: the same region, stopped at the first transfer whose
+ * fall-through is not a branch target of this block.  Loops stay inside the
+ * region, which is the whole point of regions, and the cold tail is left to
+ * the dispatcher to compile if it is ever reached. */
+#ifndef FGL_REGIONS
+#define FGL_REGIONS 3
+#endif
+
+/* The per-512-block progress line.  Off by default; it is the only way
+ * to see the fallback rate, which must stay 0. */
+#ifndef FGL_REGION_STATS
+#define FGL_REGION_STATS 0
+#endif
+
+struct fgl_range {
+	ir_node   ir[IR_MAX_NODES];
+	ir_alloc  alloc;
+	int       n;
+	unsigned  n_ops;
+	uint32_t  pc;
+	unsigned  stop;
+};
+
+/* Cut the opcode list into ranges.  Returns the count, or 0 with `info`
+ * describing the first range's refusal.  `whole` 0 is the pre-region shape:
+ * the first basic block only. */
+static int fgl_cut_ranges(const struct block *block, struct fgl_range *r,
+			  int max, int whole, unsigned nb,
+			  fgl_front_info *info)
 {
-	uint32_t entry;
-	int n;
+	static uint8_t lead[4096];
+	const struct opcode *ops = block->opcode_list;
+	unsigned i, k;
+	int nr = 0;
 
-	memset(info, 0, sizeof *info);
-	n = fgl_front(block->opcode_list, nb, block->pc, ir, IR_MAX_NODES,
-		      info);
-	if (n <= 0 || info->unsupported) {
-		*n_out = n;
-		return 0;
+	if (nb > sizeof lead)
+		whole = 0;
+
+	if (whole) {
+		memset(lead, 0, nb);
+		for (i = 0; i < nb; i++) {
+			uint32_t at, tgt;
+
+			/* BIT(3) IS LOCAL_BRANCH ON A BRANCH ONLY; on a store
+			 * it is something else.  The same opcode test as
+			 * lightrec's `is_local_branch`. */
+			switch (ops[i].c.i.op) {
+			case OP_BEQ: case OP_BNE: case OP_BLEZ: case OP_BGTZ:
+			case OP_REGIMM:
+				break;
+			default:
+				continue;
+			}
+			if (!op_flag_local_branch(ops[i].flags))
+				continue;
+			/* A swapped delay-slot pair moves the branch's index,
+			 * not its address. */
+			at = block->pc + 4u * i -
+			     4u * (uint32_t)!!op_flag_no_ds(ops[i].flags);
+			tgt = at + 4u +
+			      ((uint32_t)(int32_t)(int16_t)ops[i].c.i.imm << 2);
+			if (tgt >= block->pc && (tgt - block->pc) / 4u < nb)
+				lead[(tgt - block->pc) / 4u] = 1;
+		}
 	}
 
-	ir_allocate(ir, n, alloc);
-	entry = fgl_emit(e, ir, n, alloc, info->n_ops);
-	if (!entry) {
-		*n_out = n;
-		return 0;
-	}
+	for (k = 0; k < nb && nr < max; nr++) {
+		unsigned lim = nb;
+		struct fgl_range *q = &r[nr];
 
-	ent[0].pc = block->pc;
-	ent[0].code = (void *)(uintptr_t)entry;
-	*n_ent = 1;
-	*n_out = 0;
-	return 1;
+		if (whole)
+			for (i = k + 1; i < nb; i++)
+				if (lead[i]) { lim = i; break; }
+
+		memset(info, 0, sizeof *info);
+		q->pc = (uint32_t)block->pc + 4u * k;
+		q->n = fgl_front(&ops[k], lim - k, q->pc, q->ir, IR_MAX_NODES,
+				 info);
+		if (q->n <= 0 || info->unsupported)
+			break;
+		q->n_ops = info->n_ops;
+		q->stop = info->stop_reason;
+		k += info->n_ops;
+
+		/* LEADERS ONLY: STOP WHERE THE FALL-THROUGH IS UNREACHABLE.
+		 *
+		 * A range that ended on an unconditional transfer hands off to
+		 * the next opcode in the list, and nothing branches there
+		 * unless it is one of this block's own branch targets.  Taking
+		 * it anyway is how the whole-block shape came to compile twice
+		 * the guest code that no regions does. */
+		if (whole == 3 && q->stop == FGL_STOP_TRANSFER &&
+		    !(k < nb && lead[k])) {
+			nr++;
+			break;
+		}
+
+		if (!whole || !info->n_ops) {   /* one block, or C resumes here */
+			nr++;
+			break;
+		}
+	}
+	return nr;
+}
+
+/* One emission pass of `nr` ranges at `buf`.  Returns the size, 0 on
+ * refusal. */
+static unsigned fgl_emit_ranges(fgl_emitter *e, void *buf, unsigned bufsize,
+				struct fgl_range *r, int nr,
+				const uint32_t *label_pcs, int region)
+{
+	int i;
+
+	fgl_init(e, buf, bufsize, (u32)(uintptr_t)buf);
+	fgl_set_targets(e, &fgl_dc_targets);
+	if (region)
+		fgl_region_begin(e, label_pcs, nr);
+	for (i = 0; i < nr; i++) {
+		/* Where the range's cycle charge is measured from: the guest
+		 * pc it is entered at, not the first node that survived
+		 * folding. */
+		e->charge_pc = r[i].pc;
+		if (!fgl_emit(e, r[i].ir, r[i].n, &r[i].alloc, r[i].n_ops))
+			return 0;
+	}
+	if (e->region && fgl_region_end(e))
+		return 0;
+	return fgl_size(e);
 }
 
 void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
@@ -710,12 +876,12 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	 * retry is an infinite loop. */
 	int dummy_why;
 	fgl_front_info info;
-	ir_node ir[IR_MAX_NODES];
-	ir_alloc alloc;
+	static struct fgl_range ranges[FGL_MAX_RANGES];
+	static uint32_t label_pcs[FGL_MAX_RANGES];
 	fgl_emitter e;
 	unsigned size;
 	void *code;
-	int n;
+	int nr, i, whole = FGL_REGIONS;
 	unsigned nb;
 
 	if (!why)
@@ -726,38 +892,16 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 	fgl_targets_once();
 	fgl_crash_handler_once(cstate->state);
 
-	memset(&info, 0, sizeof info);
 	nb = block->nb_ops;
 #if FGL_DUMB_BLOCKS
+	whole = 0;
 	if (nb > 1) {
-		/* ONE INSTRUCTION, OR TWO WHEN THE FIRST IS A TRANSFER.
-		 *
-		 * A branch and its delay slot are one unit of guest
-		 * behaviour, not two -- cutting between them would change
-		 * what the machine does rather than only how it is compiled,
-		 * and the point of dumb mode is to remove fgl's cleverness
-		 * without removing the guest's semantics.  Everything else
-		 * gets a block to itself. */
-		/* TWO, NOT ONE, AND THE REASON IS THE LOAD SHADOW.
-		 *
-		 * A MIPS load's result is not visible to the instruction
-		 * after it, and fgl tracks that shadow inside a block.  Ending
-		 * a block immediately after a load orphans it: the next block
-		 * has no idea a write is still owed, so the value lands one
-		 * instruction too early.  Measured -- one instruction per
-		 * block reported divergences in four BIOS loops that the
-		 * normal build gets right, every one of them a load followed
-		 * by its consumer.
-		 *
-		 * Two instructions is the smallest block that still holds a
-		 * load and the instruction standing in its shadow, and it
-		 * removes just as much of the block formation as one did.  A
-		 * transfer landing on the second slot takes a third, because
-		 * a branch without its delay slot is not the same program. */
+		/* ONE INSTRUCTION, OR TWO WHEN THE FIRST IS A TRANSFER.  A
+		 * branch and its delay slot are one unit of guest behaviour;
+		 * and never end on a load, because a MIPS load's write lands
+		 * one instruction late and fgl carries that shadow inside a
+		 * block. */
 		nb = 2u;
-		/* Never end on a load (the shadow), never end on a transfer
-		 * (the delay slot).  Either takes another instruction, and a
-		 * load in a delay slot wants both. */
 		while (nb < block->nb_ops &&
 		       (dumb_is_load(block->opcode_list[nb - 1u].opcode) ||
 			ir_is_transfer(block->opcode_list[nb - 1u].opcode)))
@@ -766,21 +910,9 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 			nb = block->nb_ops;
 	}
 #endif
-	/* First pass: into scratch, to measure.
-	 *
-	 * THE BASE MUST NOT BE ZERO, and it is not arbitrary that it is the
-	 * scratch buffer's own address. `fgl_emit` reports failure by returning
-	 * 0 and success by returning the block's ENTRY ADDRESS -- so a block
-	 * emitted at base 0 succeeds and says 0, which is indistinguishable
-	 * from having refused. Every block then looks unlowerable, with
-	 * `overflow` and `unsupported` both clear to prove nothing was actually
-	 * wrong. test_reloc had this same bug and was fixed for it; this is the
-	 * same mistake one layer down. */
-	fgl_init(&e, scratch, sizeof scratch, (u32)(uintptr_t)scratch);
-	fgl_set_targets(&e, &fgl_dc_targets);
 
-	if (!fgl_emit_all(&e, block, nb, ir, &alloc, &info,
-			  entries, nb_entries, &n)) {
+	nr = fgl_cut_ranges(block, ranges, FGL_MAX_RANGES, whole, nb, &info);
+	if (nr <= 0) {
 		static unsigned f, by_reason[8], by_op[64];
 		unsigned k;
 		f++;
@@ -789,9 +921,10 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 		if (f <= 10 || (f % 2000) == 0) {
 			fprintf(stderr, "fgl FAIL %u: pc=%08x nb_ops=%u n=%d unsup=%u "
 			       "reason=%u op=%08x at=%08x | reasons:",
-			       f, (unsigned)block->pc, block->nb_ops, n,
-			       info.unsupported, info.stop_reason,
-			       info.unsupported_op, info.unsupported_pc);
+			       f, (unsigned)block->pc, block->nb_ops, ranges[0].n,
+			       info.unsupported, (unsigned)info.stop_reason,
+			       (unsigned)info.unsupported_op,
+			       (unsigned)info.unsupported_pc);
 			for (k = 0; k < 8; k++) fprintf(stderr, " %u", by_reason[k]);
 			fprintf(stderr, " | top majors:");
 			for (k = 0; k < 64; k++)
@@ -801,7 +934,52 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 		return NULL;
 	}
 
-	size = fgl_size(&e);
+	for (i = 0; i < nr; i++) {
+		ir_allocate(ranges[i].ir, ranges[i].n, &ranges[i].alloc);
+		label_pcs[i] = ranges[i].pc;
+	}
+
+	/* First pass: into scratch, to measure.
+	 *
+	 * THE BASE MUST NOT BE ZERO, and it is not arbitrary that it is the
+	 * scratch buffer's own address. `fgl_emit` reports failure by
+	 * returning 0 and success by returning the block's ENTRY ADDRESS --
+	 * so a block emitted at base 0 succeeds and says 0, which is
+	 * indistinguishable from having refused. */
+	size = fgl_emit_ranges(&e, scratch, sizeof scratch, ranges, nr,
+			       label_pcs, whole);
+	if (!size && nr > 1) {
+		/* THE REGION DID NOT FIT -- a `bra` out of 12-bit reach, the
+		 * scratch buffer, a label never reached, overflow 5/6/7.  The
+		 * old shape still works: the first basic block alone, the
+		 * rest compiled as blocks when they are reached. */
+		fgl_region_fallbacks++;
+		nr = fgl_cut_ranges(block, ranges, 1, 0, nb, &info);
+		if (nr != 1)
+			return NULL;
+		ir_allocate(ranges[0].ir, ranges[0].n, &ranges[0].alloc);
+		label_pcs[0] = ranges[0].pc;
+		whole = 0;
+		size = fgl_emit_ranges(&e, scratch, sizeof scratch, ranges, 1,
+				       label_pcs, 0);
+	}
+	if (!size) {
+		fprintf(stderr, "fgl: FIRST PASS REFUSED pc=%08x ranges=%d "
+			"ovf=%d unsup=%d op=%u\n", (unsigned)block->pc, nr,
+			e.overflow, e.unsupported, e.unsupported_op);
+		return NULL;
+	}
+	fgl_region_blocks++;
+	fgl_region_ranges += nr;
+	/* HOW THE BLOCKS WERE CUT, and the one number worth watching: a
+	 * nonzero fallback rate on the DC means `bra` reach or the scratch
+	 * size differs from what the Linux tree measured (0 in 1889). */
+#if FGL_REGION_STATS
+	if ((fgl_region_blocks & 511u) == 0)
+		printf("fgl: regions %lu blocks / %lu basic blocks, "
+		       "%lu fallbacks\n", fgl_region_blocks,
+		       fgl_region_ranges, fgl_region_fallbacks);
+#endif
 
 	code = lightrec_alloc_code(state, size);
 	if (!code) {
@@ -809,24 +987,26 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 		return NULL;
 	}
 
-	/* Second pass, at the real address. The allocation pass is not run
+	/* Second pass, at the real address.  The allocation pass is not run
 	 * again: its result depends on the IR, not on where the code lands. */
-	fgl_init(&e, code, size, (u32)(uintptr_t)code);
-	fgl_set_targets(&e, &fgl_dc_targets);
-	if (!fgl_emit_all(&e, block, nb, ir, &alloc, &info,
-			  entries, nb_entries, &n) || fgl_size(&e) != size) {
+	if (fgl_emit_ranges(&e, code, size, ranges, nr, label_pcs, whole)
+	    != size) {
 		fprintf(stderr, "fgl: SECOND PASS DIFFERS pc=%08x %u vs %u "
 			"ovf=%d unsup=%d\n", (unsigned)block->pc,
-			fgl_size(&e), size, e.overflow, e.unsupported);
+			(unsigned)fgl_size(&e), size, e.overflow,
+			e.unsupported);
 		lightrec_free_code(state, code);
 		return NULL;
 	}
 
+	/* ONE ENTRY, AT THE BLOCK'S OWN PC.  The internal basic blocks are
+	 * reached by `bra` from inside the region now, not through the LUT. */
+	entries[0].pc = block->pc;
+	entries[0].code = code;
+	*nb_entries = 1;
+
 	if (state->ops.code_inv)
 		state->ops.code_inv(code, size);
-
-
-
 
 	*code_size = size;
 	return code;
@@ -943,6 +1123,35 @@ static uint32_t fgl_link_site[FGL_MAX_LINKS];
 static uint32_t fgl_link_slot[FGL_MAX_LINKS];
 static unsigned fgl_n_links;
 
+/* HOW MANY LINKS POINT INTO EACH PAGE OF THE TABLE.
+ *
+ * An invalidation clears two slots and then asked "is any of my 1400 links
+ * one of these two?" by walking all 1400.  Spyro does that 213 times a frame
+ * and the answer is no every single time: 358k entries visited a frame, 118 ms
+ * of it, which was the whole of the `rw` bucket and most of the frame.
+ *
+ * A count per 1024 slots turns the common answer into one load.  The walk is
+ * still there for when a page really does hold links -- this only skips the
+ * sweeps that were always going to find nothing.  Exact, not a filter: the
+ * count is incremented where a site enters the table and decremented where one
+ * leaves, so a zero means zero. */
+#define FGL_LINK_PAGE_SHIFT 10
+#define FGL_LINK_PAGES ((CODE_LUT_SIZE >> FGL_LINK_PAGE_SHIFT) + 1u)
+static uint16_t fgl_link_pgcnt[FGL_LINK_PAGES];
+
+static int fgl_links_in_range(u32 first, u32 last)
+{
+	u32 p = first >> FGL_LINK_PAGE_SHIFT;
+	u32 e = (last - 1u) >> FGL_LINK_PAGE_SHIFT;
+
+	if (e >= FGL_LINK_PAGES)
+		e = FGL_LINK_PAGES - 1u;
+	for (; p <= e; p++)
+		if (fgl_link_pgcnt[p])
+			return 1;
+	return 0;
+}
+
 /* Edges refused because the table was full.  Nonzero means FGL_MAX_LINKS is
  * too small and the emulator is on the cliff described above. */
 unsigned fgl_link_full;
@@ -986,6 +1195,7 @@ void fgl_unlink_all(struct lightrec_state *state, unsigned why)
 
 	fgl_link_undone += fgl_n_links;
 	fgl_n_links = 0;
+	memset(fgl_link_pgcnt, 0, sizeof fgl_link_pgcnt);
 }
 
 /* THE SAME, FOR ONE WINDOW OF THE TABLE -- WHICH IS ALMOST ALWAYS WHAT WAS
@@ -1014,9 +1224,14 @@ void fgl_unlink_range(struct lightrec_state *state, u32 first, u32 n,
 
 	fgl_unlink_calls[why]++;
 
+	if (!n || !fgl_links_in_range(first, last))
+		return;
+
 	for (i = 0; i < fgl_n_links; i++) {
 		if (fgl_link_slot[i] >= first && fgl_link_slot[i] < last) {
 			fgl_link_restore(state, fgl_link_site[i]);
+			fgl_link_pgcnt[fgl_link_slot[i]
+					>> FGL_LINK_PAGE_SHIFT]--;
 			hit++;
 			continue;
 		}
@@ -1066,6 +1281,8 @@ void fgl_unlink_block(struct lightrec_state *state, u32 first, u32 n,
 
 		/* Living in the dying code: drop it, do not write it. */
 		if (code_size && site >= code && site < code + code_size) {
+			fgl_link_pgcnt[fgl_link_slot[i]
+					>> FGL_LINK_PAGE_SHIFT]--;
 			hit++;
 			continue;
 		}
@@ -1073,6 +1290,8 @@ void fgl_unlink_block(struct lightrec_state *state, u32 first, u32 n,
 		/* Pointing at the dying code: put it back. */
 		if (fgl_link_slot[i] >= first && fgl_link_slot[i] < last) {
 			fgl_link_restore(state, fgl_link_site[i]);
+			fgl_link_pgcnt[fgl_link_slot[i]
+					>> FGL_LINK_PAGE_SHIFT]--;
 			hit++;
 			continue;
 		}
@@ -1227,6 +1446,7 @@ static u32 fgl_link_resolve_inner(struct lightrec_state *state, u32 target,
 
 	fgl_link_slot[fgl_n_links] = lut_offset(target);
 	fgl_link_site[fgl_n_links++] = site;
+	fgl_link_pgcnt[lut_offset(target) >> FGL_LINK_PAGE_SHIFT]++;
 
 	return (u32)(uintptr_t)slot;
 }
