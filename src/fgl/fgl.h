@@ -168,6 +168,11 @@ typedef struct {
 	 * amount of code is none.  `user` is passed back untouched so a host
 	 * test can hang its own table off it. */
 	uint32_t (*gte_body)(void *user, uint32_t op);
+	/* The LEAF for a command, or 0 for "through the shim" (gte_fpu.h,
+	 * GTE_LEAF_*).  Called directly: `mov.l lit,r0; jsr @r0`, bleem's
+	 * COP2 emitter.  Bit 0 set means the routine also wants the op word
+	 * in r1 (bleem's argument flag); NCLIP does not.  May be NULL. */
+	uint32_t (*gte_leaf)(void *user, uint32_t op);
 	void     *user;
 } fgl_targets;
 

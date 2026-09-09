@@ -152,7 +152,20 @@ FGL_ASSERT(!ENABLE_FIRST_PASS || OPT_HANDLE_LOAD_DELAYS, first_pass_load_delay);
  * check cannot see. lightrec's own emitter declared it the same way and for
  * the same reason. */
 extern void *gte_fpu_resolve(u32 op);
+extern int gte_fpu_leaf_cmd(u32 op);
 extern uint32_t psxCP2CtrlGen;
+
+/* The leaf routines themselves (src/gte_rtp.S).  Declared as data because
+ * nothing here calls them -- their addresses go into emitted code, and they
+ * are not C functions: they take the register file from GBR and keep every
+ * register but r0, r1, PR, MAC and T. */
+extern char gte_nclip_leaf[], gte_rtps_leaf[], gte_rtpt_leaf[],
+	    gte_mvmva_leaf[], gte_dpcs_leaf[], gte_intpl_leaf[],
+	    gte_sqr_leaf[], gte_op_leaf[], gte_gpf_leaf[], gte_gpl_leaf[],
+	    gte_dcpl_leaf[], gte_dpct_leaf[], gte_avsz3_leaf[],
+	    gte_avsz4_leaf[], gte_ncs_leaf[], gte_nct_leaf[],
+	    gte_nccs_leaf[], gte_ncct_leaf[], gte_ncds_leaf[],
+	    gte_ncdt_leaf[], gte_cc_leaf[], gte_cdp_leaf[];
 
 /* HOW BIG A BLOCK CAN GET BEFORE IT IS MEASURED.
  *
@@ -172,6 +185,36 @@ static u32 fgl_gte_body(void *user, u32 op)
 {
 	(void)user;
 	return (u32)(uintptr_t)gte_fpu_resolve(op);
+}
+
+/* THE LEAF FOR ONE COMMAND, AS AN ADDRESS.
+ *
+ * `gte_fpu_leaf_cmd` knows which commands have one and returns an index with
+ * the argument flag in bit 0; this turns the index into the routine's real
+ * address and puts the flag back, because on this side the emitter jumps to
+ * it directly rather than handing a token to an interpreter.  Indices are
+ * GTE_LEAF_* from gte_fpu.h and the table is in that order; 0 is "no leaf",
+ * which sends the command through the shim as before. */
+static u32 fgl_gte_leaf(void *user, u32 op)
+{
+	static char *const leaves[] = {
+		NULL,            gte_nclip_leaf,  gte_rtps_leaf,
+		gte_rtpt_leaf,   gte_mvmva_leaf,  gte_dpcs_leaf,
+		gte_intpl_leaf,  gte_sqr_leaf,    gte_op_leaf,
+		gte_gpf_leaf,    gte_gpl_leaf,    gte_dcpl_leaf,
+		gte_dpct_leaf,   gte_avsz3_leaf,  gte_avsz4_leaf,
+		gte_ncs_leaf,    gte_nct_leaf,    gte_nccs_leaf,
+		gte_ncct_leaf,   gte_ncds_leaf,   gte_ncdt_leaf,
+		gte_cc_leaf,     gte_cdp_leaf,
+	};
+	int cmd = gte_fpu_leaf_cmd(op);
+	unsigned idx = (unsigned)cmd >> 1;
+
+	(void)user;
+	if (!cmd || idx >= sizeof leaves / sizeof leaves[0] || !leaves[idx])
+		return 0;
+
+	return (u32)(uintptr_t)leaves[idx] | (u32)(cmd & 1);
 }
 
 /* An access whose region the optimiser could not prove.  C performs the whole
@@ -630,6 +673,7 @@ static void fgl_targets_once(void)
 	fgl_dc_targets.cp2_ctrl_gen = (u32)(uintptr_t)&psxCP2CtrlGen;
 	fgl_dc_targets.wild     = (u32)(uintptr_t)fgl_wild_store;
 	fgl_dc_targets.gte_body = fgl_gte_body;
+	fgl_dc_targets.gte_leaf = fgl_gte_leaf;
 
 	/* Last, and it is what the guard above tests: nothing may observe a
 	 * half-filled table. */

@@ -1271,3 +1271,1551 @@ _gte_mvmva_sf0_asm:
 	.long	0x20000000, 0x84000000, 0x80800000
 	.long	0x10000000, 0x82000000, 0x00400000
 	.size	_gte_mvmva_sf0_asm, . - _gte_mvmva_sf0_asm
+
+/*
+ * ----------------------------------------------------------------
+ * NCLIP AS A LEAF -- bleem's shape for a GTE command.
+ * ----------------------------------------------------------------
+ *
+ * Every other GTE command reaches its C or assembly through `_fgl_shim_gte`:
+ * seven registers pushed, seven popped, the cycle pair reconciled either
+ * side, then a C-ABI call.  Bleem does none of that.  Its emitter loads the
+ * routine into r0 and `jsr`s to it (recompiler_backend.md, "the COP2 command
+ * emitter"), and the routine finds the COP2 file at a fixed offset from GBR
+ * and saves only what it uses.  NCLIP is called half a million times per 300
+ * vsyncs in Spyro, second only to RTPS, and its body is six multiplies; the
+ * shim was most of its cost.
+ *
+ * THE LEAF CONTRACT (fgl.h, "a service may clobber r0 and r1 and nothing
+ * else"): entered by `jsr` from inside a block with GBR = the state block.
+ * May clobber r0, r1, PR, MACH, MACL and T.  Preserves r2-r15 and GBR.  The
+ * file is at GBR + FGL_AT_CP2D * 4 (fgl_state.h; 264, asserted in gte_sh4.c
+ * and fgl_lightrec.c).  Never calls C.
+ *
+ *   MAC0 = SX0*(SY1-SY2) + SX1*(SY2-SY0) + SX2*(SY0-SY1)
+ *        = (SX1-SX0)*(SY2-SY0) - (SX2-SX0)*(SY1-SY0)
+ *
+ * The second form is two 64-bit products and a subtract instead of six
+ * products and five adds.  FLAG is 0, or bit 31 with bit 16 (MAC0 > INT_MAX)
+ * or bit 15 (MAC0 < INT_MIN), as the reference's F().  The differences are
+ * 17-bit, the products 34-bit, so the sum needs the 64 bits `dmuls.l` gives.
+ */
+	.balign	4
+	.global	_gte_nclip_leaf
+	.type	_gte_nclip_leaf, @function
+_gte_nclip_leaf:
+	mov.l	r2, @-r15
+	mov.l	r3, @-r15
+	mov.l	r4, @-r15
+	mov.w	3f, r0			/* FGL_AT_CP2D * 4 */
+	mov.l	r5, @-r15
+	stc	gbr, r4
+	add	r0, r4			/* r4 = &cp2d */
+	mov.l	@(48, r4), r0		/* SXY0 */
+	mov.l	@(52, r4), r1		/* SXY1 */
+	mov.l	@(56, r4), r2		/* SXY2 */
+	mov	r0, r3
+	exts.w	r3, r3			/* SX0 */
+	shlr16	r0
+	exts.w	r0, r0			/* SY0 */
+	lds	r0, mach		/* parked: SY0 */
+	mov	r1, r0
+	exts.w	r0, r0
+	sub	r3, r0			/* a = SX1 - SX0 */
+	lds	r0, macl		/* parked: a */
+	shlr16	r1
+	exts.w	r1, r1			/* SY1 */
+	sts	mach, r5		/* SY0 */
+	sub	r5, r1			/* d = SY1 - SY0 */
+	mov	r2, r0
+	exts.w	r0, r0
+	sub	r3, r0			/* c = SX2 - SX0 */
+	shlr16	r2
+	exts.w	r2, r2
+	sub	r5, r2			/* b = SY2 - SY0 */
+	sts	macl, r3		/* a */
+	dmuls.l	r3, r2			/* a * b */
+	sts	macl, r3
+	sts	mach, r5		/* r5:r3 = a * b */
+	dmuls.l	r0, r1			/* c * d */
+	sts	macl, r0
+	sts	mach, r1		/* r1:r0 = c * d */
+	clrt
+	subc	r0, r3			/* low word of the difference */
+	subc	r1, r5			/* high word */
+	mov	r3, r0
+	shll	r0
+	subc	r0, r0			/* what the high word would be in range */
+	cmp/eq	r0, r5
+	mov	#0, r1			/* FLAG, in range */
+	bt	2f
+	mov.l	5f, r1			/* positive overflow */
+	cmp/pz	r5
+	bt	2f
+	mov.l	6f, r1			/* negative overflow */
+2:	mov	r4, r0
+	add	#96, r0
+	mov.l	r3, @r0			/* MAC0 */
+	mov.w	4f, r0
+	add	r4, r0
+	mov.l	r1, @r0			/* FLAG */
+	mov.l	@r15+, r5
+	mov.l	@r15+, r4
+	mov.l	@r15+, r3
+	rts
+	 mov.l	@r15+, r2
+3:	.word	264			/* FGL_AT_CP2D * 4 */
+4:	.word	252			/* cp2c[31]: 128 + 31 * 4 */
+	.align	2
+5:	.long	0x80010000
+6:	.long	0x80008000
+	.size	_gte_nclip_leaf, . - _gte_nclip_leaf
+
+/*
+ * The C-callable form, for the self-test: r4 = &file.  Sets GBR so the leaf
+ * finds the file where a block would have it, and puts GBR back.  Under the
+ * interpreter on Linux gte_sh4.c provides this in C instead.
+ */
+	.balign	4
+	.global	_gte_nclip_leaf_call
+	.type	_gte_nclip_leaf_call, @function
+_gte_nclip_leaf_call:
+	sts.l	pr, @-r15
+	stc.l	gbr, @-r15
+	mov.w	1f, r0
+	sub	r0, r4
+	ldc	r4, gbr
+	bsr	_gte_nclip_leaf
+	 nop
+	ldc.l	@r15+, gbr
+	lds.l	@r15+, pr
+	rts
+	 nop
+1:	.word	264
+	.size	_gte_nclip_leaf_call, . - _gte_nclip_leaf_call
+
+/*
+ * ----------------------------------------------------------------
+ * RTPS / RTPT AS LEAVES -- bleem's shape for the transforms.
+ * ----------------------------------------------------------------
+ *
+ * Bloom's RTPS caches the converted rotation matrix in XMTRX keyed on the
+ * control-file generation, checks the key on every call (RTP_CHECK, twelve
+ * instructions and three data lines) and drops into C to rebuild it when the
+ * key misses.  Measured in Spyro: 823k RTPS per 300 vsyncs, 178k of them
+ * missing -- one in 4.6, every object switch.  Bleem does not cache: its RTPS
+ * reads the matrix out of the GBR file and rebuilds XMTRX every call, nine
+ * halfword converts and eight moves, then `ftrv`.  The same number of
+ * instructions as the check-plus-occasional-rebuild on average, and no C, no
+ * shim, no `gte_col`/`gte_rot`/`psxCP2CtrlGen` lines, no slow path at all.
+ * That is the shape here.  The arithmetic after the load is RTP_VERTEX and
+ * the depth cue unchanged, so results stay bit-identical to the C.
+ *
+ * THE LEAF CONTRACT: entered by `jsr` with GBR = the state block, the file at
+ * GBR + 264.  Clobbers r0, r1, PR, MACH, MACL, T, FR0-FR15 and XMTRX;
+ * preserves r2-r15 and GBR.  Generated code holds nothing in the FPU.  C's
+ * matrix cache does, so the leaf writes -1 into gte_hot.xmtrx_key/xmtrx_mx on
+ * the way out: the next cached user (MVMVA through the shim) reloads.
+ */
+
+/* The rotation matrix and translation column of the file at r4 into XMTRX,
+ * scaled as gte_rot_convert / gte_col_rebuild would: m * 1/4096, TR as
+ * float, column 3 = (0,0,0,1).  fr0-fr15 and r0-r2 are scratch. */
+.macro RTP_XMTRX_LOAD
+	mov	r4, r1
+	add	#64, r1
+	add	#64, r1			/* r1 = &cp2c[0] */
+	mova	9f, r0
+	fmov.s	@r0, fr15		/* 1/4096 */
+
+	mov.l	@(0, r1), r2		/* R11 | R12 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr0
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr4
+
+	mov.l	@(4, r1), r2		/* R13 | R21 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr8
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr1
+
+	mov.l	@(8, r1), r2		/* R22 | R23 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr5
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr9
+
+	mov.l	@(12, r1), r2		/* R31 | R32 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr2
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr6
+
+	mov.w	@(16, r1), r0		/* R33 */
+	lds	r0, fpul
+	float	fpul, fr10
+
+	fmul	fr15, fr0
+	fmul	fr15, fr1
+	fmul	fr15, fr2
+	fldi0	fr3
+	fmul	fr15, fr4
+	fmul	fr15, fr5
+	fmul	fr15, fr6
+	fldi0	fr7
+	fmul	fr15, fr8
+	fmul	fr15, fr9
+	fmul	fr15, fr10
+	fldi0	fr11
+
+	mov.l	@(20, r1), r0		/* TRX */
+	lds	r0, fpul
+	float	fpul, fr12
+	mov.l	@(24, r1), r0		/* TRY */
+	lds	r0, fpul
+	float	fpul, fr13
+	mov.l	@(28, r1), r0		/* TRZ */
+	lds	r0, fpul
+	float	fpul, fr14
+	fldi1	fr15
+
+	fschg
+	fmov	dr0, xd0
+	fmov	dr2, xd2
+	fmov	dr4, xd4
+	fmov	dr6, xd6
+	fmov	dr8, xd8
+	fmov	dr10, xd10
+	fmov	dr12, xd12
+	fmov	dr14, xd14
+	bra	1f
+	 fschg
+	.align	2
+9:	.long	0x39800000		/* 1/4096 */
+1:
+.endm
+
+/* The leaf prologue: save what the body uses beyond r0/r1, find the file,
+ * load XMTRX, then RTP_ENTER's bases and constants with ofx/ofy taken from
+ * the file instead of gte_hot. */
+.macro RTP_ENTER_LEAF
+	mov.l	r2, @-r15
+	mov.l	r3, @-r15
+	mov.l	r4, @-r15
+	mov.l	r6, @-r15
+	mov.l	r7, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.w	2f, r0			/* FGL_AT_CP2D * 4 */
+	stc	gbr, r4
+	add	r0, r4			/* r4 = the file */
+	RTP_XMTRX_LOAD
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov.w	3f, r3
+	add	r4, r3			/* file + 232: H, DQA, DQB, FLAG */
+	mov	#0, r7
+	mova	4f, r0
+	fmov.s	@r0+, fr8
+	fmov.s	@r0+, fr9
+	fmov.s	@r0+, fr10
+	fmov.s	@r0+, fr11
+	fmov	fr11, fr5
+	fneg	fr5
+	mov.w	5f, r0			/* cp2c[24]: OFX */
+	mov.l	@(r0, r4), r1
+	lds	r1, fpul
+	float	fpul, fr6
+	fmul	fr9, fr6		/* ofx = OFX / 65536 */
+	add	#4, r0
+	mov.l	@(r0, r4), r1
+	lds	r1, fpul
+	float	fpul, fr7
+	bra	1f
+	 fmul	fr9, fr7		/* ofy */
+2:	.word	264
+3:	.word	232
+5:	.word	224
+	.align	2
+4:	.long	0x47800000	/* 65536.0 */
+	.long	0x37800000	/* 1/65536 */
+	.long	0x3f000000	/* 0.5 */
+	.long	0x47000000	/* 32768.0 */
+1:
+.endm
+
+/* RTP_LEAVE for a leaf: the depth cue and FLAG as before, no gte_hot.flag,
+ * the XMTRX cache told it no longer holds what it thinks, and everything the
+ * prologue saved put back. */
+.macro RTP_LEAVE_LEAF
+	mov.w	@(4, r3), r0		/* DQA, sign-extended */
+	dmuls.l	r0, r10
+	mov.l	@(8, r3), r1		/* DQB */
+	mov	r1, r0
+	shll	r0
+	subc	r0, r0			/* sign of DQB, 64-bit */
+	sts	macl, r9
+	sts	mach, r8
+	clrt
+	addc	r1, r9
+	addc	r0, r8
+	mov.l	r9, @(32, r6)		/* MAC0 = low word */
+	mov	#20, r0
+	shld	r0, r8
+	mov	#-12, r0
+	shld	r0, r9
+	or	r8, r9			/* (tmp >> 12) as s32 */
+	mov.w	4f, r0
+	cmp/gt	r0, r9
+	bt	1f
+	cmp/pz	r9
+	bf	2f
+	mov	r9, r0
+3:	mov.w	r0, @(0, r2)		/* IR0 */
+	mov.l	r7, @(20, r3)		/* FLAG */
+	mov.l	5f, r0			/* &gte_hot */
+	mov	#-1, r1
+	mov.l	r1, @(16, r0)		/* xmtrx_key: XMTRX is ours now */
+	mov.l	r1, @(20, r0)		/* xmtrx_mx */
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	mov.l	@r15+, r8
+	mov.l	@r15+, r7
+	mov.l	@r15+, r6
+	mov.l	@r15+, r4
+	mov.l	@r15+, r3
+	rts
+	 mov.l	@r15+, r2
+1:	mov.w	4f, r1
+	or	r1, r7
+	bra	3b
+	 nop
+2:	mov.w	4f, r1
+	or	r1, r7
+	bra	3b
+	 mov	#0, r0
+4:	.word	0x1000			/* limH bound, and its flag bit */
+	.align	2
+5:	.long	_gte_hot
+.endm
+
+	.balign	4
+	.global	_gte_rtps_leaf
+	.type	_gte_rtps_leaf, @function
+_gte_rtps_leaf:
+	RTP_ENTER_LEAF
+	/* Both stacks shift before the new vertex lands */
+	mov.w	@(4, r6), r0
+	mov.w	r0, @(0, r6)
+	mov.w	@(8, r6), r0
+	mov.w	r0, @(4, r6)
+	mov.w	@(12, r6), r0
+	mov.w	r0, @(8, r6)
+	mov.l	@(20, r2), r0
+	mov.l	r0, @(16, r2)
+	mov.l	@(24, r2), r0
+	mov.l	r0, @(20, r2)
+	RTP_VERTEX 0, 12, 24
+	RTP_LEAVE_LEAF
+	.size	_gte_rtps_leaf, . - _gte_rtps_leaf
+
+	.balign	4
+	.global	_gte_rtpt_leaf
+	.type	_gte_rtpt_leaf, @function
+_gte_rtpt_leaf:
+	RTP_ENTER_LEAF
+	/* SZ0 takes the old SZ3 before anything is written */
+	mov.w	@(12, r6), r0
+	mov.w	r0, @(0, r6)
+	RTP_VERTEX 0, 4, 16
+	RTP_VERTEX 8, 8, 20
+	RTP_VERTEX 16, 12, 24
+	RTP_LEAVE_LEAF
+	.size	_gte_rtpt_leaf, . - _gte_rtpt_leaf
+
+/* C-callable forms for the self-test, as _gte_nclip_leaf_call. */
+.macro LEAF_CALL name, leaf
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	sts.l	pr, @-r15
+	stc.l	gbr, @-r15
+	mov.w	1f, r0
+	sub	r0, r4
+	ldc	r4, gbr
+	bsr	\leaf
+	 nop
+	ldc.l	@r15+, gbr
+	lds.l	@r15+, pr
+	rts
+	 nop
+1:	.word	264
+	.size	\name, . - \name
+.endm
+
+	LEAF_CALL _gte_rtps_leaf_call, _gte_rtps_leaf
+	LEAF_CALL _gte_rtpt_leaf_call, _gte_rtpt_leaf
+
+/*
+ * ================================================================
+ * THE REST OF THE GTE AS LEAVES -- integer, exact to pcsx's gte.c
+ * ================================================================
+ *
+ * Every command below is arithmetic on 16-bit quantities with a 44-bit
+ * accumulator, done here on the integer unit exactly as pcsx's gte.c does
+ * it (the flags included: sequential 44-bit overflow per addend, the clamps,
+ * the master bit), so the self-test compares against gteDispatch() and asks
+ * for zero differences.  No FPU, no cache, no C, no slow path.
+ *
+ * The leaf contract is the one above: entered by jsr, GBR = the state block,
+ * the file at GBR + 264, r1 = the op word for the commands that take one.
+ * Clobbers r0, r1, PR, MACH, MACL, T.  Preserves r2-r15 and GBR.
+ *
+ * Register plan for all of them (gl_*):
+ *   r4   the file                 r2   file + 32: IR0 @0, IR1..3 @4/8/12
+ *   r6   file + 64: SZ @0..12, RGB0..2 @16/20/24, MAC0 @32, MAC1..3 @36/40/44
+ *   r3   the flags, no master bit (gl_flagout adds it and writes FLAG)
+ *   r14  -shift (0 or -12)        r13  lm's low bound (0 or -0x8000)
+ *   r15  the op word is at @(0,r15) after ILEAF_ENTER
+ *
+ * The 44-bit accumulator is kept the way pcsx keeps it: as a 64-bit value
+ * scaled by 2^20 (hi:lo = r13:r12 in the core), so a signed overflow of the
+ * high word IS the 44-bit overflow, `addv`/`subv` report it, and the final
+ * `>> (shift + 20)` is either the high word or a 12-bit funnel shift.
+ */
+
+/* ---- the small building blocks ---- */
+
+/* The flag bits, built with shifts so the cold stubs carry no literals. */
+.macro FLAG_A_POS n		/* 1 << (31 - n): 30, 29, 28 */
+	.if \n == 1
+	mov	#0x40, r0
+	.elseif \n == 2
+	mov	#0x20, r0
+	.else
+	mov	#0x10, r0
+	.endif
+	shll16	r0
+	shll8	r0
+.endm
+.macro FLAG_A_NEG n		/* 1 << (28 - n): 27, 26, 25 */
+	.if \n == 1
+	mov	#8, r0
+	.elseif \n == 2
+	mov	#4, r0
+	.else
+	mov	#2, r0
+	.endif
+	shll16	r0
+	shll8	r0
+.endm
+
+/* hi:lo (x 2^20) += p << 20, with the 44-bit overflow flags of component n.
+ * r1 = p on entry and is destroyed; r0 scratch. */
+.macro MACADD n, lo, hi
+	mov	r1, r0
+	shll16	r0
+	shll2	r0
+	shll2	r0			/* p << 20 */
+	clrt
+	addc	r0, \lo
+	mov	#-12, r0
+	shad	r0, r1			/* p >> 12 */
+	movt	r0
+	add	r0, r1			/* + carry */
+	addv	r1, \hi
+	bf	8f
+	cmp/pz	\hi
+	bt	1f
+	FLAG_A_POS \n			/* wrapped negative: overflowed up */
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:
+.endm
+
+/* r0 = (hi:lo x 2^20) >> (shift + 20).  r1 scratch. */
+.macro EXTR20 lo, hi
+	mov	\hi, r0
+	tst	r14, r14
+	bf	3f			/* shift 12: the high word */
+	shll8	r0
+	shll2	r0
+	shll2	r0
+	mov	\lo, r1
+	shlr16	r1
+	shlr2	r1
+	shlr2	r1
+	or	r1, r0
+3:
+.endm
+
+/* r0 = (hi:lo, plain 64-bit) >> shift.  r1 scratch. */
+.macro EXTR0 lo, hi
+	mov	\lo, r0
+	tst	r14, r14
+	bt	3f			/* shift 0: the low word */
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	mov	\hi, r1
+	shll16	r1
+	shll2	r1
+	shll2	r1
+	or	r1, r0
+3:
+.endm
+
+/* limB\n: clamp reg to [min, 0x7fff], flag bit 25 - n.  r0 scratch. */
+.macro LIMB reg, n, min
+	mov	#-1, r0
+	shlr16	r0
+	shlr	r0			/* 0x7fff */
+	cmp/gt	r0, \reg
+	bt	5f
+	cmp/ge	\min, \reg
+	bt	7f
+	mov	\min, \reg
+	bra	6f
+	 nop
+5:	mov	r0, \reg
+6:	mov	#0x40, r0
+	shll16	r0
+	.if \n == 1
+	shll2	r0
+	.elseif \n == 2
+	shll	r0
+	.endif
+	or	r0, r3
+7:
+.endm
+
+/* limC\n on reg >> 4 into byte n-1 of r12, flag bit 22 - n.  reg destroyed. */
+.macro LIMC reg, n
+	mov	#-4, r0
+	shad	r0, \reg
+	mov	#-1, r0
+	extu.b	r0, r0			/* 255 */
+	cmp/hi	r0, \reg
+	bf	2f
+	cmp/pz	\reg
+	bt	1f
+	mov	#0, \reg
+	bra	3f
+	 nop
+1:	mov	r0, \reg
+3:	.if \n == 1
+	mov	#0x20, r0
+	.elseif \n == 2
+	mov	#0x10, r0
+	.else
+	mov	#8, r0
+	.endif
+	shll16	r0
+	or	r0, r3
+2:	.if \n == 1
+	mov	\reg, r12
+	.elseif \n == 2
+	shll8	\reg
+	or	\reg, r12
+	.else
+	shll16	\reg
+	or	\reg, r12
+	.endif
+.endm
+
+/* r13 = lm's low bound from the op word at @(off, r15).  r0, r1 scratch. */
+.macro LMB off
+	mov.l	@(\off, r15), r0
+	mov	#4, r1
+	shll8	r1			/* 1 << 10 */
+	tst	r1, r0
+	movt	r13
+	neg	r13, r13		/* -1 when lm == 0 */
+	mov	#1, r0
+	shll16	r0
+	shlr	r0
+	neg	r0, r0			/* -0x8000 */
+	and	r0, r13
+.endm
+
+/* RGB0 = RGB1, RGB1 = RGB2 */
+.macro SHIFT_RGB
+	mov.l	@(20, r6), r0
+	mov.l	r0, @(16, r6)
+	mov.l	@(24, r6), r0
+	mov.l	r0, @(20, r6)
+.endm
+
+/* The colour word in r12 gets CODE and lands at file + 64 + (r8 & 0xff). */
+.macro RGB_OUT
+	mov.l	@(24, r4), r1
+	mov	#-1, r0
+	shll16	r0
+	shll8	r0
+	and	r0, r1
+	or	r1, r12
+	mov	r8, r0
+	and	#0xff, r0
+	mov.l	r12, @(r0, r6)
+.endm
+
+/* Prologue for every integer leaf: save everything the family uses, find
+ * the file, park the op word, decode sf and lm. */
+.macro ILEAF_ENTER
+	sts.l	pr, @-r15
+	mov.l	r2, @-r15
+	mov.l	r3, @-r15
+	mov.l	r4, @-r15
+	mov.l	r5, @-r15
+	mov.l	r6, @-r15
+	mov.l	r7, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+	mov.l	r1, @-r15		/* the op word, @(0, r15) */
+	mov	#66, r0
+	shll2	r0			/* 264 = FGL_AT_CP2D * 4 */
+	stc	gbr, r4
+	add	r0, r4
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov	#0, r3
+	mov	#8, r0
+	shll16	r0			/* sf, 1 << 19 */
+	tst	r0, r1
+	movt	r14
+	add	#-1, r14		/* -1 when sf, else 0 */
+	shll2	r14
+	mov	r14, r0
+	add	r0, r14
+	add	r0, r14			/* -12 or 0 */
+	LMB	0
+.endm
+
+.macro ILEAF_LEAVE
+	mov.l	98f, r0
+	tst	r0, r3
+	bt	99f
+	mov	#1, r0
+	rotr	r0
+	or	r0, r3			/* the master bit */
+99:	mov	#63, r0
+	shll2	r0			/* 252 */
+	mov.l	r3, @(r0, r4)		/* FLAG */
+	add	#4, r15
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	mov.l	@r15+, r8
+	mov.l	@r15+, r7
+	mov.l	@r15+, r6
+	mov.l	@r15+, r5
+	mov.l	@r15+, r4
+	mov.l	@r15+, r3
+	mov.l	@r15+, r2
+	lds.l	@r15+, pr
+	rts
+	 nop
+	.align	2
+98:	.long	0x7f87e000
+.endm
+
+/* Three colour bytes of the word in r0, each << 16, into MAC1..3. */
+.macro RGB_TO_MAC16
+	mov	r0, r1
+	extu.b	r1, r1
+	shll16	r1
+	mov.l	r1, @(36, r6)
+	mov	r0, r1
+	shlr8	r1
+	extu.b	r1, r1
+	shll16	r1
+	mov.l	r1, @(40, r6)
+	mov	r0, r1
+	shlr16	r1
+	extu.b	r1, r1
+	shll16	r1
+	mov.l	r1, @(44, r6)
+.endm
+
+/* ---- SQR, OP, GPF, GPL: the three-product commands ---- */
+
+	.balign	4
+	.global	_gte_sqr_leaf
+	.type	_gte_sqr_leaf, @function
+_gte_sqr_leaf:
+	ILEAF_ENTER
+.macro SQR_COMP n
+	mov.w	@(4 * \n, r2), r0
+	mul.l	r0, r0
+	sts	macl, r5
+	shad	r14, r5
+	mov.l	r5, @(32 + 4 * \n, r6)
+	LIMB	r5, \n, r13
+	mov	r5, r0
+	mov.w	r0, @(4 * \n, r2)
+.endm
+	SQR_COMP 1
+	SQR_COMP 2
+	SQR_COMP 3
+	ILEAF_LEAVE
+	.size	_gte_sqr_leaf, . - _gte_sqr_leaf
+
+	.balign	4
+	.global	_gte_op_leaf
+	.type	_gte_op_leaf, @function
+_gte_op_leaf:
+	ILEAF_ENTER
+	mov	r4, r9
+	add	#64, r9
+	add	#64, r9			/* the rotation matrix */
+	mov.w	@(0, r9), r0
+	mov	r0, r5			/* R11 */
+	mov.w	@(8, r9), r0
+	mov	r0, r7			/* R22 */
+	mov.w	@(16, r9), r0
+	mov	r0, r8			/* R33 */
+	mov.w	@(4, r2), r0
+	mov	r0, r10			/* IR1 */
+	mov.w	@(8, r2), r0
+	mov	r0, r11			/* IR2 */
+	mov.w	@(12, r2), r0
+	mov	r0, r12			/* IR3 */
+	/* MAC1 = (R22 * IR3 - R33 * IR2) >> shift */
+	mov	r7, r9
+	mul.l	r12, r9
+	sts	macl, r9
+	mov	r8, r0
+	mul.l	r11, r0
+	sts	macl, r0
+	sub	r0, r9
+	shad	r14, r9
+	mov.l	r9, @(36, r6)
+	LIMB	r9, 1, r13
+	mov	r9, r0
+	mov.w	r0, @(4, r2)
+	/* MAC2 = (R33 * IR1 - R11 * IR3) >> shift */
+	mov	r8, r9
+	mul.l	r10, r9
+	sts	macl, r9
+	mov	r5, r0
+	mul.l	r12, r0
+	sts	macl, r0
+	sub	r0, r9
+	shad	r14, r9
+	mov.l	r9, @(40, r6)
+	LIMB	r9, 2, r13
+	mov	r9, r0
+	mov.w	r0, @(8, r2)
+	/* MAC3 = (R11 * IR2 - R22 * IR1) >> shift */
+	mov	r5, r9
+	mul.l	r11, r9
+	sts	macl, r9
+	mov	r7, r0
+	mul.l	r10, r0
+	sts	macl, r0
+	sub	r0, r9
+	shad	r14, r9
+	mov.l	r9, @(44, r6)
+	LIMB	r9, 3, r13
+	mov	r9, r0
+	mov.w	r0, @(12, r2)
+	ILEAF_LEAVE
+	.size	_gte_op_leaf, . - _gte_op_leaf
+
+	.balign	4
+	.global	_gte_gpf_leaf
+	.type	_gte_gpf_leaf, @function
+_gte_gpf_leaf:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+.macro GPF_COMP n
+	mov.w	@(4 * \n, r2), r0
+	mul.l	r7, r0
+	sts	macl, r5
+	shad	r14, r5
+	mov.l	r5, @(32 + 4 * \n, r6)
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+	LIMC	r5, \n
+.endm
+	GPF_COMP 1
+	GPF_COMP 2
+	GPF_COMP 3
+	mov	#24, r8
+	RGB_OUT
+	ILEAF_LEAVE
+	.size	_gte_gpf_leaf, . - _gte_gpf_leaf
+
+	.balign	4
+	.global	_gte_gpl_leaf
+	.type	_gte_gpl_leaf, @function
+_gte_gpl_leaf:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+.macro GPL_COMP n
+	mov.w	@(4 * \n, r2), r0
+	mul.l	r7, r0
+	sts	macl, r1		/* IR0 * IRn */
+	mov.l	@(32 + 4 * \n, r6), r10	/* MACn */
+	tst	r14, r14
+	bt	20f
+	mov	#0, r11			/* sf: (MAC << 12) + p, 44-bit checked, >> 12 */
+	MACADD	\n, r11, r10
+	bra	21f
+	 mov	r10, r5
+20:	add	r1, r10			/* no shift: plain wrapping add */
+	mov	r10, r5
+21:	mov.l	r5, @(32 + 4 * \n, r6)
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+	LIMC	r5, \n
+.endm
+	GPL_COMP 1
+	GPL_COMP 2
+	GPL_COMP 3
+	mov	#24, r8
+	RGB_OUT
+	ILEAF_LEAVE
+	.size	_gte_gpl_leaf, . - _gte_gpl_leaf
+
+/* ---- AVSZ3 / AVSZ4 ---- */
+
+/* r0 = ZSF, r5 = the SZ sum: MAC0 with its 32-bit flags, OTZ = limD. */
+gl_avsz:
+	dmuls.l	r0, r5
+	sts	macl, r5
+	sts	mach, r7
+	mov.l	r5, @(32, r6)		/* MAC0 = the low word */
+	mov	r5, r0
+	shll	r0
+	subc	r0, r0			/* sign of the low word */
+	cmp/eq	r0, r7
+	bt	1f			/* it fit */
+	cmp/pz	r7
+	bt	2f
+	mov	#1, r0
+	shll16	r0
+	shlr	r0			/* bit 15: went under */
+	bra	1f
+	 or	r0, r3
+2:	mov	#1, r0
+	shll16	r0			/* bit 16: went over */
+	or	r0, r3
+1:	mov	r5, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shll16	r7
+	shll2	r7
+	shll2	r7
+	or	r7, r0			/* (s32)(r >> 12) */
+	mov	#-1, r1
+	extu.w	r1, r1			/* 0xffff */
+	cmp/hi	r1, r0
+	bf	3f
+	cmp/pz	r0
+	bt	4f
+	mov	#0, r0
+	bra	5f
+	 nop
+4:	mov	r1, r0
+5:	mov	#4, r1
+	shll16	r1			/* bit 18 */
+	or	r1, r3
+3:	rts
+	 mov.w	r0, @(28, r4)		/* OTZ */
+
+	.balign	4
+	.global	_gte_avsz3_leaf
+	.type	_gte_avsz3_leaf, @function
+_gte_avsz3_leaf:
+	ILEAF_ENTER
+	mov.w	@(4, r6), r0
+	extu.w	r0, r5
+	mov.w	@(8, r6), r0
+	extu.w	r0, r0
+	add	r0, r5
+	mov.w	@(12, r6), r0
+	extu.w	r0, r0
+	add	r0, r5			/* SZ1 + SZ2 + SZ3 */
+	mov	r4, r9
+	add	#116, r9
+	add	#116, r9
+	mov.w	@(12, r9), r0		/* ZSF3 @244 */
+	bsr	gl_avsz
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_avsz3_leaf, . - _gte_avsz3_leaf
+
+	.balign	4
+	.global	_gte_avsz4_leaf
+	.type	_gte_avsz4_leaf, @function
+_gte_avsz4_leaf:
+	ILEAF_ENTER
+	mov.w	@(0, r6), r0
+	extu.w	r0, r5
+	mov.w	@(4, r6), r0
+	extu.w	r0, r0
+	add	r0, r5
+	mov.w	@(8, r6), r0
+	extu.w	r0, r0
+	add	r0, r5
+	mov.w	@(12, r6), r0
+	extu.w	r0, r0
+	add	r0, r5			/* SZ0 + SZ1 + SZ2 + SZ3 */
+	mov	r4, r9
+	add	#116, r9
+	add	#116, r9
+	mov.w	@(16, r9), r0		/* ZSF4 @248 */
+	bsr	gl_avsz
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_avsz4_leaf, . - _gte_avsz4_leaf
+
+/* ---- the depth cue: DPCS, INTPL, DCPL, DPCT ---- */
+
+/*
+ * One component of pcsx's runColor2 on the value in r5:
+ *   ir  = limB(((FC << 12) - (mac << 20 >> 20... i.e. FC<<12 - mac) >> shift), lm = 0)
+ *   mac = (IR0 * ir + (s64)mac) >> shift
+ * r7 = IR0, r9 = file + 212 (RFC/GFC/BFC).  r0, r1, r10, r11 scratch.
+ */
+.macro RC2_CORE n
+	mov.l	@(4 * (\n - 1), r9), r11	/* hi = FC */
+	mov	r5, r0
+	shll16	r0
+	shll2	r0
+	shll2	r0			/* mac << 20 */
+	mov	#0, r1
+	clrt
+	subc	r0, r1			/* lo = -(mac << 20), T = borrow */
+	mov	#-12, r0
+	mov	r5, r10
+	shad	r0, r10			/* mac >> 12 */
+	movt	r0
+	add	r0, r10			/* + borrow */
+	subv	r10, r11		/* hi -= ; T = 44-bit overflow */
+	bf	8f
+	cmp/pz	r11
+	bt	1f
+	FLAG_A_POS \n
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:	mov	r11, r10
+	tst	r14, r14
+	bf	3f			/* shift 12: the high word */
+	shll8	r10
+	shll2	r10
+	shll2	r10
+	shlr16	r1
+	shlr2	r1
+	shlr2	r1
+	or	r1, r10
+3:	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1			/* -0x8000: this clamp ignores lm */
+	LIMB	r10, \n, r1
+	mul.l	r7, r10
+	sts	macl, r0		/* IR0 * ir */
+	mov	r5, r11
+	shll	r11
+	subc	r11, r11		/* sign of mac */
+	mov	r0, r10
+	shll	r10
+	subc	r10, r10		/* sign of the product */
+	clrt
+	addc	r0, r5			/* lo */
+	addc	r10, r11		/* hi */
+	tst	r14, r14
+	bt	4f			/* shift 0: the low word */
+	shlr8	r5
+	shlr2	r5
+	shlr2	r5
+	shll16	r11
+	shll2	r11
+	shll2	r11
+	or	r11, r5
+4:
+.endm
+
+.macro RC2_COMP n
+	mov.l	@(32 + 4 * \n, r6), r5
+	RC2_CORE \n
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn, every pass */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	20f			/* IR only on the writeback pass */
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+20:	LIMC	r5, \n
+.endm
+
+/* runColor2 over MAC1..3 as they stand in the file.  r8 = dest | 0x400 for
+ * the writeback pass.  Preserves r13, r14. */
+gl_rc2:
+	mov	#106, r9
+	shll	r9
+	add	r4, r9			/* file + 212 */
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+	RC2_COMP 1
+	RC2_COMP 2
+	RC2_COMP 3
+	RGB_OUT
+	rts
+	 nop
+
+	.balign	4
+	.global	_gte_dpcs_leaf
+	.type	_gte_dpcs_leaf, @function
+_gte_dpcs_leaf:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov.l	@(24, r4), r0		/* RGB */
+	RGB_TO_MAC16
+	mov	#4, r8
+	shll8	r8
+	add	#24, r8			/* writeback, RGB2 */
+	bsr	gl_rc2
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_dpcs_leaf, . - _gte_dpcs_leaf
+
+	.balign	4
+	.global	_gte_intpl_leaf
+	.type	_gte_intpl_leaf, @function
+_gte_intpl_leaf:
+	ILEAF_ENTER
+	SHIFT_RGB
+.macro INTPL_MAC n
+	mov.w	@(4 * \n, r2), r0
+	shll8	r0
+	shll2	r0
+	shll2	r0			/* IRn << 12 */
+	mov.l	r0, @(32 + 4 * \n, r6)
+.endm
+	INTPL_MAC 1
+	INTPL_MAC 2
+	INTPL_MAC 3
+	mov	#4, r8
+	shll8	r8
+	add	#24, r8
+	bsr	gl_rc2
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_intpl_leaf, . - _gte_intpl_leaf
+
+	.balign	4
+	.global	_gte_dcpl_leaf
+	.type	_gte_dcpl_leaf, @function
+_gte_dcpl_leaf:
+	ILEAF_ENTER
+	SHIFT_RGB
+.macro DCPL_MAC n
+	mov.w	@(4 * \n, r2), r0
+	mov	r0, r5
+	mov.l	@(24, r4), r0
+	.if \n == 2
+	shlr8	r0
+	.elseif \n == 3
+	shlr16	r0
+	.endif
+	extu.b	r0, r0
+	mul.l	r5, r0
+	sts	macl, r0
+	shll2	r0
+	shll2	r0			/* (C * IRn) << 4 */
+	mov.l	r0, @(32 + 4 * \n, r6)
+.endm
+	DCPL_MAC 1
+	DCPL_MAC 2
+	DCPL_MAC 3
+	mov	#4, r8
+	shll8	r8
+	add	#24, r8
+	bsr	gl_rc2
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_dcpl_leaf, . - _gte_dcpl_leaf
+
+	.balign	4
+	.global	_gte_dpct_leaf
+	.type	_gte_dpct_leaf, @function
+_gte_dpct_leaf:
+	ILEAF_ENTER
+.macro DPCT_PASS v, wb
+	mov.l	@(16 + 4 * \v, r6), r0	/* RGBv, as the previous pass left it */
+	RGB_TO_MAC16
+	mov	#16 + 4 * \v, r8
+	.if \wb
+	mov	#4, r0
+	shll8	r0
+	or	r0, r8
+	.endif
+	bsr	gl_rc2
+	 nop
+.endm
+	DPCT_PASS 0, 0
+	DPCT_PASS 1, 0
+	DPCT_PASS 2, 1
+	ILEAF_LEAVE
+	.size	_gte_dpct_leaf, . - _gte_dpct_leaf
+
+/* ---- the shared core and the flag write ---- */
+
+	.align	2
+gl_zeros:
+	.long	0, 0, 0
+
+/*
+ * pcsx's gteMAC123f: MAC1..3 = (t << 12 + m * v) >> shift, with the 44-bit
+ * overflow flags raised per addend, written to the file.
+ *   r5 = the vector (three s16), r1 = its stride (2: V0..2, 4: IR1..3)
+ *   r7 = the matrix, nine s16 in a row     r11 = the translation, 3 x s32
+ * Clobbers r0, r1, r5, r7, r9, r10, r11, r12, r13.  Preserves r8.
+ */
+.macro MACROW n
+	mov.l	@r11+, r13		/* hi = t: t << 12 in x 2^20 form */
+	mov	#0, r12
+	mov.w	@r7+, r1
+	mul.l	r9, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	mov.w	@r7+, r1
+	mul.l	r10, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	mov.w	@r7+, r1
+	mul.l	r5, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	EXTR20	r12, r13
+	mov.l	r0, @(32 + 4 * \n, r6)
+.endm
+
+gl_mac123f:
+	mov.w	@r5, r9
+	add	r1, r5
+	mov.w	@r5, r10
+	add	r1, r5
+	mov.w	@r5, r5			/* vx r9, vy r10, vz r5 */
+	MACROW 1
+	MACROW 2
+	MACROW 3
+	rts
+	 nop
+
+/* ---- the lighting family ---- */
+
+/*
+ * One component of pcsx's runColor1 after the colour matrix.  r5 = MACn
+ * from the file; r8 = dest | 0x100 (ncc: modulate by the colour) | 0x200
+ * (ncd: modulate, then the depth cue) | 0x400 (writeback: MAC, IR).
+ */
+.macro RC1_COMP n
+	mov.l	@(32 + 4 * \n, r6), r5
+	mov	r8, r0
+	shlr8	r0
+	tst	#3, r0
+	bt	20f			/* NCS: the colour stage is the result */
+	mov	r5, r10
+	LIMB	r10, \n, r13		/* ir = limB(mac, lm) */
+	mov.l	@(24, r4), r0
+	.if \n == 2
+	shlr8	r0
+	.elseif \n == 3
+	shlr16	r0
+	.endif
+	extu.b	r0, r0
+	mul.l	r10, r0
+	sts	macl, r5
+	shll2	r5
+	shll2	r5			/* (C * ir) << 4 */
+	mov	r8, r0
+	shlr8	r0
+	tst	#2, r0
+	bf	21f
+	bra	20f
+	 shad	r14, r5			/* NCC: >> shift */
+21:	RC2_CORE \n			/* NCD: the depth cue */
+20:	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	22f
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	bra	23f
+	 mov.w	r0, @(4 * \n, r2)	/* IRn */
+22:	mov	r5, r10
+	LIMB	r10, \n, r13		/* flags only */
+23:	LIMC	r5, \n
+.endm
+
+/* CC / CDP enter here: the colour matrix on IR as it stands. */
+gl_rc3:
+	sts.l	pr, @-r15
+	bra	gl_rc1_c
+	 nop
+
+/* One vertex of NCS/NCT/NCCS/NCCT/NCDS/NCDT: r5 = the vertex, r1 = 2,
+ * r8 = dest | mode bits. */
+gl_rc1:
+	sts.l	pr, @-r15
+	mov	r4, r7
+	add	#80, r7
+	add	#80, r7			/* the light matrix @160 */
+	mov.l	92f, r11		/* no translation */
+	bsr	gl_mac123f
+	 nop
+	bra	93f
+	 nop
+	.align	2
+92:	.long	gl_zeros
+93:	LMB	4
+	mov.l	@(36, r6), r5
+	LIMB	r5, 1, r13
+	mov	r5, r0
+	mov.w	r0, @(4, r2)
+	mov.l	@(40, r6), r5
+	LIMB	r5, 2, r13
+	mov	r5, r0
+	mov.w	r0, @(8, r2)
+	mov.l	@(44, r6), r5
+	LIMB	r5, 3, r13
+	mov	r5, r0
+	mov.w	r0, @(12, r2)		/* IR = limB(light), the next vector */
+gl_rc1_c:
+	mov	r2, r5
+	add	#4, r5
+	mov	#4, r1
+	mov	r4, r7
+	add	#96, r7
+	add	#96, r7			/* the colour matrix @192 */
+	mov	r4, r11
+	add	#90, r11
+	add	#90, r11		/* the background colour @180 */
+	bsr	gl_mac123f
+	 nop
+	LMB	4
+	mov	#106, r9
+	shll	r9
+	add	r4, r9			/* the far colour @212 */
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+	RC1_COMP 1
+	RC1_COMP 2
+	RC1_COMP 3
+	RGB_OUT
+	lds.l	@r15+, pr
+	rts
+	 nop
+
+.macro LIGHT_LEAF name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov	r4, r5			/* V0 */
+	mov	#2, r1
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8			/* RGB2 */
+	bsr	gl_rc1
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+.macro LIGHT_LEAF_T name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	mov	r4, r5
+	mov	#2, r1
+	mov	#\mode - 4, r8
+	shll8	r8
+	add	#16, r8			/* RGB0, no writeback */
+	bsr	gl_rc1
+	 nop
+	mov	r4, r5
+	add	#8, r5
+	mov	#2, r1
+	mov	#\mode - 4, r8
+	shll8	r8
+	add	#20, r8			/* RGB1 */
+	bsr	gl_rc1
+	 nop
+	mov	r4, r5
+	add	#16, r5
+	mov	#2, r1
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8			/* RGB2, writeback */
+	bsr	gl_rc1
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+.macro COLOUR_LEAF name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8
+	bsr	gl_rc3
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+	LIGHT_LEAF   _gte_ncs_leaf,  4		/* 0x400 */
+	LIGHT_LEAF_T _gte_nct_leaf,  4
+	LIGHT_LEAF   _gte_nccs_leaf, 5		/* 0x100 | 0x400 */
+	LIGHT_LEAF_T _gte_ncct_leaf, 5
+	LIGHT_LEAF   _gte_ncds_leaf, 6		/* 0x200 | 0x400 */
+	LIGHT_LEAF_T _gte_ncdt_leaf, 6
+	COLOUR_LEAF  _gte_cc_leaf,   5
+	COLOUR_LEAF  _gte_cdp_leaf,  6
+
+/* ---- MVMVA ---- */
+
+/*
+ * pcsx's bugged form for cv == 2 (the far colour as translation): the first
+ * column with the translation and the flags, the other two on their own.
+ * r5, r1, r7, r11 as gl_mac123f; r13 = lm's bound.
+ */
+.macro BUGROW n
+	mov.l	@r11+, r8		/* hi = FC */
+	mov	#0, r12
+	mov.w	@r7+, r1
+	mul.l	r9, r1
+	sts	macl, r1
+	MACADD	\n, r12, r8
+	EXTR20	r12, r8
+	mov	r0, r12
+	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1
+	LIMB	r12, \n, r1		/* flags only, lm = 0 */
+	mov.w	@r7+, r1
+	mul.l	r10, r1
+	sts	macl, r12		/* m * vy */
+	mov.w	@r7+, r1
+	mul.l	r5, r1
+	sts	macl, r1		/* m * vz */
+	mov	r12, r8
+	shll	r8
+	subc	r8, r8
+	mov	r1, r0
+	shll	r0
+	subc	r0, r0
+	clrt
+	addc	r1, r12
+	addc	r0, r8			/* the 64-bit sum */
+	EXTR0	r12, r8
+	mov.l	r0, @(32 + 4 * \n, r6)
+	mov	r0, r12
+	LIMB	r12, \n, r13
+	mov	r12, r0
+	mov.w	r0, @(4 * \n, r2)
+.endm
+
+gl_mvmva_bug:
+	mov.w	@r5, r9
+	add	r1, r5
+	mov.w	@r5, r10
+	add	r1, r5
+	mov.w	@r5, r5
+	BUGROW 1
+	BUGROW 2
+	BUGROW 3
+	rts
+	 nop
+
+	.balign	4
+	.global	_gte_mvmva_leaf
+	.type	_gte_mvmva_leaf, @function
+_gte_mvmva_leaf:
+	ILEAF_ENTER
+	add	#-20, r15		/* room for the bugged matrix; op @(20,r15) */
+	mov.l	@(20, r15), r8		/* the op word (r1 is scratch by now) */
+	/* the vector: V0..2 at file + 8v, or IR1..3 */
+	mov	r8, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0
+	cmp/eq	#3, r0
+	bt	1f
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	mov	r0, r5
+	bra	2f
+	 mov	#2, r1
+1:	mov	r2, r5
+	add	#4, r5
+	mov	#4, r1
+2:	/* the matrix: 32 bytes each from file + 128, or the bugged one */
+	mov	r8, r0
+	shlr16	r0
+	shlr	r0
+	and	#3, r0
+	cmp/eq	#3, r0
+	bt	3f
+	shll2	r0
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	add	#64, r0
+	add	#64, r0
+	bra	4f
+	 mov	r0, r7
+3:	mov.l	@(24, r4), r0
+	extu.b	r0, r0
+	shll2	r0
+	shll2	r0			/* R << 4 */
+	mov.w	r0, @(2, r15)
+	neg	r0, r0
+	mov.w	r0, @(0, r15)
+	mov.w	@r2, r0
+	mov.w	r0, @(4, r15)		/* IR0 */
+	mov	r4, r7
+	add	#64, r7
+	add	#64, r7
+	mov.w	@(4, r7), r0		/* R13 */
+	mov.w	r0, @(6, r15)
+	mov.w	r0, @(8, r15)
+	mov.w	r0, @(10, r15)
+	mov.w	@(8, r7), r0		/* R22 */
+	mov.w	r0, @(12, r15)
+	mov.w	r0, @(14, r15)
+	mov.w	r0, @(16, r15)
+	mov	r15, r7
+4:	/* the translation: 32 bytes each from file + 148, none, or bugged */
+	mov	r8, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0
+	cmp/eq	#3, r0
+	bt	35f
+	cmp/eq	#2, r0
+	bt	37f
+	shll2	r0
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	add	#74, r0
+	add	#74, r0
+	bra	36f
+	 mov	r0, r11
+35:	mov.l	92f, r11
+36:	bsr	gl_mac123f
+	 nop
+	bra	93f
+	 nop
+	.align	2
+92:	.long	gl_zeros
+93:	LMB	20
+	mov.l	@(36, r6), r5
+	LIMB	r5, 1, r13
+	mov	r5, r0
+	mov.w	r0, @(4, r2)
+	mov.l	@(40, r6), r5
+	LIMB	r5, 2, r13
+	mov	r5, r0
+	mov.w	r0, @(8, r2)
+	mov.l	@(44, r6), r5
+	LIMB	r5, 3, r13
+	mov	r5, r0
+	bra	38f
+	 mov.w	r0, @(12, r2)
+37:	mov	#106, r11
+	shll	r11
+	add	r4, r11			/* the far colour */
+	bsr	gl_mvmva_bug
+	 nop
+38:	add	#20, r15
+	ILEAF_LEAVE
+	.size	_gte_mvmva_leaf, . - _gte_mvmva_leaf
+
+/* C-callable: gte_leaf_call(file, leaf, op) -- bloom's self-test. */
+	.balign	4
+	.global	_gte_leaf_call
+	.type	_gte_leaf_call, @function
+_gte_leaf_call:
+	sts.l	pr, @-r15
+	stc.l	gbr, @-r15
+	mov	#66, r0
+	shll2	r0
+	sub	r0, r4
+	ldc	r4, gbr
+	mov	r6, r1
+	jsr	@r5
+	 nop
+	ldc.l	@r15+, gbr
+	lds.l	@r15+, pr
+	rts
+	 nop
+	.size	_gte_leaf_call, . - _gte_leaf_call

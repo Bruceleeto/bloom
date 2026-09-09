@@ -249,15 +249,22 @@ _fgl_shim_call_st:
 	.globl	_fgl_shim_gte
 	.type	_fgl_shim_gte, @function
 _fgl_shim_gte:
+	/* NO CYCLE RECONCILIATION.  A COP2 body reads and writes the register
+	 * file and nothing else -- it cannot advance the guest clock, take an
+	 * exception, or re-enter the recompiler -- so the pair the dispatcher
+	 * holds in registers cannot have moved while it ran.  Publishing and
+	 * reloading it either side was four instructions on every command.
+	 *
+	 * With every command now a leaf (fgl_gte_leaf, gte_rtp.S) generated
+	 * code no longer reaches this at all; it stays for the builds that
+	 * force the C bodies. */
 	SHIM_ENTER
 	mov	r0, r7			/* the callee, out of the way */
 	mov	r1, r5			/* argument two: the command word */
-	SHIM_CYCLES_OUT
 	mov.w	1f, r0
 	stc	gbr, r4
 	jsr	@r7
 	 add	r0, r4			/* argument one: &regs.cp2d */
-	SHIM_CYCLES_IN
 	SHIM_LEAVE
 	.align	2
 1:	.word	FGL_AT_CP2D * 4

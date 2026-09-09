@@ -2026,6 +2026,22 @@ static void emit_gte(fgl_emitter *e, const ir_node *p)
 	if (!body)
 		return;
 
+	/* BLEEM'S SHAPE, where a leaf exists: the routine's address in r0 and
+	 * a `jsr`, nothing else.  No shim, no saved r2-r7, no cycle
+	 * reconciliation -- the leaf keeps the contract itself and never
+	 * calls C, so the cycle pair cannot have moved. */
+	if (e->tgt->gte_leaf) {
+		uint32_t leaf = e->tgt->gte_leaf(e->tgt->user, p->imm);
+
+		if (leaf) {
+			emit_const(e, leaf & ~1u, FGL_R_XFER);
+			if (leaf & 1u)
+				emit_const(e, p->imm, FGL_R_T1);
+			emit_jsr_slot(e, FGL_R_XFER);
+			return;
+		}
+	}
+
 	/* The allocator owes this node a scratch register, because `jsr` wants
 	 * its target in a general register and r0 and r1 are both carrying
 	 * arguments. Without one there is nowhere to put the shim's address. */

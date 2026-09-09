@@ -32,12 +32,19 @@
  * Copyright (C) 2026 bloom contributors
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <libpcsxcore/r3000a.h>
 #include <libpcsxcore/gte.h>
 #include <libpcsxcore/gte_divider.h>
 #include <libpcsxcore/psxinterpreter.h>
+
+/* The assembly path (src/gte_rtp.S): native on the SH-4, and on Linux the
+ * same code under the SH-4 interpreter (fgl/gte_sh4.c, -DFGL_GTE_ASM). */
+#if defined(__sh__) || defined(FGL_GTE_ASM)
+#define GTE_ASM 1
+#endif
 
 #include "bloom-config.h"
 #include "gte_fpu.h"
@@ -176,6 +183,7 @@ struct gte_hot {
 } __attribute__((aligned(32)));
 
 struct gte_hot gte_hot = { .xmtrx_key = -1, .xmtrx_mx = -1 };
+_Static_assert(sizeof(struct gte_hot) == 32, "gte_sh4.c maps 32 bytes");
 
 #define gte_flag	(gte_hot.flag)
 
@@ -351,6 +359,7 @@ struct gte_col_cache {
 
 static struct gte_rot_cache gte_rot[3];
 struct gte_col_cache gte_col[3][4];
+_Static_assert(sizeof(gte_col) == 384, "gte_sh4.c maps 384 bytes");
 static u32 gte_mtx_serial;
 
 #ifdef GTE_CACHE_STATS
@@ -378,7 +387,7 @@ static void gte_stat_tick(void)
  * serial moves every time, so XMTRX reloads after every rebuild; that is ten
  * instructions.
  */
-#ifdef __sh__
+#ifdef GTE_ASM
 void gte_rot_convert(const u32 *src, float *m);
 #endif
 
@@ -391,7 +400,7 @@ static void gte_rot_rebuild(const psxCP2Regs *r, int mx)
 	c->gen = psxCP2CtrlGen;
 	c->serial = ++gte_mtx_serial;
 
-#ifdef __sh__
+#ifdef GTE_ASM
 	gte_rot_convert(&r->CP2C.r[mx * 8], c->m);
 	return;
 #endif
@@ -513,7 +522,7 @@ gte_mtx_use(const psxCP2Regs *r, int mx, int cv)
  * `CP2C` straight into the register file, which no counter can observe, so the
  * one path that does that says so explicitly.
  */
-#if defined(__sh__) && defined(GTE_RTP_SELFTEST)
+#if defined(GTE_ASM) && defined(GTE_RTP_SELFTEST)
 static void gte_rtp_selftest(void);
 #endif
 
@@ -521,7 +530,7 @@ void gte_fpu_reset(void)
 {
 	int i;
 
-#if defined(__sh__) && defined(GTE_RTP_SELFTEST)
+#if defined(GTE_ASM) && defined(GTE_RTP_SELFTEST)
 	gte_rtp_selftest();
 #endif
 
@@ -809,15 +818,28 @@ static void gte_floor3(float a, float b, float c, s32 *mac)
 
 static float gte_resident[16];
 
+#ifdef GTE_ASM
+/* The assembly runs under the SH-4 interpreter (gte_sh4.c), whose back bank
+ * is its XMTRX; the C stand-ins here keep reading gte_resident. */
+void gte_sh4_mtx_load(const float *m, const float *t);
+void gte_sh4_col_load(const float *t);
+#endif
+
 static void gte_mtx_load(const float *m, const float *t)
 {
 	memcpy(gte_resident, m, 12 * sizeof(float));
 	memcpy(gte_resident + 12, t, 4 * sizeof(float));
+#ifdef GTE_ASM
+	gte_sh4_mtx_load(m, t);
+#endif
 }
 
 static void gte_col_load(const float *t)
 {
 	memcpy(gte_resident + 12, t, 4 * sizeof(float));
+#ifdef GTE_ASM
+	gte_sh4_col_load(t);
+#endif
 }
 
 static void gte_xform(const s16 *v, s32 *mac)
@@ -826,8 +848,17 @@ static void gte_xform(const s16 *v, s32 *mac)
 	int i;
 
 	for (i = 0; i < 3; i++) {
+#ifdef GTE_ASM
+		/* The assembly's `ftrv` runs under the SH-4 interpreter
+		 * (fgl/gte_sh4.c), which accumulates in double and rounds
+		 * once; sum the same way so the self-test compares the
+		 * assembly's plumbing and not two summation orders. */
+		float acc = (float)((double)m[i] * v[0] + (double)m[4 + i] * v[1] +
+				    (double)m[8 + i] * v[2] + (double)m[12 + i]);
+#else
 		float acc = m[i] * (float)v[0] + m[4 + i] * (float)v[1] +
 			    m[8 + i] * (float)v[2] + m[12 + i];
+#endif
 
 		if (acc >= 2147483648.0f)
 			mac[i] = (s32)0x7fffffff;
@@ -1065,7 +1096,7 @@ gte_rtp_end_i(psxCP2Regs *r, u32 quotient)
 	gte_end(r);
 }
 
-#ifdef __sh__
+#ifdef GTE_ASM
 /*
  * On the target both transforms are `src/gte_rtp.S`: the same arithmetic as
  * the C below, without the compiler's double-precision detours around the
@@ -1167,7 +1198,7 @@ __attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
 	gte_rtp_end_i(r, quotient);
 }
 
-#ifdef __sh__
+#ifdef GTE_ASM
 #undef gte_fpu_rtps
 #undef gte_fpu_rtpt
 
@@ -1247,6 +1278,8 @@ static void gte_st_fill(psxCP2Regs *r)
 	r->CP2C.p[26].w.l = (gte_st_rnd() & 7) ? (gte_st_rnd() & 0x7ff)
 					      : (gte_st_rnd() & 0xffff);
 	r->CP2C.p[27].sw.l = gte_st_val(12, 15);
+	r->CP2C.p[29].sw.l = gte_st_val(12, 15);
+	r->CP2C.p[30].sw.l = gte_st_val(12, 15);
 	((s32 *)r->CP2C.r)[28] = gte_st_val(24, 31);
 }
 
@@ -1254,7 +1287,8 @@ static void gte_st_fill(psxCP2Regs *r)
 static int gte_st_run(int which, int n)
 {
 	static psxCP2Regs a, b;
-	static const char *names[] = { "RTPS", "RTPT", "MVMVA", "DPCS", "INTPL" };
+	static const char *names[] = { "RTPS", "RTPT", "MVMVA", "DPCS", "INTPL",
+				       "RTPS leaf", "RTPT leaf" };
 	int i, bad = 0;
 	u32 op = 0;
 
@@ -1278,7 +1312,7 @@ static int gte_st_run(int which, int n)
 			gte_intpl(&a, op);
 		else if (which == 2)
 			gte_mvmva_c(&a, op);
-		else if (which)
+		else if (which == 1 || which == 6)
 			gte_fpu_rtpt_c(&a);
 		else
 			gte_fpu_rtps_c(&a);
@@ -1290,11 +1324,17 @@ static int gte_st_run(int which, int n)
 			gte_intpl_fast(&b, op);
 		else if (which == 2)
 			gte_mvmva_fast(&b, op);
+		else if (which == 5)
+			gte_rtps_leaf_call(&b);
+		else if (which == 6)
+			gte_rtpt_leaf_call(&b);
 		else if (which)
 			gte_rtpt_fast(&b);
 		else
 			gte_rtps_fast(&b);
-		u32 fb = gte_hot.flag;
+		/* A leaf writes FLAG into the file and not gte_hot.flag; the
+		 * file compare below covers it. */
+		u32 fb = which >= 5 ? fa : gte_hot.flag;
 
 		if (memcmp(&a, &b, sizeof(a)) || fa != fb) {
 			if (bad < 4) {
@@ -1315,6 +1355,8 @@ static int gte_st_run(int which, int n)
 	}
 	return bad;
 }
+
+static void gte_nclip_cmd(psxCP2Regs *r);
 
 static void gte_rtp_selftest(void)
 {
@@ -1350,6 +1392,36 @@ static void gte_rtp_selftest(void)
 		printf("GTE selftest: rot_convert %d/2000 bad\n", bc);
 	}
 
+	{
+		/* The NCLIP leaf against the C, MAC0 and FLAG.  Every eighth
+		 * case is built from the extremes so both overflow flags are
+		 * exercised, not just the in-range path. */
+		static psxCP2Regs a, b;
+		int k, bn = 0;
+		for (k = 0; k < 4000; k++) {
+			gte_st_fill(&a);
+			if ((k & 7) == 0) {
+				u32 x = gte_st_rnd();
+				a.CP2D.r[12] = (x & 1) ? 0x80008000u : 0x7fff7fffu;
+				a.CP2D.r[13] = (x & 2) ? 0x7fff8000u : 0x80007fffu;
+				a.CP2D.r[14] = (x & 4) ? 0x80007fffu : x;
+			}
+			b = a;
+			gte_nclip_cmd(&a);
+			gte_nclip_leaf_call(&b);
+			if (a.CP2D.r[24] != b.CP2D.r[24] ||
+			    a.CP2C.r[31] != b.CP2C.r[31]) {
+				if (bn < 3)
+					printf("GTE selftest: NCLIP leaf %08x %08x %08x: C mac0 %08x flag %08x, leaf %08x %08x\n",
+					       a.CP2D.r[12], a.CP2D.r[13], a.CP2D.r[14],
+					       a.CP2D.r[24], a.CP2C.r[31],
+					       b.CP2D.r[24], b.CP2C.r[31]);
+				bn++;
+			}
+		}
+		printf("GTE selftest: NCLIP leaf %d/4000 bad\n", bn);
+	}
+
 	bs = gte_st_run(0, 4000);
 	bt = gte_st_run(1, 4000);
 	bm = gte_st_run(2, 4000);
@@ -1357,6 +1429,70 @@ static void gte_rtp_selftest(void)
 	bi = gte_st_run(4, 4000);
 	printf("GTE selftest: RTPS %d/4000 bad, RTPT %d/4000 bad, MVMVA %d/4000 bad, DPCS %d/4000 bad, INTPL %d/4000 bad\n",
 	       bs, bt, bm, bd, bi);
+	bs = gte_st_run(5, 4000);
+	bt = gte_st_run(6, 4000);
+	printf("GTE selftest: RTPS leaf %d/4000 bad, RTPT leaf %d/4000 bad\n", bs, bt);
+
+	{
+		/* Every integer leaf against pcsx's gte.c, the ground truth,
+		 * on the whole file: random sf/lm (MVMVA: every selector),
+		 * random registers, the extremes every eighth case. */
+		static const u8 fns[] = { 0x12, 0x10, 0x11, 0x28, 0x0c, 0x3d,
+			0x3e, 0x29, 0x2a, 0x2d, 0x2e, 0x1e, 0x20, 0x1b, 0x3f,
+			0x13, 0x16, 0x1c, 0x14 };
+		static psxCP2Regs a, b;
+		int f, total = 0;
+		char line[256];
+		int at = 0;
+
+		for (f = 0; f < (int)sizeof fns; f++) {
+			int leaf = gte_fpu_leaf_cmd(fns[f]) >> 1;
+			int k, bad = 0;
+			for (k = 0; k < 4000; k++) {
+				u32 x = gte_st_rnd();
+				u32 op = 0x4a000000u | fns[f] | ((x & 1) << 19) |
+					 ((x & 2) << 9);
+				if (fns[f] == 0x12)
+					op |= ((x >> 2) & 0x7f) << 13;
+				gte_st_fill(&a);
+				if ((k & 7) == 0) {
+					int j;
+					for (j = 0; j < 3; j++)
+						a.CP2D.p[9 + j].sw.l = (x >> j) & 8 ? 0x7fff : -0x8000;
+					a.CP2D.p[8].sw.l = (x & 0x40) ? 0x7fff : -0x8000;
+					for (j = 21; j < 24; j++)
+						((s32 *)a.CP2C.r)[j] = (x >> j) & 1 ? 0x7fffffff : (s32)0x80000000;
+					for (j = 5; j < 8; j++)
+						((s32 *)a.CP2C.r)[j] = (x >> j) & 1 ? 0x7fffffff : (s32)0x80000000;
+					for (j = 13; j < 16; j++)
+						((s32 *)a.CP2C.r)[j] = (x >> j) & 1 ? 0x7fffffff : (s32)0x80000000;
+				}
+				b = a;
+				gteDispatch(&a, op);
+				gte_leaf_call(leaf, &b, op);
+				if (memcmp(&a, &b, sizeof(a))) {
+					if (bad < 8) {
+						int w;
+						printf("GTE selftest: %s leaf op %08x:", gte_fpu_leaf_name(leaf), op);
+						for (w = 0; w < 64; w++)
+							if (((u32 *)&a)[w] != ((u32 *)&b)[w])
+								printf(" r%d %08x/%08x", w, ((u32 *)&a)[w], ((u32 *)&b)[w]);
+						printf("\n");
+					}
+					bad++;
+				}
+			}
+			total += bad;
+			at += snprintf(line + at, sizeof line - at, "%s %d ",
+				       gte_fpu_leaf_name(leaf), bad);
+			if (at > 200) {
+				printf("GTE selftest: leaves bad/4000: %s\n", line);
+				at = 0;
+			}
+		}
+		printf("GTE selftest: leaves bad/4000: %s\n", line);
+		printf("GTE selftest: integer leaves %d bad in total\n", total);
+	}
 }
 #endif
 #endif
@@ -1487,7 +1623,7 @@ static void gte_mac_to_rgb(psxCP2Regs *r)
  * exactly.  Both go down the integer path, which is the reference's arithmetic
  * transcribed; it is exact, and neither case is one a game issues in a loop.
  */
-#ifdef __sh__
+#ifdef GTE_ASM
 void gte_mvmva_asm(psxCP2Regs *r, const s16 *v, int stride,
 		   struct gte_hot *hot);
 static void gte_mvmva_c(psxCP2Regs *r, u32 op);
@@ -1565,7 +1701,7 @@ GTE_CMD void gte_mvmva(psxCP2Regs *r, u32 op)
 	gte_end(r);
 }
 
-#ifdef __sh__
+#ifdef GTE_ASM
 #undef gte_mvmva
 
 void gte_mvmva_sf0_asm(psxCP2Regs *r, const s16 *v, const s16 *m,
@@ -2053,7 +2189,7 @@ gte_intpl(psxCP2Regs *r, u32 op)
 static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 {
 	switch (op & 0x3f) {
-#ifdef __sh__
+#ifdef GTE_ASM
 	case 0x01: gte_rtps_fast(r); break;
 	case 0x10: gte_dpcs_fast(r, op); break;
 	case 0x11: gte_intpl_fast(r, op); break;
@@ -2079,7 +2215,7 @@ static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 	case 0x2a: gte_dpct(r); break;
 	case 0x2d: gte_avsz3(r); break;
 	case 0x2e: gte_avsz4(r); break;
-#ifndef __sh__
+#ifndef GTE_ASM
 	case 0x30: gte_fpu_rtpt(r); break;
 #endif
 	case 0x3d: gte_gpf(r, op); break;
@@ -2139,6 +2275,50 @@ void gte_fpu_cmd(psxCP2Regs *r, u32 op)
  * rely on.
  *
  */
+int gte_fpu_leaf_cmd(u32 op)
+{
+#ifdef GTE_ASM
+	/* | 1: the leaf reads sf/lm (and MVMVA its selectors) from r1. */
+	switch (op & 0x3f) {
+	case 0x01: return GTE_LEAF_RTPS << 1;
+	case 0x06: return GTE_LEAF_NCLIP << 1;
+	case 0x0c: return (GTE_LEAF_OP << 1) | 1;
+	case 0x10: return (GTE_LEAF_DPCS << 1) | 1;
+	case 0x11: return (GTE_LEAF_INTPL << 1) | 1;
+	case 0x12: return (GTE_LEAF_MVMVA << 1) | 1;
+	case 0x13: return (GTE_LEAF_NCDS << 1) | 1;
+	case 0x14: return (GTE_LEAF_CDP << 1) | 1;
+	case 0x16: return (GTE_LEAF_NCDT << 1) | 1;
+	case 0x1b: return (GTE_LEAF_NCCS << 1) | 1;
+	case 0x1c: return (GTE_LEAF_CC << 1) | 1;
+	case 0x1e: return (GTE_LEAF_NCS << 1) | 1;
+	case 0x20: return (GTE_LEAF_NCT << 1) | 1;
+	case 0x28: return (GTE_LEAF_SQR << 1) | 1;
+	case 0x29: return (GTE_LEAF_DCPL << 1) | 1;
+	case 0x2a: return (GTE_LEAF_DPCT << 1) | 1;
+	case 0x2d: return GTE_LEAF_AVSZ3 << 1;
+	case 0x2e: return GTE_LEAF_AVSZ4 << 1;
+	case 0x30: return GTE_LEAF_RTPT << 1;
+	case 0x3d: return (GTE_LEAF_GPF << 1) | 1;
+	case 0x3e: return (GTE_LEAF_GPL << 1) | 1;
+	case 0x3f: return (GTE_LEAF_NCCT << 1) | 1;
+	default: break;
+	}
+#endif
+	(void)op;
+	return 0;
+}
+
+const char *gte_fpu_leaf_name(int leaf)
+{
+	static const char *const names[GTE_LEAF_N] = {
+		NULL, "nclip", "rtps", "rtpt", "mvmva", "dpcs", "intpl", "sqr",
+		"op", "gpf", "gpl", "dcpl", "dpct", "avsz3", "avsz4", "ncs",
+		"nct", "nccs", "ncct", "ncds", "ncdt", "cc", "cdp",
+	};
+	return (leaf > 0 && leaf < GTE_LEAF_N) ? names[leaf] : NULL;
+}
+
 void *gte_fpu_resolve(u32 op)
 {
 	switch (op & 0x3f) {
@@ -2148,7 +2328,7 @@ void *gte_fpu_resolve(u32 op)
 	case 0x11: return (void *)gte_shadow_intpl;
 	case 0x12: return (void *)gte_shadow_mvmva;
 	case 0x30: return (void *)gte_shadow_rtpt;
-#elif defined(__sh__)
+#elif defined(GTE_ASM)
 	case 0x01: return (void *)(GTE_FAST & 1 ? gte_rtps_fast : gte_fpu_rtps);
 	case 0x10: return (void *)(GTE_FAST & 2 ? gte_dpcs_fast : gte_dpcs);
 	case 0x11: return (void *)(GTE_FAST & 4 ? gte_intpl_fast : gte_intpl);
@@ -2159,7 +2339,7 @@ void *gte_fpu_resolve(u32 op)
 #endif
 	case 0x06: return (void *)gte_nclip_cmd;
 	case 0x0c: return (void *)gte_op;
-#ifndef __sh__
+#ifndef GTE_ASM
 	case 0x10: return (void *)gte_dpcs;
 	case 0x11: return (void *)gte_intpl;
 	case 0x12: return (void *)gte_mvmva;
@@ -2176,7 +2356,7 @@ void *gte_fpu_resolve(u32 op)
 	case 0x2a: return (void *)gte_dpct;
 	case 0x2d: return (void *)gte_avsz3;
 	case 0x2e: return (void *)gte_avsz4;
-#ifndef __sh__
+#ifndef GTE_ASM
 	case 0x30: return (void *)gte_fpu_rtpt;
 #endif
 	case 0x3d: return (void *)gte_gpf;
@@ -2202,10 +2382,12 @@ int gte_fpu_nclip_inline(void)
  * interpreter and the GTE-in-a-delay-slot path in `psxException` - assign it
  * before dispatching, so one function serves all sixty-four slots.
  */
+#ifndef FGL_LINUX
 static void gte_fpu_slot(psxCP2Regs *r)
 {
 	gte_fpu_cmd(r, psxRegs.code);
 }
+#endif
 
 /*
  * Take the table over, so a core that dispatches through it gets this GTE too.
@@ -2214,8 +2396,13 @@ static void gte_fpu_slot(psxCP2Regs *r)
  */
 void gte_fpu_install(void)
 {
+#ifdef FGL_LINUX
+	/* No psxCP2[] table here: fgl_gte_dispatch (fgl_run.c) is the one
+	 * entry for the dispatcher and the lockstep oracle alike. */
+#else
 	int i;
 
 	for (i = 0; i < 64; i++)
 		psxCP2[i] = gte_fpu_slot;
+#endif
 }
