@@ -105,6 +105,15 @@ if (WITH_EMITMISS)
 	add_compile_definitions(BLOOM_EMITMISS=1 FGL_BLOCK_COUNT=1)
 endif (WITH_EMITMISS)
 
+# WHICH FUNCTIONS THE FRAME RUNS (src/hotset.h).  TMU2 interrupts a couple of
+# thousand times a second and buckets the interrupted PC, so the report is a
+# ranked list of 128-byte code regions plus the emitted/native split.  Resolve
+# it with tools/hotset_resolve.py and feed the result to tools/icache_alias.py.
+option(WITH_HOTSET "Sample the PC to find the frame's hot code" OFF)
+if (WITH_HOTSET)
+	add_compile_definitions(BLOOM_HOTSET=1)
+endif (WITH_HOTSET)
+
 # THE HEAD-TO-HEAD AGAINST GNU LIGHTNING (src/perfcmp.c).  The same five
 # SH7750 events the lightning tree rotates through, one per one-second window,
 # printed in the same units so the two logs line up.  Both trees load the same
@@ -291,6 +300,7 @@ add_executable(bloom
 	src/mmap.c
 	src/platform.c
 	src/emitmiss.c
+	src/hotset.c
 	src/perfcmp.c
 	src/plugins.c
 )

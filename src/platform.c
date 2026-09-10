@@ -25,6 +25,7 @@
 #include "overlay.h"
 #include "perf.h"
 #include "emitmiss.h"
+#include "hotset.h"
 #include "perfcmp.h"
 #include "pvr.h"
 
@@ -520,6 +521,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 
 	frames++;
 	EMITMISS_VSYNC();
+	HOTSET_VSYNC();
 
 	if (timer_ms == 0) {
 		timer_ms = new_timer;

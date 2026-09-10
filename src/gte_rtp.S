@@ -86,7 +86,8 @@
 42:	mov	r9, r0
 	mov.w	r0, @(\szoff, r6)
 
-	/* quotient = limE(H * 65536 / SZ + 0.5), all-ones when H >= 2 SZ */
+	/* POC: q = H / SZ in float -> fr4 (bleem's shape, no integer quotient,
+	 * no rounding), limE flagged when H >= 2 SZ */
 	mov.w	@(0, r3), r0
 	extu.w	r0, r0
 	mov	r9, r10
@@ -94,33 +95,17 @@
 	cmp/hs	r10, r0
 	bt	52f
 	lds	r0, fpul
-	float	fpul, fr0
-	fmul	fr8, fr0
+	float	fpul, fr4
 	lds	r9, fpul
 	float	fpul, fr1
-	fdiv	fr1, fr0
-	fadd	fr10, fr0
-	ftrc	fr0, fpul
-	sts	fpul, r0
-	mov.l	82f, r10
-	cmp/hi	r10, r0
-	bt	52f
-53:	mov	r0, r10
-
-	/* qs = quotient / 65536 -> fr0 */
-	lds	r0, fpul
-	float	fpul, fr0
-	fmul	fr9, fr0
-
-	/* SX = limG1(project(ofx + IR1 * qs)) -> r9 */
+	fdiv	fr1, fr4
+53:
+	/* SX = limG1(ofx + IR1 * q) -> r9, no project saturation */
 	lds	r1, fpul
 	float	fpul, fr1
 	fmov	fr6, fr2
+	fmov	fr4, fr0
 	fmac	fr0, fr1, fr2
-	fcmp/gt	fr2, fr11
-	bf	61f
-	fcmp/gt	fr2, fr5
-	bt	62f
 	ftrc	fr2, fpul
 	sts	fpul, r0
 63:	mov.w	85f, r1
@@ -131,15 +116,12 @@
 	bf	64f
 66:	extu.w	r0, r9
 
-	/* SY = limG2(project(ofy + IR2 * qs)), packed with SX */
+	/* SY = limG2(ofy + IR2 * q), packed with SX */
 	lds	r8, fpul
 	float	fpul, fr1
 	fmov	fr7, fr2
+	fmov	fr4, fr0
 	fmac	fr0, fr1, fr2
-	fcmp/gt	fr2, fr11
-	bf	71f
-	fcmp/gt	fr2, fr5
-	bt	72f
 	ftrc	fr2, fpul
 	sts	fpul, r0
 73:	mov.w	85f, r1
@@ -202,24 +184,15 @@
 	bra	42b
 	 nop
 
-	/* limE, also the H >= 2 SZ path (all-ones limits the same way) */
+	/* limE, also the H >= 2 SZ path: q = 0x1ffff / 65536 */
 52:	mov.l	95f, r10
 	or	r10, r7
 	mov.l	82f, r0
+	lds	r0, fpul
+	float	fpul, fr4
 	bra	53b
-	 nop
+	 fmul	fr9, fr4
 
-	/* SX projection saturated high / low, then through limG1 */
-61:	mov.l	96f, r1
-	or	r1, r7
-	mov.w	83f, r0
-	bra	63b
-	 nop
-62:	mov.l	97f, r1
-	or	r1, r7
-	mov.w	84f, r0
-	bra	63b
-	 nop
 	/* limG1: r1 holds the bound that failed */
 64:	mov.l	98f, r0
 	or	r0, r7
@@ -227,16 +200,6 @@
 	 mov	r1, r0
 
 	/* SY */
-71:	mov.l	96f, r1
-	or	r1, r7
-	mov.w	83f, r0
-	bra	73b
-	 nop
-72:	mov.l	97f, r1
-	or	r1, r7
-	mov.w	84f, r0
-	bra	73b
-	 nop
 74:	mov.l	100f, r0
 	or	r0, r7
 	bra	76b
@@ -297,23 +260,21 @@
 
 /* The depth cue from the last quotient (r10), the flag word out, return. */
 .macro RTP_LEAVE
-	mov.w	@(4, r3), r0		/* DQA, sign-extended */
-	dmuls.l	r0, r10
-	mov.l	@(8, r3), r1		/* DQB */
-	mov	r1, r0
-	shll	r0
-	subc	r0, r0			/* sign of DQB, 64-bit */
-	sts	macl, r9
-	sts	mach, r8
-	clrt
-	addc	r1, r9
-	addc	r0, r8
-	mov.l	r9, @(32, r6)		/* MAC0 = low word */
-	mov	#20, r0
-	shld	r0, r8
+	/* POC: MAC0 = ftrc(DQB + DQA * 65536 * q) in float */
+	mov.w	@(4, r3), r0		/* DQA */
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr8, fr0
+	fmul	fr4, fr0
+	mov.l	@(8, r3), r0		/* DQB */
+	lds	r0, fpul
+	float	fpul, fr1
+	fadd	fr1, fr0
+	ftrc	fr0, fpul
+	sts	fpul, r9
+	mov.l	r9, @(32, r6)		/* MAC0 */
 	mov	#-12, r0
-	shld	r0, r9
-	or	r8, r9			/* (tmp >> 12) as s32 */
+	shad	r0, r9
 	mov.w	4f, r0
 	cmp/gt	r0, r9
 	bt	1f
@@ -1288,7 +1249,8 @@ _gte_mvmva_sf0_asm:
  *
  * THE LEAF CONTRACT (fgl.h, "a service may clobber r0 and r1 and nothing
  * else"): entered by `jsr` from inside a block with GBR = the state block.
- * May clobber r0, r1, PR, MACH, MACL and T.  Preserves r2-r15 and GBR.  The
+ * May clobber r0-r6, PR, MACH, MACL and T (r3 comes back as GBR).  Preserves
+ * r7-r15 and GBR.  The
  * file is at GBR + FGL_AT_CP2D * 4 (fgl_state.h; 264, asserted in gte_sh4.c
  * and fgl_lightrec.c).  Never calls C.
  *
@@ -1304,11 +1266,7 @@ _gte_mvmva_sf0_asm:
 	.global	_gte_nclip_leaf
 	.type	_gte_nclip_leaf, @function
 _gte_nclip_leaf:
-	mov.l	r2, @-r15
-	mov.l	r3, @-r15
-	mov.l	r4, @-r15
 	mov.w	3f, r0			/* FGL_AT_CP2D * 4 */
-	mov.l	r5, @-r15
 	stc	gbr, r4
 	add	r0, r4			/* r4 = &cp2d */
 	mov.l	@(48, r4), r0		/* SXY0 */
@@ -1359,11 +1317,8 @@ _gte_nclip_leaf:
 	mov.w	4f, r0
 	add	r4, r0
 	mov.l	r1, @r0			/* FLAG */
-	mov.l	@r15+, r5
-	mov.l	@r15+, r4
-	mov.l	@r15+, r3
 	rts
-	 mov.l	@r15+, r2
+	 stc	gbr, r3			/* the guest-file base, see pins.h */
 3:	.word	264			/* FGL_AT_CP2D * 4 */
 4:	.word	252			/* cp2c[31]: 128 + 31 * 4 */
 	.align	2
@@ -1544,10 +1499,6 @@ _gte_nclip_leaf_call:
  * CTC2 (generation moved).  xmtrx_mx stays -1 so the column-only reload in
  * gte_mtx_use_slow never fires on the leaf's matrix. */
 .macro RTP_ENTER_LEAF
-	mov.l	r2, @-r15
-	mov.l	r3, @-r15
-	mov.l	r4, @-r15
-	mov.l	r6, @-r15
 	mov.l	r7, @-r15
 	mov.l	r8, @-r15
 	mov.l	r9, @-r15
@@ -1616,23 +1567,21 @@ _gte_nclip_leaf_call:
  * the XMTRX cache told it no longer holds what it thinks, and everything the
  * prologue saved put back. */
 .macro RTP_LEAVE_LEAF
-	mov.w	@(4, r3), r0		/* DQA, sign-extended */
-	dmuls.l	r0, r10
-	mov.l	@(8, r3), r1		/* DQB */
-	mov	r1, r0
-	shll	r0
-	subc	r0, r0			/* sign of DQB, 64-bit */
-	sts	macl, r9
-	sts	mach, r8
-	clrt
-	addc	r1, r9
-	addc	r0, r8
-	mov.l	r9, @(32, r6)		/* MAC0 = low word */
-	mov	#20, r0
-	shld	r0, r8
+	/* POC: MAC0 = ftrc(DQB + DQA * 65536 * q) in float */
+	mov.w	@(4, r3), r0		/* DQA */
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr8, fr0
+	fmul	fr4, fr0
+	mov.l	@(8, r3), r0		/* DQB */
+	lds	r0, fpul
+	float	fpul, fr1
+	fadd	fr1, fr0
+	ftrc	fr0, fpul
+	sts	fpul, r9
+	mov.l	r9, @(32, r6)		/* MAC0 */
 	mov	#-12, r0
-	shld	r0, r9
-	or	r8, r9			/* (tmp >> 12) as s32 */
+	shad	r0, r9
 	mov.w	4f, r0
 	cmp/gt	r0, r9
 	bt	1f
@@ -1644,12 +1593,9 @@ _gte_nclip_leaf_call:
 	mov.l	@r15+, r10
 	mov.l	@r15+, r9
 	mov.l	@r15+, r8
-	mov.l	@r15+, r7
-	mov.l	@r15+, r6
-	mov.l	@r15+, r4
-	mov.l	@r15+, r3
+	stc	gbr, r3			/* the guest-file base, see pins.h */
 	rts
-	 mov.l	@r15+, r2
+	 mov.l	@r15+, r7
 1:	mov.w	4f, r1
 	or	r1, r7
 	bra	3b
@@ -1732,7 +1678,8 @@ _gte_rtpt_leaf:
  *
  * The leaf contract is the one above: entered by jsr, GBR = the state block,
  * the file at GBR + 264, r1 = the op word for the commands that take one.
- * Clobbers r0, r1, PR, MACH, MACL, T.  Preserves r2-r15 and GBR.
+ * Clobbers r0-r6, PR, MACH, MACL, T (r3 comes back as GBR).  Preserves r7-r15
+ * and GBR.
  *
  * Register plan for all of them (gl_*):
  *   r4   the file                 r2   file + 32: IR0 @0, IR1..3 @4/8/12
@@ -1929,11 +1876,6 @@ _gte_rtpt_leaf:
  * the file, park the op word, decode sf and lm. */
 .macro ILEAF_ENTER
 	sts.l	pr, @-r15
-	mov.l	r2, @-r15
-	mov.l	r3, @-r15
-	mov.l	r4, @-r15
-	mov.l	r5, @-r15
-	mov.l	r6, @-r15
 	mov.l	r7, @-r15
 	mov.l	r8, @-r15
 	mov.l	r9, @-r15
@@ -1983,14 +1925,9 @@ _gte_rtpt_leaf:
 	mov.l	@r15+, r9
 	mov.l	@r15+, r8
 	mov.l	@r15+, r7
-	mov.l	@r15+, r6
-	mov.l	@r15+, r5
-	mov.l	@r15+, r4
-	mov.l	@r15+, r3
-	mov.l	@r15+, r2
 	lds.l	@r15+, pr
 	rts
-	 nop
+	 stc	gbr, r3			/* the guest-file base, see pins.h */
 	.align	2
 98:	.long	0x7f87e000
 .endm
@@ -2423,45 +2360,182 @@ gl_rc2_sf0:
 	rts
 	 nop
 
+/*
+ * POC (2026-09-10): DPCS and INTPL in bleem's shape (asm/gte_cop2.md 13.1).
+ * Float intermediates, one ftrc per MAC, no 44-bit overflow flags, sf=1
+ * assumed, only the IR saturation flags written (no master bit).  Leaf
+ * contract: r0-r6 and fr0-fr13 clobbered, r7-r14 kept, r3 rebuilt from gbr.
+ * Nothing pushed.
+ *
+ *   r4 file+16 (RGBC @8, IR0 @16, IRn @16+4n)   r2 file+64 (RGB0..2 @16/20/24,
+ *   MACn @32+4n)   r1 -> FC   r5 RGBC, a byte shifted out per component
+ *   r6 the colour word   r3 FLAG
+ *   fr8 IR0/4096  fr9 32767.0  fr10 -32768.0  fr11 IR min (lm)  fr12 255.0
+ *   fr13 1/16
+ */
+.macro FL_ENTER
+	mov	#70, r0
+	shll2	r0			/* 280 = file + 16 */
+	stc	gbr, r4
+	add	r0, r4
+	mov	r4, r2
+	add	#48, r2			/* file + 64 */
+	mov.l	@(20, r2), r0
+	mov.l	r0, @(16, r2)		/* RGB0 = RGB1 */
+	mov.l	@(24, r2), r0
+	mov.l	r0, @(20, r2)		/* RGB1 = RGB2 */
+	mov.l	@(8, r4), r5		/* RGBC */
+	mov.l	fl_c0, r0
+	lds	r0, fpul
+	fsts	fpul, fr8		/* 1/4096 */
+	mov.l	fl_c1, r0
+	lds	r0, fpul
+	fsts	fpul, fr9		/* 32767.0 */
+	mov.l	fl_c2, r0
+	lds	r0, fpul
+	fsts	fpul, fr10		/* -32768.0 */
+	mov.l	fl_c3, r0
+	lds	r0, fpul
+	fsts	fpul, fr12		/* 255.0 */
+	mov.l	fl_c4, r0
+	lds	r0, fpul
+	fsts	fpul, fr13		/* 1/16 */
+	fmov	fr10, fr11
+	mov	r1, r0
+	shlr8	r0
+	tst	#4, r0			/* lm */
+	bt	1f
+	fldi0	fr11
+1:	mov.w	@(16, r4), r0		/* IR0 */
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr0, fr8		/* IR0 / 4096 */
+	mov	#98, r1
+	shll	r1
+	add	r4, r1			/* FC */
+	mov	#0, r3
+	mov	#0, r6
+.endm
+
+/* fr1 = lim16(FCn - fr0), then fr1 = fr0 + IR0/4096 * fr1 = MACn. */
+.macro FL_MAC
+	mov.l	@r1+, r0
+	lds	r0, fpul
+	float	fpul, fr1		/* FCn */
+	fsub	fr0, fr1
+	fcmp/gt	fr9, fr1
+	bf	1f
+	fmov	fr9, fr1
+1:	fcmp/gt	fr1, fr10
+	bf	2f
+	fmov	fr10, fr1
+2:	fmul	fr8, fr1
+	fadd	fr0, fr1
+.endm
+
+/* fr1 = MACn: store it, IRn = lim(MACn) with flag bit 25-n, byte n-1 of r6. */
+.macro FL_OUT n
+	ftrc	fr1, fpul
+	sts	fpul, r0
+	mov.l	r0, @(32 + 4 * \n, r2)	/* MACn */
+	fmov	fr1, fr0
+	fcmp/gt	fr9, fr0
+	bt	3f
+	fcmp/gt	fr0, fr11
+	bf	4f
+	bra	5f
+	 fmov	fr11, fr0
+3:	fmov	fr9, fr0
+5:	mov	#0x40, r0
+	shll16	r0
+	.if \n == 1
+	shll2	r0
+	.elseif \n == 2
+	shll	r0
+	.endif
+	or	r0, r3
+4:	ftrc	fr0, fpul
+	sts	fpul, r0
+	mov.w	r0, @(16 + 4 * \n, r4)	/* IRn */
+	fmul	fr13, fr1		/* MAC / 16 */
+	fcmp/gt	fr12, fr1
+	bf	6f
+	fmov	fr12, fr1
+6:	fldi0	fr0
+	fcmp/gt	fr0, fr1
+	bt	7f
+	fmov	fr0, fr1
+7:	ftrc	fr1, fpul
+	sts	fpul, r0
+	.if \n == 2
+	shll8	r0
+	.elseif \n == 3
+	shll16	r0
+	.endif
+	or	r0, r6
+.endm
+
+/* r5 holds CODE in its low byte. */
+.macro FL_LEAVE
+	shll16	r5
+	shll8	r5
+	or	r5, r6
+	mov.l	r6, @(24, r2)		/* RGB2 */
+	mov	#59, r0
+	shll2	r0			/* 236 = FLAG - 16 */
+	mov.l	r3, @(r0, r4)
+	rts
+	 stc	gbr, r3
+.endm
+
 	.balign	4
 	.global	_gte_dpcs_leaf
 	.type	_gte_dpcs_leaf, @function
 _gte_dpcs_leaf:
-	ILEAF_ENTER
-	SHIFT_RGB
-	mov.l	@(24, r4), r0		/* RGB */
-	RGB_TO_MAC16
-	mov	#4, r8
-	shll8	r8
-	add	#24, r8			/* writeback, RGB2 */
-	bsr	gl_rc2
-	 nop
-	ILEAF_LEAVE
+	FL_ENTER
+.macro FLD_COMP n
+	extu.b	r5, r0
+	shlr8	r5
+	shll2	r0
+	shll2	r0
+	lds	r0, fpul
+	float	fpul, fr0		/* 16 * Cn */
+	FL_MAC
+	FL_OUT \n
+.endm
+	FLD_COMP 1
+	FLD_COMP 2
+	FLD_COMP 3
+	FL_LEAVE
 	.size	_gte_dpcs_leaf, . - _gte_dpcs_leaf
 
 	.balign	4
 	.global	_gte_intpl_leaf
 	.type	_gte_intpl_leaf, @function
 _gte_intpl_leaf:
-	ILEAF_ENTER
-	SHIFT_RGB
-.macro INTPL_MAC n
-	mov.w	@(4 * \n, r2), r0
-	shll8	r0
-	shll2	r0
-	shll2	r0			/* IRn << 12 */
-	mov.l	r0, @(32 + 4 * \n, r6)
+	FL_ENTER
+	shlr16	r5
+	shlr8	r5			/* CODE */
+.macro FLI_COMP n
+	mov.w	@(16 + 4 * \n, r4), r0
+	lds	r0, fpul
+	float	fpul, fr0		/* IRn */
+	FL_MAC
+	FL_OUT \n
 .endm
-	INTPL_MAC 1
-	INTPL_MAC 2
-	INTPL_MAC 3
-	mov	#4, r8
-	shll8	r8
-	add	#24, r8
-	bsr	gl_rc2
-	 nop
-	ILEAF_LEAVE
+	FLI_COMP 1
+	FLI_COMP 2
+	FLI_COMP 3
+	FL_LEAVE
 	.size	_gte_intpl_leaf, . - _gte_intpl_leaf
+
+	.align	2
+fl_c0:	.long	0x39800000		/* 1/4096 */
+fl_c1:	.long	0x46fffe00		/* 32767.0 */
+fl_c2:	.long	0xc7000000		/* -32768.0 */
+fl_c3:	.long	0x437f0000		/* 255.0 */
+fl_c4:	.long	0x3d800000		/* 1/16 */
+
 
 	.balign	4
 	.global	_gte_dcpl_leaf

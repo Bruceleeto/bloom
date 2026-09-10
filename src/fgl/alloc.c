@@ -550,7 +550,7 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                         p->hs = host_src(&s, p->rs);
                         p->ht = host_src(&s, p->rt);
                         /* A HALF NOTHING READS GETS NO REGISTER.
-                         *
+                          *
                          * Not an optimisation -- a correctness requirement
                          * that comes with the emitter's right to skip a dead
                          * half. `host_dst` claims a pinned register and the
@@ -618,7 +618,24 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                          * writes the COP2 file in the state block. What it
                          * does need is somewhere to put the shim's address,
                          * because `jsr` cannot take it in r0 or r1 and both
-                         * of those are carrying the call's arguments. */
+                         * of those are carrying the call's arguments.
+                         *
+                         * THE LEAF CONTRACT (gte_rtp.S): a leaf may clobber
+                         * r0-r6 and must keep r7-r14; r3 it rebuilds from GBR.
+                         * So the three rotating registers are evicted here --
+                         * stored if dirty, reloaded on their next use -- which
+                         * is what lets every leaf drop eight pushes and pops.
+                         * `used` is set so no preload is hoisted into them
+                         * across the call. */
+                        {
+                                int h;
+
+                                for (h = 0; h < ALLOC_N; h++)
+                                        if (ir_pin[h] < 0) {
+                                                evict(&s, h);
+                                                s.used[h] = 1;
+                                        }
+                        }
                         scratch(&s, p, 1);
                         break;
 
