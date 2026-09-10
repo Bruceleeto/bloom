@@ -9,6 +9,8 @@
  * wanted by something else, or when the block ends, and never speculatively.
  */
 
+#include <string.h>
+
 #include "alloc.h"
 #include "fgl.h"
 #include "fgl_state.h"
@@ -108,6 +110,8 @@ typedef struct {
         uint8_t   wrote[ALLOC_N];       /* ...and whether it was a write     */
         int8_t    where[GUEST_HI + 1];  /* pool index per guest register     */
         uint8_t   defined[GUEST_HI + 1];/* written somewhere in this block   */
+        uint8_t   lastuse[GUEST_HI + 1];/* last node mentioning it, 0xff none */
+        uint16_t  claim[ALLOC_N];       /* node that took it, 0xffff none    */
         uint8_t   rank[RANK_BYTES];
         int       node;                 /* the node being allocated for      */
         ir_alloc *a;
@@ -127,16 +131,83 @@ static void touch(allocator *s, int h)
                 s->rank[b] = lru_tab[k][s->rank[b]];
 }
 
-/* The ranks are a permutation, so exactly one register has rank 0 and there is
- * no case where nothing comes back. */
+/* WHAT EVICTING A SLOT ACTUALLY COSTS, in instructions that would not have
+ * been emitted anyway.  LRU answers "who is oldest", which is not the same
+ * question and gets the answer wrong in the one case that matters.
+ *
+ * A dirty non-pinned register is stored by the exit flush regardless, so
+ * evicting it moves that store earlier and adds nothing.  A PIN SITTING AT
+ * HOME is the opposite: the flush skips its store (it is already where the
+ * next block expects it) and skips its reload, so taking it creates both -- a
+ * store here and a reload at the exit.  A pin is worth two of anything else,
+ * and LRU will spend one to save a register that dies on the next node.
+ *
+ * The last term is the reload this block will need if the value is read
+ * again.  `lastuse` over-approximates -- a later mention that is a pure write
+ * needs no reload -- which can only make a victim look dearer than it is. */
+static int evict_cost(const allocator *s, int h)
+{
+        int g = s->owner[h];
+        int cost = 0;
+
+        if (g < 0)
+                return 0;               /* empty */
+
+        if (ir_pin[h] == (int8_t)g)
+                cost += s->dirty[h] ? 2 : 1;
+
+        if (s->lastuse[g] != 0xff && s->lastuse[g] > (uint8_t)s->node)
+                cost += 1;
+
+        return cost;
+}
+
+/* A slot this node has already been handed can never be the victim: the
+ * emitter has the host register number baked into the node by now, and giving
+ * it to a second operand makes the first one read whatever the second wrote.
+ * LRU got this for free -- taking a register makes it most recent -- so the
+ * cost order has to say it out loud. */
+static int claimed_here(const allocator *s, int h)
+{
+        return s->claim[h] == (uint16_t)s->node;
+}
+
+/* THE MATCHED PAIR.  Set this to 1 and both pickers fall back to pure age,
+ * which is the allocator this replaced, with the same `.text` either way --
+ * the only kind of A/B worth running on hardware for a few milliseconds. */
+volatile int fgl_alloc_lru = 0;
+
+/* Cheapest to evict, oldest of the cheapest.  With every cost equal this is
+ * exactly the old LRU pick. */
 static int victim(const allocator *s)
 {
-        int h;
+        int h, best = -1, best_cost = 0, best_rank = 0;
 
-        for (h = 0; h < ALLOC_N; h++)
-                if (rank_of(s, h) == 0)
-                        return h;
-        return 0;
+        for (h = 0; h < ALLOC_N; h++) {
+                int cost, rank;
+
+                if (claimed_here(s, h))
+                        continue;
+
+                rank = rank_of(s, h);
+                cost = fgl_alloc_lru ? 0 : evict_cost(s, h);
+
+                if (best < 0 || cost < best_cost ||
+                    (cost == best_cost && rank < best_rank)) {
+                        best      = h;
+                        best_cost = cost;
+                        best_rank = rank;
+                }
+        }
+
+        /* Every slot claimed by this node is impossible -- the pool outnumbers
+         * what one node can want -- but a fall-back beats a -1 escaping into
+         * the emitter. */
+        if (best < 0)
+                for (h = 0; h < ALLOC_N; h++)
+                        if (rank_of(s, h) == 0)
+                                return h;
+        return best < 0 ? 0 : best;
 }
 
 /* ---------------------------------------------------------------- */
@@ -203,6 +274,7 @@ static int take(allocator *s, unsigned g, int want_value)
         if (s->where[g] >= 0) {
                 h = s->where[g];
                 s->last[h] = (uint8_t)s->node;
+                s->claim[h] = (uint16_t)s->node;
                 s->wrote[h] = 0;
                 touch(s, h);
                 return h;
@@ -258,6 +330,7 @@ static int take(allocator *s, unsigned g, int want_value)
         s->used[h]  = 1;
         s->where[g] = (int8_t)h;
         s->last[h]  = (uint8_t)s->node;
+        s->claim[h] = (uint16_t)s->node;
         s->wrote[h] = 0;
         touch(s, h);
         return h;
@@ -310,34 +383,47 @@ static int8_t host_mod(allocator *s, unsigned g)
  * wants one should get the same one back. */
 static void scratch(allocator *s, ir_node *p, int k)
 {
-        int r, got = 0;
+        int got = 0;
 
-        for (r = 0; r < ALLOC_N && got < k; r++) {
-                int h, i;
-                int taken = 0;
+        /* By cost, then by age, for the same reason as `victim` -- a memory
+         * node wanting a working register is the commonest way a pin gets
+         * spilled, and the old walk took whatever was oldest. */
+        while (got < k) {
+                int h, best = -1, best_cost = 0, best_rank = 0;
 
-                for (h = 0; h < ALLOC_N; h++)
-                        if (rank_of(s, h) == r)
-                                break;
-                if (h == ALLOC_N)
-                        continue;
+                for (h = 0; h < ALLOC_N; h++) {
+                        int cost, rank, i, taken = 0;
 
-                /* Not one of this node's own operands, and not one already
-                 * handed to it. */
-                if ((p->hd >= 0 && p->hd == ALLOC_FIRST + h) ||
-                    (p->hs >= 0 && p->hs == ALLOC_FIRST + h) ||
-                    (p->ht >= 0 && p->ht == ALLOC_FIRST + h) ||
-                    (p->hx >= 0 && p->hx == ALLOC_FIRST + h))
-                        continue;
-                for (i = 0; i < got; i++)
-                        if (p->sc[i] == ALLOC_FIRST + h)
-                                taken = 1;
-                if (taken)
-                        continue;
+                        /* Not one of this node's own operands, and not one
+                         * already handed to it. */
+                        if ((p->hd >= 0 && p->hd == ALLOC_FIRST + h) ||
+                            (p->hs >= 0 && p->hs == ALLOC_FIRST + h) ||
+                            (p->ht >= 0 && p->ht == ALLOC_FIRST + h) ||
+                            (p->hx >= 0 && p->hx == ALLOC_FIRST + h))
+                                continue;
+                        for (i = 0; i < got; i++)
+                                if (p->sc[i] == ALLOC_FIRST + h)
+                                        taken = 1;
+                        if (taken)
+                                continue;
 
-                evict(s, h);
-                s->used[h] = 1;
-                p->sc[got++] = (uint8_t)(ALLOC_FIRST + h);
+                        rank = rank_of(s, h);
+                        cost = fgl_alloc_lru ? 0 : evict_cost(s, h);
+
+                        if (best < 0 || cost < best_cost ||
+                            (cost == best_cost && rank < best_rank)) {
+                                best      = h;
+                                best_cost = cost;
+                                best_rank = rank;
+                        }
+                }
+                if (best < 0)
+                        break;
+
+                evict(s, best);
+                s->used[best] = 1;
+                s->claim[best] = (uint16_t)s->node;
+                p->sc[got++] = (uint8_t)(ALLOC_FIRST + best);
         }
 }
 
@@ -472,6 +558,7 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
                 s.dirty[i] = 0;
 #endif
                 s.used[i] = ir_pin[i] >= 0;
+                s.claim[i] = 0xffff;
                 s.last[i] = 0;
                 s.wrote[i] = 0;
         }
@@ -485,6 +572,20 @@ void ir_allocate(ir_node *ir, int n, ir_alloc *out)
         for (i = 0; i < RANK_BYTES; i++)
                 s.rank[i] = (uint8_t)((2 * i + 1) << 4 | (2 * i));
         s.a = out;
+
+        /* Last mention of each guest register, counting a write as a mention.
+         * `evict_cost` reads it to price the reload an eviction will owe, and
+         * over-approximating that can only make a victim look dearer than it
+         * is -- never cheaper, which is the direction that would cost
+         * instructions. */
+        memset(s.lastuse, 0xff, sizeof s.lastuse);
+        for (i = 0; i < n; i++) {
+                const ir_node *p = &ir[i];
+
+                if (p->rs <= GUEST_HI) s.lastuse[p->rs] = (uint8_t)i;
+                if (p->rt <= GUEST_HI) s.lastuse[p->rt] = (uint8_t)i;
+                if (p->rd <= GUEST_HI) s.lastuse[p->rd] = (uint8_t)i;
+        }
 
         for (i = 0; i < n; i++) {
                 ir_node *p = &ir[i];
