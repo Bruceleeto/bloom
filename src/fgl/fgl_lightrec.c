@@ -19,6 +19,7 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "lightrec-private.h"
 
@@ -89,6 +90,120 @@ FGL_ASSERT(FGL_AT_LINK * 4
 	   == offsetof(struct lightrec_state, link), link);
 FGL_ASSERT(FGL_AT_TSAVE * 4
 	   == offsetof(struct lightrec_state, tsave), tsave);
+FGL_ASSERT(FGL_AT_EXIT_METER * 4
+	   == offsetof(struct lightrec_state, exit_meter), exit_meter);
+FGL_ASSERT(FGL_AT_METER_BASE * 4
+	   == offsetof(struct lightrec_state, meter_base), meter_base);
+FGL_ASSERT(FGL_AT_METER_IN * 4
+	   == offsetof(struct lightrec_state, meter_in), meter_in);
+
+/* ---------------------------------------------------------------- */
+/* THE METER                                                         */
+/* ---------------------------------------------------------------- */
+
+/* THE BUDGET IN r14 IS A COUNT OF GUEST INSTRUCTIONS, NOT OF CYCLES.
+ *
+ * Emitted code charges `add #-n,r14` and nothing else (emit_charge_ops), so
+ * the cycles-per-op multiply lives here, at the two points C already had to
+ * touch the pair: `in` hands a budget out, `out` settles what was spent.
+ *
+ * EXACTNESS.  The gate is `cmp/pl r14` -- run while the budget is positive --
+ * so the meter has to make that predicate agree with the old one instruction
+ * for instruction.  Old: keep going while `left - sum*cpo > 0`, i.e. while
+ * `sum < left/cpo`.  New: while `m - sum > 0`.  The two are the same predicate
+ * over the integers exactly when `m = ceil(left / cpo)`; floor would leave a
+ * block early whenever the division had a remainder, which is nearly always.
+ *
+ * `meter_base` is the meter reading `current_cycle` already accounts for.
+ * Settling from there rather than from `target_cycle` is what makes this
+ * survive C moving the target under us, which an interrupt does on any
+ * crossing.  It is a state-block word and not a static here because shim.S
+ * settles with the same arithmetic inline -- see SHIM_CYCLES_OUT. */
+static u32 fgl_cycles_per_op(const struct lightrec_state *state)
+{
+	/* cycle_table[k] == k * cycles_per_op, so entry 1 IS the constant.
+	 * Read every time: the multiplier is a setting and can move. */
+	u32 cpo = state->cycle_table[1];
+
+	return cpo ? cpo : 1u;
+}
+
+/* SETTLING RE-ANCHORS, WHICH IS WHAT MAKES A SECOND SETTLE FREE.
+ *
+ * The dispatcher settles on its way out and `lightrec_execute` settles again
+ * with the same delta.  With the anchor moved, that second settle charges
+ * zero.  Without it, it charged the whole slice twice -- a 35000-cycle slice
+ * landing twice runs a hundred vsyncs of guest clock in three thousand
+ * blocks. */
+void fgl_cycles_out(struct lightrec_state *state, s32 delta)
+{
+	state->current_cycle += (u32)(state->meter_base - delta) *
+			        fgl_cycles_per_op(state);
+	state->meter_base = delta;
+}
+
+void fgl_cycles_settle(struct lightrec_state *state, s32 delta)
+{
+	fgl_cycles_out(state, delta);
+}
+
+/* THE ONE PIECE OF ARITHMETIC, IN THE ONE PLACE THAT CAN DO IT.
+ *
+ * `ceil` and not `floor`: the gate is `cmp/pl r14` -- run while the budget is
+ * positive -- so the meter has to make that predicate agree with the cycle
+ * one instruction for instruction.  Old: keep going while `sum < left/cpo`.
+ * New: while `m - sum > 0`.  Those are the same predicate over the integers
+ * exactly when `m = ceil(left / cpo)`; floor would leave a block early
+ * whenever the division had a remainder, which is nearly always. */
+static s32 fgl_meter_of(const struct lightrec_state *state)
+{
+	u32 cpo  = fgl_cycles_per_op(state);
+	s32 left = (s32)(state->target_cycle - state->current_cycle);
+
+	return left > 0 ? (s32)(((u32)left + cpo - 1u) / cpo) : 0;
+}
+
+/* WHAT A SHIM COMES BACK TO.
+ *
+ * A device access is a C call in the middle of a block, and C moves the
+ * target under it constantly -- `lightrec_tansition_from_pcsx` recomputes the
+ * slice from `next_interupt - cycle` on the way back, and a pad access is
+ * exactly the case that schedules a nearer event than the one the meter was
+ * built against.  The shim keeping its old, longer meter is a block running
+ * past the new deadline and an SIO interrupt landing late, which reads as
+ * input that does not arrive.
+ *
+ * `current` moving is not the problem -- no guest instruction retired while C
+ * ran -- and neither is a forced exit, which was all the shim used to test
+ * for.  It is `target`. */
+void fgl_meter_refresh(struct lightrec_state *state)
+{
+	state->meter_in = fgl_meter_of(state);
+}
+
+s32 fgl_cycles_in(struct lightrec_state *state)
+{
+	u32 cpo  = fgl_cycles_per_op(state);
+	s32 left = (s32)(state->target_cycle - state->current_cycle);
+	/* NO BUDGET IS ZERO BUDGET, not a negative cycle count.  The old code
+	 * could hand back the raw negative difference because the caller put
+	 * it straight back with `current = target - delta`; the meter's settle
+	 * multiplies, so a cycle count leaking in here comes back scaled by
+	 * cycles_per_op and the guest clock runs away in three frames. */
+	s32 m    = left > 0 ? (s32)(((u32)left + cpo - 1u) / cpo) : 0;
+
+	/* Nothing has parked a budget for this slice yet. */
+	state->exit_meter = INT32_MIN;
+	state->meter_base = m;
+	state->meter_in   = m;
+	return m;
+}
+
+/* A budget in guest instructions, in cycles. */
+u32 fgl_meter_cycles(const struct lightrec_state *state, s32 delta)
+{
+	return (u32)delta * fgl_cycles_per_op(state);
+}
 
 /* THE REACH ITSELF.  `mov.l @(disp,GBR),r0` has an eight-bit displacement
  * scaled by four, so the last word generated code can name is at +1020.

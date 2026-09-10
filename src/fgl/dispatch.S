@@ -188,13 +188,18 @@ _fgl_dispatch:
 	mov.l	r0, @-r15
 
 	ldc	r4, gbr				/* the state block */
-#if FGL_GBASE
-	mov	r4, r3				/* the guest-file base: pins.h */
-#endif
-	mov	r7, r14				/* the cycle delta */
 	mov.l	@(FGL_AT_ADDR_MASK * 4, gbr), r0
 	mov	r0, r13				/* the guest address mask */
-	mov	r5, r2				/* the PC to run */
+
+	/* THE FOURTH ARGUMENT IS CYCLES AND r14 IS NOT.  lightrec hands the
+	 * dispatcher `target - current`; r14 counts guest instructions now,
+	 * so the budget has to be built from the pair by C instead -- which
+	 * is exactly what `.Lsync_in` does, and it sets r3 on the way.  The
+	 * PC is parked because the call destroys r5. */
+	mov.l	r5, @-r15
+	bsr	.Lsync_in
+	 nop
+	mov.l	@r15+, r2			/* the PC to run */
 
 	/* Filled for the first time; from here they live in registers. */
 	PIN_LOAD
@@ -377,13 +382,16 @@ _fgl_dispatch_loop:
 	.globl	_fgl_dispatch_compile
 _fgl_dispatch_compile:
 .Lcompile:
-	bsr	.Lsync_out
-	 nop
-
 	/* ENABLE_FIRST_PASS makes `get_next_block` INTERPRET the block before
 	 * compiling it, so this crossing reads and writes guest registers like
-	 * any other run of guest code -- it is not merely the compiler. */
+	 * any other run of guest code -- it is not merely the compiler.
+	 *
+	 * PUBLISHED BEFORE THE SETTLE, not after: `.Lsync_out` calls C now,
+	 * and r7 -- one of the pins -- is caller-saved. */
 	PIN_PUBLISH
+
+	bsr	.Lsync_out
+	 nop
 
 	stc	gbr, r4				/* arg0: the state */
 	mov.l	@(FGL_AT_CURR_PC * 4, gbr), r0
@@ -427,13 +435,32 @@ _fgl_dispatch_compile:
  * what decided how long the next slice is.
  * ------------------------------------------------------------------------- */
 .Lservice:
+	/* A BLOCK THAT ASKED TO LEAVE PARKED ITS OWN BUDGET.
+	 *
+	 * `IR_EXIT` zeroes r14 to close the gate, and the block's epilogue
+	 * then takes its own length out of that zero -- so r14 is no longer
+	 * what was unspent, and settling from it would charge the whole slice.
+	 * The parked word is what was unspent.  It is stamped out once read,
+	 * so an exit flag raised from C later cannot pick it up again.  See
+	 * FGL_AT_EXIT_METER. */
+	mov.l	@(FGL_AT_EXIT_METER * 4, gbr), r0
+	mov	#1, r1
+	rotr	r1				/* 0x80000000, no literal */
+	cmp/eq	r1, r0
+	bt	1f
+	mov	r0, r14				/* the parked, unspent meter */
+	mov	r1, r0
+	mov.l	r0, @(FGL_AT_EXIT_METER * 4, gbr)
+1:
+	/* Published before the settle: `.Lsync_out` calls C and r7 is
+	 * caller-saved. */
+	PIN_PUBLISH
+
 	bsr	.Lsync_out
 	 nop
 
-	PIN_PUBLISH
-
 	stc	gbr, r4				/* arg0: the state */
-	mov	r14, r5				/* arg1: the delta we spent */
+	mov	r14, r5				/* arg1: the meter we spent */
 	mov.l	.Lservicefn, r0
 	jsr	@r0
 	 nop
@@ -457,10 +484,10 @@ _fgl_dispatch_compile:
  * Leaving for good.
  * ------------------------------------------------------------------------- */
 .Lexit:
+	PIN_PUBLISH
+
 	bsr	.Lsync_out
 	 nop
-
-	PIN_PUBLISH
 
 .Lexit_published:
 	mov	r14, r1				/* the return value */
@@ -492,6 +519,14 @@ _fgl_dispatch_compile:
  * charge that no cycle-table entry could have predicted, which is the whole
  * reason this is a call and not emitted code.
  *
+ * AND CYCLES ARE NOT WHAT r14 COUNTS ANY MORE, so the charge cannot go there:
+ * turning it into a meter reading is a division by `cycles_per_op` and the
+ * SH-4 has no instruction for one.  It goes straight onto `current_cycle`
+ * instead, which is exact and is additive with the settle -- the settle
+ * charges only the meter spent since its anchor and never reads this back.
+ * What it does not do is shorten the slice, so a memset can overrun the
+ * budget by its own length; the next crossing sees the clock and catches up.
+ *
  * NO CYCLE SYNC, WHICH IS DELIBERATE AND IS NOT AN OVERSIGHT.  The other two
  * doors below cross into C that reads and moves the absolute pair; this one
  * does not.  `lightrec_memset` touches neither counter and cannot raise an
@@ -514,7 +549,10 @@ _fgl_dispatch_memset:
 	mov.l	.Lmemset, r0
 	jsr	@r0
 	 nop
-	sub	r0, r14				/* charge what the memset cost */
+	mov	r0, r1				/* the cost, in guest cycles */
+	mov.l	@(FGL_AT_CURRENT_CYCLE * 4, gbr), r0
+	add	r1, r0
+	mov.l	r0, @(FGL_AT_CURRENT_CYCLE * 4, gbr)
 
 #if FGL_GBASE
 	/* r3 is caller-saved and this door calls C without going through
@@ -563,11 +601,12 @@ _fgl_dispatch_memset:
  * ------------------------------------------------------------------------- */
 	.globl	_fgl_dispatch_interpreter
 _fgl_dispatch_interpreter:
+	/* The interpreter reads and writes every one of them, and they go out
+	 * before the settle because `.Lsync_out` calls C. */
+	PIN_PUBLISH
+
 	bsr	.Lsync_out
 	 nop
-
-	/* The interpreter reads and writes every one of them. */
-	PIN_PUBLISH
 
 	mov	r2, r6				/* arg2: the branch's PC */
 	mov	r1, r5				/* arg1: the block */
@@ -607,10 +646,10 @@ _fgl_dispatch_interpreter:
  * ------------------------------------------------------------------------- */
 	.globl	_fgl_dispatch_ds_check
 _fgl_dispatch_ds_check:
+	PIN_PUBLISH
+
 	bsr	.Lsync_out
 	 nop
-
-	PIN_PUBLISH
 
 	mov	r1, r6				/* arg2: the guest register */
 	mov	r2, r5				/* arg1: the branch target */
@@ -708,23 +747,45 @@ _fgl_link_stub:
  *
  * Both are called with `bsr`, which costs PR -- and PR is free here precisely
  * because a block does not own it.
+ *
+ * BOTH ARE CALLS NOW, WHICH THEY DID NOT USED TO BE.  r14 held cycles and the
+ * conversion was a subtract in either direction; it holds guest instructions,
+ * and the multiply by `cycles_per_op` -- with the anchor the settle charges
+ * from -- lives in C (fgl_lightrec.c).  So each of these costs a `jsr`, which
+ * is why every caller publishes its pins first: r7 is caller-saved.  PR and r2
+ * are saved here rather than at the five call sites; r2 is the guest PC and
+ * two of the doors carry it across.
  * ------------------------------------------------------------------------- */
 .Lsync_out:
-	mov.l	@(FGL_AT_TARGET_CYCLE * 4, gbr), r0
-	sub	r14, r0
+	sts.l	pr, @-r15
+	mov.l	r2, @-r15
+	stc	gbr, r4				/* arg0: the state */
+	mov	r14, r5				/* arg1: the meter unspent */
+	mov.l	.Lcycout, r0
+	jsr	@r0
+	 nop
+	mov.l	@r15+, r2
+	lds.l	@r15+, pr
+#if FGL_GBASE
+	stc	gbr, r3
+#endif
 	rts
-	 mov.l	r0, @(FGL_AT_CURRENT_CYCLE * 4, gbr)
+	 nop
 
 .Lsync_in:
+	sts.l	pr, @-r15
+	mov.l	r2, @-r15
+	stc	gbr, r4				/* arg0: the state */
+	mov.l	.Lcycin, r0
+	jsr	@r0
+	 nop
+	mov.l	@r15+, r2
+	lds.l	@r15+, pr
 #if FGL_GBASE
 	/* r3 is caller-saved, so a compiled callee is entitled to have
 	 * destroyed it.  Rebuilding beats saving: the value IS gbr. */
 	stc	gbr, r3
 #endif
-	mov.l	@(FGL_AT_CURRENT_CYCLE * 4, gbr), r0
-	mov	r0, r1
-	mov.l	@(FGL_AT_TARGET_CYCLE * 4, gbr), r0
-	sub	r1, r0
 	rts
 	 mov	r0, r14
 
@@ -752,6 +813,8 @@ _fgl_getnext_slot:
 
 	.align	2
 .Lservicefn:	.long	_fgl_service_events
+.Lcycout:	.long	_fgl_cycles_out
+.Lcycin:	.long	_fgl_cycles_in
 
 /* The same arrangement for the other three doors.  Each is the fgl-side name
  * of one of lightrec's C functions -- `lightrec_memset` and

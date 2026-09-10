@@ -2065,6 +2065,33 @@ static void emit_fixup(fgl_emitter *e, const ir_fixup *f)
 		ld_guest(e, f->guest, f->host);
 }
 
+/* THE CHARGE IS AN INSTRUCTION COUNT, NOT A CYCLE COUNT.
+ *
+ * `r14` used to hold cycles, and a block's charge was `n_ops * cycles_per_op`
+ * -- a runtime product around 1800*n that fits in no immediate, so it was a
+ * GBR load of a precomputed table entry plus a subtract.  Two instructions and
+ * a state-block read on every block, against bleem's zero: bleem does no cycle
+ * arithmetic in emitted code at all.
+ *
+ * So r14 counts GUEST INSTRUCTIONS instead.  `n` is at most a block's length,
+ * which always fits `add #imm`, and the conversion to cycles happens once in
+ * C -- where the budget is handed out and settled -- instead of once per block
+ * in emitted code.  See fgl_cycles_in/out in fgl_lightrec.c: the meter is
+ * `ceil((target - current) / cycles_per_op)`, which makes the gate's
+ * `cmp/pl r14` fire on exactly the instruction it used to.
+ *
+ * A zero charge now emits nothing at all; it used to load cycle_table[0] and
+ * subtract it. */
+static void emit_charge_ops(fgl_emitter *e, unsigned n)
+{
+	while (n > 127u) {
+		sh4_emit_add_imm(&e->cg, -127, FGL_R_CYCLE);
+		n -= 127u;
+	}
+	if (n)
+		sh4_emit_add_imm(&e->cg, -(int)n, FGL_R_CYCLE);
+}
+
 static void emit_node(fgl_emitter *e, const ir_node *p)
 {
 	int rd, rs, rt;
@@ -2550,23 +2577,24 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 	 * budget spent and returns to C, which reads `exit_flags` to find out
 	 * that this was a request rather than a timeout.
 	 *
-	 * The reconciliation is `current = target = target - delta`, which is
-	 * what `rec_exit_early` does (emitter.c) -- the delta being what is
-	 * left unspent, so subtracting it from the target is what the machine
-	 * actually reached.
+	 * THE RECONCILIATION IS NO LONGER THIS NODE'S TO DO.  It used to be
+	 * `current = target = target - delta`, which is arithmetic only a
+	 * cycle budget can perform; r14 counts guest instructions now, and
+	 * turning a meter into cycles needs a multiply against an anchor that
+	 * lives in C.  So the exit parks what is unspent in `exit_meter` and
+	 * zeroes r14 to close the gate, and the dispatcher charges from the
+	 * parked word -- see FGL_AT_EXIT_METER in fgl_state.h.
 	 *
 	 * The block still runs its own epilogue after this, which charges for
 	 * the instructions and publishes the exit PC. That charge lands on a
-	 * delta that is now zero and makes it negative, which is harmless:
-	 * the test is `<= 0` and the counters C reads were already written.
+	 * meter that is now zero and makes it negative, which is harmless:
+	 * the test is `<= 0` and the parked value was written before it.
 	 *
-	 * Seven instructions, and every exit code is a power of two below 64,
-	 * so the flag is an immediate and costs no literal. */
+	 * Every exit code is a power of two below 64, so the flag is an
+	 * immediate and costs no literal. */
 	case IR_EXIT:
-		sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_TARGET_CYCLE);
-		sh4_emit_sub(&e->cg, FGL_R_CYCLE, FGL_R_XFER);
-		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_TARGET_CYCLE);
-		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_CURRENT_CYCLE);
+		sh4_emit_mov_reg(&e->cg, FGL_R_CYCLE, FGL_R_XFER);
+		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_EXIT_METER);
 		sh4_emit_mov_imm(&e->cg, 0, FGL_R_CYCLE);
 
 		sh4_emit_mov_imm(&e->cg, (int)p->imm, FGL_R_XFER);
@@ -2776,19 +2804,12 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	 * timing; if it sits at exactly the same address, the value is wrong
 	 * and cycles are innocent.
 	 *
-	 * Biasing the table index costs no instructions and no bytes: the
-	 * displacement changes, the encoding does not.  So the two builds have
-	 * identical layout and the comparison is not confounded by it. */
+	 * Biasing the charge costs no instructions and no bytes: the immediate
+	 * changes, the encoding does not.  So the two builds have identical
+	 * layout and the comparison is not confounded by it. */
 	n_ops += FGL_CYCLE_BIAS;
 
-	while (n_ops > FGL_CYCLE_ENTRIES - 1) {
-		sh4_emit_mov_l_load_gbr(&e->cg,
-					(int)(FGL_AT_CYCLES + FGL_CYCLE_ENTRIES - 1));
-		sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
-		n_ops -= FGL_CYCLE_ENTRIES - 1;
-	}
-	sh4_emit_mov_l_load_gbr(&e->cg, (int)(FGL_AT_CYCLES + n_ops));
-	sh4_emit_sub(&e->cg, FGL_R_XFER, FGL_R_CYCLE);
+	emit_charge_ops(e, (unsigned)n_ops);
 
 	/* THE LINK, WHEN THE SUCCESSORS WERE KNOWN AT COMPILE TIME.
 	 *

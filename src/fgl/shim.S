@@ -116,24 +116,71 @@
  * service that makes no C call -- the divides below -- neither needs this nor
  * is allowed it.
  */
+/*
+ * r14 IS A COUNT OF GUEST INSTRUCTIONS, so making the pair current is a
+ * multiply and not a subtract: `current += (base - r14) * cycles_per_op`,
+ * with the anchor moved to r14 afterwards so the next settle -- the
+ * dispatcher's, on the way out -- charges only what is spent after this one.
+ * `cycle_table[1]` IS cycles_per_op, since entry k is k times it.
+ *
+ * r2 is free here and does not have to be saved: SHIM_ENTER has already
+ * pushed r2-r7, which is what makes this ten instructions rather than a call
+ * into C.  MACL is dead across a shim for the same reason a compiled callee
+ * may destroy it.
+ */
 .macro	SHIM_CYCLES_OUT
-	mov.l	@(FGL_AT_TARGET_CYCLE * 4, gbr), r0
-	sub	r14, r0			/* current = target - delta */
+	mov.l	@(FGL_AT_METER_BASE * 4, gbr), r0
+	sub	r14, r0			/* the meter spent since the anchor */
+	mov	r0, r2
+	mov.l	@((FGL_AT_CYCLES + 1) * 4, gbr), r0	/* cycles_per_op */
+	mul.l	r0, r2
+	mov.l	@(FGL_AT_CURRENT_CYCLE * 4, gbr), r0
+	sts	macl, r2
+	add	r2, r0
 	mov.l	r0, @(FGL_AT_CURRENT_CYCLE * 4, gbr)
+	mov	r14, r0
+	mov.l	r0, @(FGL_AT_METER_BASE * 4, gbr)
+	/* And seed the budget the way back in will read, so a callee that
+	 * moves nothing reads this straight back.  See FGL_AT_METER_IN. */
+	mov.l	r0, @(FGL_AT_METER_IN * 4, gbr)
 .endm
 
 /*
- * And back.  Built with `neg`/`add` rather than the obvious pair of loads and
- * a `sub` because both loads must land in r0 -- @(disp,GBR) has no other
- * destination -- so the second one would otherwise need a third register to
- * survive.  Four instructions, and r1 is left alone so a caller that has a
- * return value to protect can park it there.
+ * And back, IN ONE INSTRUCTION, BECAUSE C DID THE DIVISION.
+ *
+ * The old macro re-derived the delta from the pair, which a subtract could
+ * do because the delta WAS the pair's difference.  A meter is not: it is
+ * `ceil((target - current) / cycles_per_op)` and the SH-4 has no divide.
+ *
+ * Rebuilding cannot be skipped, though, and the reason is `target`, not
+ * `current`.  No guest instruction retires while C runs, so the meter would
+ * still be right if the slice were the same length -- but a device access
+ * ends in `lightrec_tansition_from_pcsx`, which recomputes the slice from
+ * `next_interupt - cycle`, and a pad access is precisely the one that
+ * schedules a NEARER event than the meter was built against.  Keep the old,
+ * longer meter and the block runs past the new deadline: the SIO interrupt
+ * lands late and the input never arrives.
+ *
+ * So C leaves the answer in the state block every time it moves the pair,
+ * and this reads it.  A forced exit needs no special case -- the target was
+ * pulled down to the current cycle, so what lands here is zero.  r1 is still
+ * left alone, for the caller that parks a return value there.
+ *
+ * AND THE ANCHOR MOVES WITH IT, which is the half that is easy to miss.
+ * `meter_base` is the meter reading `current_cycle` already accounts for, and
+ * the settle charges `(meter_base - r14) * cycles_per_op`.  Adopt a new meter
+ * without re-anchoring and that subtraction spans two readings on different
+ * scales: enter with 100, spend 10 (base 90), let C shorten the slice to 5,
+ * and the next settle charges 88 operations for the 3 that ran -- or, when C
+ * lengthens the slice instead, a negative count that walks `current_cycle`
+ * backwards.  C is holding the pair current at this instant and r14 is what
+ * it left here, so the base must equal it.  `fgl_cycles_in` does the same
+ * thing on the dispatcher's side of the door.
  */
 .macro	SHIM_CYCLES_IN
-	mov.l	@(FGL_AT_CURRENT_CYCLE * 4, gbr), r0
-	neg	r0, r14
-	mov.l	@(FGL_AT_TARGET_CYCLE * 4, gbr), r0
-	add	r0, r14			/* delta = target - current */
+	mov.l	@(FGL_AT_METER_IN * 4, gbr), r0
+	mov	r0, r14
+	mov.l	r0, @(FGL_AT_METER_BASE * 4, gbr)
 .endm
 
 /*

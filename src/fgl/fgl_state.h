@@ -210,7 +210,44 @@
  * parked value).  Two purposes that overlap in time need two words. */
 #define FGL_AT_TSAVE         (FGL_AT_LINK + 1u)                       /* +700 */
 
-#define FGL_STATE_WORDS (FGL_AT_TSAVE + 1u)
+/* WHAT r14 STILL HELD WHEN A BLOCK ASKED TO LEAVE.
+ *
+ * The budget is a count of guest instructions now, so `IR_EXIT` can no longer
+ * reconcile the absolute counters itself -- turning a meter into cycles needs
+ * a multiply, and the anchor it would multiply against lives in C.  So the
+ * exit parks the unspent meter here and zeroes r14 to close the gate, and the
+ * dispatcher charges from this instead of from r14 (which the epilogue has
+ * since taken the block's own length out of).
+ *
+ * C stamps it back to INT32_MIN once read, so a stale value can never be
+ * mistaken for a fresh one: an exit flag raised from C, and there are
+ * several, leaves this alone. */
+#define FGL_AT_EXIT_METER    (FGL_AT_TSAVE + 1u)                      /* +704 */
+
+/* THE METER READING `current_cycle` ALREADY ACCOUNTS FOR.
+ *
+ * Settling charges `(base - r14) * cycles_per_op` and then moves the anchor
+ * here, which is what makes a second settle with the same budget cost nothing
+ * -- the dispatcher settles on its way out and `lightrec_execute` settles
+ * again.  It lives in the state block rather than in a C static because the
+ * shims settle too, and a shim cannot afford a call to do it. */
+#define FGL_AT_METER_BASE    (FGL_AT_EXIT_METER + 1u)                 /* +708 */
+
+/* THE METER A SHIM PICKS BACK UP.
+ *
+ * A shim cannot rebuild the budget itself: that is `ceil((target - current) /
+ * cycles_per_op)` and the SH-4 has no divide.  It does not have to, because
+ * whatever moved the pair while it was out was C, and C can leave the answer
+ * here -- `lightrec_set_target_cycle_count`, `lightrec_reset_cycle_count` and
+ * `lightrec_set_exit_flags` all refresh it, which is every way the pair moves
+ * under a running block.  SHIM_CYCLES_OUT seeds it with the meter it already
+ * has, so a call that moves nothing reads its own value back.
+ *
+ * The forced exit falls out for free: `set_exit_flags` pulls the target down
+ * to the current cycle, so what lands here is zero and the gate closes. */
+#define FGL_AT_METER_IN      (FGL_AT_METER_BASE + 1u)                 /* +712 */
+
+#define FGL_STATE_WORDS (FGL_AT_METER_IN + 1u)
 
 /* The COP0 registers that are actually live.  Everything else reads zero and
  * discards writes. */

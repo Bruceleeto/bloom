@@ -1901,7 +1901,12 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 		cycles_delta = fgl_dispatch(state, state->curr_pc,
 					    block_trace, cycles_delta);
 
-		state->current_cycle = state->target_cycle - cycles_delta;
+		/* The budget fgl hands to emitted code is a count of guest
+		 * instructions, not of cycles, so putting the pair back is
+		 * fgl's arithmetic and not `target - delta`.  The dispatcher
+		 * has already settled on its way out and re-anchored, so this
+		 * second settle charges zero -- see fgl_lightrec.c. */
+		fgl_cycles_settle(state, cycles_delta);
 	}
 
 	if (ENABLE_THREADED_COMPILER)
@@ -2408,6 +2413,7 @@ void lightrec_set_exit_flags(struct lightrec_state *state, u32 flags)
 	if (flags != LIGHTREC_EXIT_NORMAL) {
 		state->exit_flags |= flags;
 		state->target_cycle = state->current_cycle;
+		fgl_meter_refresh(state);
 	}
 }
 
@@ -2437,6 +2443,8 @@ void lightrec_reset_cycle_count(struct lightrec_state *state, u32 cycles)
 
 	if (state->target_cycle < cycles)
 		state->target_cycle = cycles;
+
+	fgl_meter_refresh(state);
 }
 
 void lightrec_set_target_cycle_count(struct lightrec_state *state, u32 cycles)
@@ -2446,6 +2454,7 @@ void lightrec_set_target_cycle_count(struct lightrec_state *state, u32 cycles)
 			cycles = state->current_cycle;
 
 		state->target_cycle = cycles;
+		fgl_meter_refresh(state);
 	}
 }
 

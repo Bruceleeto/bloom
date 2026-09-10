@@ -205,6 +205,9 @@ struct lightrec_state {
 	u32 shim_arg;				/* +692 */
 	u32 link;				/* +696 */
 	u32 tsave;				/* +700 */
+	s32 exit_meter;				/* +704 */
+	s32 meter_base;				/* +708 */
+	s32 meter_in;				/* +712 */
 	u8 in_delay_slot_n;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
@@ -501,6 +504,16 @@ void *fgl_compile_block(struct lightrec_cstate *cstate, struct block *block,
 /* The code arena, shared with fgl because it places its own blocks. */
 void *lightrec_alloc_code(struct lightrec_state *state, size_t size);
 void lightrec_free_code(struct lightrec_state *state, void *ptr);
+
+/* The budget fgl hands to emitted code is a count of guest instructions, not
+ * of cycles, so putting the pair back after a run is fgl's arithmetic and not
+ * `target - delta`. */
+void fgl_cycles_settle(struct lightrec_state *state, s32 delta);
+
+/* Recompute the budget a shim will pick up.  Called wherever C moves the
+ * cycle pair, because a shim cannot do the division itself -- see
+ * FGL_AT_METER_IN in src/fgl/fgl_state.h. */
+void fgl_meter_refresh(struct lightrec_state *state);
 
 /* The dispatcher: hand-written SH-4 (src/fgl/dispatch.S), not generated.
  * `fgl_dispatch` is the way in from C and has the signature lightrec's

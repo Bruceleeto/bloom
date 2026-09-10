@@ -196,6 +196,8 @@ volatile int fgl_service_inline = 1;
  * the whole of it without threading a stop onto each of the four returns. */
 static s32 fgl_service_events_inner(struct lightrec_state *state, s32 delta);
 
+u32 fgl_meter_cycles(const struct lightrec_state *state, s32 delta);
+
 s32 fgl_service_events(struct lightrec_state *state, s32 delta)
 {
 	s32 ret;
@@ -250,8 +252,13 @@ static s32 fgl_service_events_inner(struct lightrec_state *state, s32 delta)
 		/* Leaving after all, and the transition above already moved
 		 * the clock.  Put the pair back where the caller's arithmetic
 		 * expects to find it. */
+		/* `delta` is a guest-instruction budget, not cycles; the
+		 * caller settles the pair through fgl_cycles_settle and does
+		 * not read this back.  Keep the target self-consistent all
+		 * the same. */
 		lightrec_set_target_cycle_count(state,
-			lightrec_current_cycle_count(state) + delta);
+			lightrec_current_cycle_count(state) +
+			fgl_meter_cycles(state, delta));
 		return 0;
 	}
 
