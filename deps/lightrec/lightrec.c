@@ -37,7 +37,9 @@
  * from.  Defined by the core's GTE (libpcsxcore/gte.c); declared here because
  * this library does not include the core's headers.
  */
-extern uint32_t psxCP2CtrlGen;
+extern uint32_t psxCP2Gen[2];
+#define psxCP2CtrlGen psxCP2Gen[0]
+#define psxCP2RtGen   psxCP2Gen[1]
 
 static struct block * lightrec_precompile_block(struct lightrec_state *state,
 						u32 pc);
@@ -652,6 +654,8 @@ static void lightrec_mtc2(struct lightrec_state *state, u8 reg, u32 data)
 static void lightrec_ctc2(struct lightrec_state *state, u8 reg, u32 data)
 {
 	psxCP2CtrlGen++;
+	if (reg < 8 || reg == 24 || reg == 25)
+		psxCP2RtGen++;
 
 	switch (reg) {
 	case 4:

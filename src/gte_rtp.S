@@ -615,7 +615,7 @@ _gte_rot_convert:
 	bra	9f
 	 nop
 	.align	2
-10:	.long	_psxCP2CtrlGen
+10:	.long	_psxCP2Gen
 11:	.long	_gte_col
 12:	.long	_gte_hot
 13:	.long	_gte_rtp_slow
@@ -736,7 +736,7 @@ _gte_mvmva_fast:
 	jmp	@r1			/* gte_mvmva_slow(file, op) */
 	 nop
 	.align	2
-10:	.long	_psxCP2CtrlGen
+10:	.long	_psxCP2Gen
 11:	.long	_gte_col
 12:	.long	_gte_hot
 13:	.long	_gte_mvmva_asm
@@ -1263,9 +1263,9 @@ _gte_mvmva_sf0_asm:
  * 17-bit, the products 34-bit, so the sum needs the 64 bits `dmuls.l` gives.
  */
 	.balign	4
-	.global	_gte_nclip_leaf
-	.type	_gte_nclip_leaf, @function
-_gte_nclip_leaf:
+	.global	_gte_nclip_leaf_old
+	.type	_gte_nclip_leaf_old, @function
+_gte_nclip_leaf_old:
 	mov.w	3f, r0			/* FGL_AT_CP2D * 4 */
 	stc	gbr, r4
 	add	r0, r4			/* r4 = &cp2d */
@@ -1324,7 +1324,7 @@ _gte_nclip_leaf:
 	.align	2
 5:	.long	0x80010000
 6:	.long	0x80008000
-	.size	_gte_nclip_leaf, . - _gte_nclip_leaf
+	.size	_gte_nclip_leaf_old, . - _gte_nclip_leaf_old
 
 /*
  * The C-callable form, for the self-test: r4 = &file.  Sets GBR so the leaf
@@ -1340,7 +1340,7 @@ _gte_nclip_leaf_call:
 	mov.w	1f, r0
 	sub	r0, r4
 	ldc	r4, gbr
-	bsr	_gte_nclip_leaf
+	bsr	_gte_nclip_leaf_old
 	 nop
 	ldc.l	@r15+, gbr
 	lds.l	@r15+, pr
@@ -1558,7 +1558,7 @@ _gte_nclip_leaf_call:
 	.long	0x37800000	/* 1/65536 */
 	.long	0x3f000000	/* 0.5 */
 	.long	0x47000000	/* 32768.0 */
-6:	.long	_psxCP2CtrlGen
+6:	.long	_psxCP2Gen
 7:	.long	_gte_hot
 1:
 .endm
@@ -1607,38 +1607,305 @@ _gte_nclip_leaf_call:
 4:	.word	0x1000			/* limH bound, and its flag bit */
 .endm
 
+/* ---- RTPS / RTPT leaves, second shape (2026-09-10) ----------------------
+ *
+ * Everything the op touches is addressed off GBR (file = GBR + 264), so no
+ * base registers are built and nothing is pushed: r0/r1 scratch, r2 SX,
+ * r5 FLAG, fr4 = q, fr6/fr7 = ofx/ofy, XMTRX the matrix.  SX/SY are taken
+ * from the float MACs as bleem does (gte_cop2.md S4), not from the clamped
+ * IRs.  The XMTRX cache protocol with gte_hot is unchanged (RTP_ENTER_LEAF
+ * above), only the hit path no longer falls into the miss path's tail. */
+.macro RTPL_ENTER
+	mov.l	76f, r1
+	mov.l	@(4, r1), r1		/* psxCP2RtGen: RT/TR/OFX/OFY writes only */
+	mov.l	77f, r0			/* &gte_hot */
+	mov.l	@(16, r0), r2		/* xmtrx_key */
+	mov	#-2, r5
+	cmp/eq	r5, r2
+	bf	78f
+	mov.l	@(24, r0), r2		/* xmtrx_serial */
+	cmp/eq	r1, r2
+	bf	78f
+	add	#4, r0
+	fmov.s	@r0+, fr6		/* ofx */
+	fmov.s	@r0, fr7		/* ofy */
+	bra	79f
+	 mov	#0, r5
+78:	stc	gbr, r4
+	mov.w	75f, r0
+	add	r0, r4			/* r4 = the file */
+	RTP_XMTRX_LOAD
+	mov.l	74f, r1
+	lds	r1, fpul
+	fsts	fpul, fr5		/* 1/65536 */
+	mov.l	@(488, gbr), r0		/* OFX */
+	lds	r0, fpul
+	float	fpul, fr6
+	fmul	fr5, fr6
+	mov.l	@(492, gbr), r0		/* OFY */
+	lds	r0, fpul
+	float	fpul, fr7
+	fmul	fr5, fr7
+	mov.l	76f, r1
+	mov.l	@(4, r1), r2		/* psxCP2RtGen */
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	77f, r0
+	mov.l	r2, @(24, r0)		/* xmtrx_serial */
+	mov.l	r1, @(12, r0)		/* ofs_gen */
+	mov	#-2, r1
+	mov.l	r1, @(16, r0)		/* xmtrx_key */
+	mov	#-1, r1
+	mov.l	r1, @(20, r0)		/* xmtrx_mx */
+	add	#4, r0
+	fmov.s	fr6, @r0
+	add	#4, r0
+	fmov.s	fr7, @r0
+	bra	79f
+	 mov	#0, r5
+75:	.word	264
+	.align	2
+74:	.long	0x37800000		/* 1/65536 */
+76:	.long	_psxCP2Gen
+77:	.long	_gte_hot
+79:
+.endm
+
+/* GBR displacements of the file: V at voff (VX, VY, VZ), SZ at szoff,
+ * SXY at sxyoff.  IR1..3 300/304/308, MAC1..3 364/368/372, H 496. */
+.macro RTPL_VERTEX voff, szoff, sxyoff
+	mov.w	@(\voff, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	mov.w	@(\voff + 2, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr1
+	mov.w	@(\voff + 4, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr2
+	fldi1	fr3
+	ftrv	xmtrx, fv0
+
+	ftrc	fr0, fpul
+	sts	fpul, r0
+	mov.l	r0, @(364, gbr)		/* MAC1 */
+	exts.w	r0, r1
+	cmp/eq	r0, r1
+	bf	11f
+12:	mov.w	r0, @(300, gbr)		/* IR1 */
+
+	ftrc	fr1, fpul
+	sts	fpul, r0
+	mov.l	r0, @(368, gbr)		/* MAC2 */
+	exts.w	r0, r1
+	cmp/eq	r0, r1
+	bf	21f
+22:	mov.w	r0, @(304, gbr)		/* IR2 */
+
+	ftrc	fr2, fpul
+	sts	fpul, r1
+	mov	r1, r0
+	mov.l	r0, @(372, gbr)		/* MAC3, kept in r1 */
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	31f
+32:	mov.w	r0, @(308, gbr)		/* IR3 */
+
+	/* SZ = limD(MAC3) -> r1 */
+	mov.l	81f, r0
+	cmp/hi	r0, r1
+	bt	41f
+42:	mov	r1, r0
+	mov.w	r0, @(\szoff, gbr)
+
+	/* q = H / SZ -> fr4, limE when SZ <= H/2 */
+	mov.w	@(496, gbr), r0		/* H */
+	extu.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	shlr	r0
+	cmp/hi	r0, r1
+	bf	52f
+	lds	r1, fpul
+	float	fpul, fr3
+	fdiv	fr3, fr4
+53:
+	/* SX = limG1(ofx + MAC1f * q) -> r2 */
+	fmov	fr6, fr2
+	fmac	fr0, fr4, fr2
+	ftrc	fr2, fpul
+	sts	fpul, r0
+	mov.w	85f, r1
+	cmp/gt	r1, r0
+	bt	64f
+	mov.w	86f, r1
+	cmp/ge	r1, r0
+	bf	64f
+66:	extu.w	r0, r2
+
+	/* SY = limG2(ofy + MAC2f * q), packed with SX */
+	fmov	fr1, fr0
+	fmov	fr7, fr3
+	fmac	fr0, fr4, fr3
+	ftrc	fr3, fpul
+	sts	fpul, r0
+	mov.w	85f, r1
+	cmp/gt	r1, r0
+	bt	74f
+	mov.w	86f, r1
+	cmp/ge	r1, r0
+	bf	74f
+76:	shll16	r0
+	or	r2, r0
+	bra	99f
+	 mov.l	r0, @(\sxyoff, gbr)
+
+	/* --- stubs ---
+	 *
+	 * A PC-RELATIVE LOAD CANNOT GO IN A DELAY SLOT.  `bra 12b` with
+	 * `mov.w 84f,r0` behind it assembles without complaint and raises a
+	 * slot illegal instruction the first time the clamp actually fires --
+	 * the SH-4 interpreter these leaves were written against does not
+	 * enforce the rule, the hardware does.  So the constant is loaded
+	 * before the branch and the slot holds a `nop`.  These are the
+	 * saturation paths; the cycle is not on the fast route. */
+11:	mov.l	91f, r1
+	or	r1, r5
+	cmp/pz	r0
+	bt	13f
+	mov.w	84f, r0
+	bra	12b
+	 nop
+13:	mov.w	83f, r0
+	bra	12b
+	 nop
+21:	mov.l	92f, r1
+	or	r1, r5
+	cmp/pz	r0
+	bt	23f
+	mov.w	84f, r0
+	bra	22b
+	 nop
+23:	mov.w	83f, r0
+	bra	22b
+	 nop
+31:	mov.l	93f, r0
+	or	r0, r5
+	cmp/pz	r1
+	bt	33f
+	mov.w	84f, r0
+	bra	32b
+	 nop
+33:	mov.w	83f, r0
+	bra	32b
+	 nop
+41:	mov.l	94f, r0
+	or	r0, r5
+	cmp/pz	r1
+	bt	43f
+	mov	#0, r1
+	bra	42b
+	 nop
+43:	mov.l	81f, r1
+	bra	42b
+	 nop
+52:	mov.l	95f, r0
+	or	r0, r5
+	mov.l	82f, r0
+	lds	r0, fpul
+	bra	53b
+	 fsts	fpul, fr4
+64:	mov.l	98f, r0
+	or	r0, r5
+	bra	66b
+	 mov	r1, r0
+74:	mov.l	100f, r0
+	or	r0, r5
+	bra	76b
+	 mov	r1, r0
+	.align	2
+81:	.long	0xffff
+82:	.long	0x3fffff80		/* 0x1ffff / 65536 */
+83:	.word	0x7fff
+84:	.word	0x8000
+85:	.word	0x3ff
+86:	.word	0xfc00
+	.align	2
+91:	.long	0x81000000	/* limB1 */
+92:	.long	0x80800000	/* limB2 */
+93:	.long	0x00400000	/* limB3 */
+94:	.long	0x80040000	/* limD */
+95:	.long	0x80020000	/* limE */
+98:	.long	0x80004000	/* limG1 */
+100:	.long	0x80002000	/* limG2 */
+99:
+.endm
+
+/* MAC0 = ftrc(DQB + (DQA << 16) * q), IR0 = limH(MAC0 >> 12), FLAG. */
+.macro RTPL_LEAVE
+	mov.w	@(500, gbr), r0		/* DQA */
+	shll16	r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr4, fr0
+	mov.l	@(504, gbr), r0		/* DQB */
+	lds	r0, fpul
+	float	fpul, fr1
+	fadd	fr1, fr0
+	ftrc	fr0, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360, gbr)		/* MAC0 */
+	mov	#-12, r1
+	shad	r1, r0
+	mov.w	4f, r1
+	cmp/gt	r1, r0
+	bt	1f
+	cmp/pz	r0
+	bf	2f
+3:	mov.w	r0, @(296, gbr)		/* IR0 */
+	mov	r5, r0
+	rts
+	 mov.l	r0, @(516, gbr)		/* FLAG */
+1:	or	r1, r5
+	bra	3b
+	 mov	r1, r0
+2:	or	r1, r5
+	bra	3b
+	 mov	#0, r0
+4:	.word	0x1000
+.endm
+
 	.balign	4
 	.global	_gte_rtps_leaf
 	.type	_gte_rtps_leaf, @function
 _gte_rtps_leaf:
-	RTP_ENTER_LEAF
-	/* Both stacks shift before the new vertex lands */
-	mov.w	@(4, r6), r0
-	mov.w	r0, @(0, r6)
-	mov.w	@(8, r6), r0
-	mov.w	r0, @(4, r6)
-	mov.w	@(12, r6), r0
-	mov.w	r0, @(8, r6)
-	mov.l	@(20, r2), r0
-	mov.l	r0, @(16, r2)
-	mov.l	@(24, r2), r0
-	mov.l	r0, @(20, r2)
-	RTP_VERTEX 0, 12, 24
-	RTP_LEAVE_LEAF
+	RTPL_ENTER
+	/* SZ0 <- SZ1 <- SZ2 <- SZ3, SXY0 <- SXY1 <- SXY2 */
+	mov.w	@(332, gbr), r0
+	mov.w	r0, @(328, gbr)
+	mov.w	@(336, gbr), r0
+	mov.w	r0, @(332, gbr)
+	mov.w	@(340, gbr), r0
+	mov.w	r0, @(336, gbr)
+	mov.l	@(316, gbr), r0
+	mov.l	r0, @(312, gbr)
+	mov.l	@(320, gbr), r0
+	mov.l	r0, @(316, gbr)
+	RTPL_VERTEX 264, 340, 320
+	RTPL_LEAVE
 	.size	_gte_rtps_leaf, . - _gte_rtps_leaf
 
 	.balign	4
 	.global	_gte_rtpt_leaf
 	.type	_gte_rtpt_leaf, @function
 _gte_rtpt_leaf:
-	RTP_ENTER_LEAF
+	RTPL_ENTER
 	/* SZ0 takes the old SZ3 before anything is written */
-	mov.w	@(12, r6), r0
-	mov.w	r0, @(0, r6)
-	RTP_VERTEX 0, 4, 16
-	RTP_VERTEX 8, 8, 20
-	RTP_VERTEX 16, 12, 24
-	RTP_LEAVE_LEAF
+	mov.w	@(340, gbr), r0
+	mov.w	r0, @(328, gbr)
+	RTPL_VERTEX 264, 332, 312
+	RTPL_VERTEX 272, 336, 316
+	RTPL_VERTEX 280, 340, 320
+	RTPL_LEAVE
 	.size	_gte_rtpt_leaf, . - _gte_rtpt_leaf
 
 /* C-callable forms for the self-test, as _gte_nclip_leaf_call. */
@@ -2036,9 +2303,9 @@ _gte_op_leaf:
 	.size	_gte_op_leaf, . - _gte_op_leaf
 
 	.balign	4
-	.global	_gte_gpf_leaf
-	.type	_gte_gpf_leaf, @function
-_gte_gpf_leaf:
+	.global	_gte_gpf_leaf_old
+	.type	_gte_gpf_leaf_old, @function
+_gte_gpf_leaf_old:
 	ILEAF_ENTER
 	SHIFT_RGB
 	mov.w	@r2, r7			/* IR0 */
@@ -2061,12 +2328,12 @@ _gte_gpf_leaf:
 	mov	#24, r8
 	RGB_OUT
 	ILEAF_LEAVE
-	.size	_gte_gpf_leaf, . - _gte_gpf_leaf
+	.size	_gte_gpf_leaf_old, . - _gte_gpf_leaf_old
 
 	.balign	4
-	.global	_gte_gpl_leaf
-	.type	_gte_gpl_leaf, @function
-_gte_gpl_leaf:
+	.global	_gte_gpl_leaf_old
+	.type	_gte_gpl_leaf_old, @function
+_gte_gpl_leaf_old:
 	ILEAF_ENTER
 	SHIFT_RGB
 	mov.w	@r2, r7			/* IR0 */
@@ -2097,7 +2364,7 @@ _gte_gpl_leaf:
 	mov	#24, r8
 	RGB_OUT
 	ILEAF_LEAVE
-	.size	_gte_gpl_leaf, . - _gte_gpl_leaf
+	.size	_gte_gpl_leaf_old, . - _gte_gpl_leaf_old
 
 /* ---- AVSZ3 / AVSZ4 ---- */
 
@@ -2489,9 +2756,9 @@ gl_rc2_sf0:
 .endm
 
 	.balign	4
-	.global	_gte_dpcs_leaf
-	.type	_gte_dpcs_leaf, @function
-_gte_dpcs_leaf:
+	.global	_gte_dpcs_leaf_old
+	.type	_gte_dpcs_leaf_old, @function
+_gte_dpcs_leaf_old:
 	FL_ENTER
 .macro FLD_COMP n
 	extu.b	r5, r0
@@ -2507,12 +2774,12 @@ _gte_dpcs_leaf:
 	FLD_COMP 2
 	FLD_COMP 3
 	FL_LEAVE
-	.size	_gte_dpcs_leaf, . - _gte_dpcs_leaf
+	.size	_gte_dpcs_leaf_old, . - _gte_dpcs_leaf_old
 
 	.balign	4
-	.global	_gte_intpl_leaf
-	.type	_gte_intpl_leaf, @function
-_gte_intpl_leaf:
+	.global	_gte_intpl_leaf_old
+	.type	_gte_intpl_leaf_old, @function
+_gte_intpl_leaf_old:
 	FL_ENTER
 	shlr16	r5
 	shlr8	r5			/* CODE */
@@ -2527,7 +2794,7 @@ _gte_intpl_leaf:
 	FLI_COMP 2
 	FLI_COMP 3
 	FL_LEAVE
-	.size	_gte_intpl_leaf, . - _gte_intpl_leaf
+	.size	_gte_intpl_leaf_old, . - _gte_intpl_leaf_old
 
 	.align	2
 fl_c0:	.long	0x39800000		/* 1/4096 */
@@ -2817,7 +3084,7 @@ gl_rc1_c:
 	LIGHT_LEAF_T _gte_ncct_leaf, 5
 	LIGHT_LEAF   _gte_ncds_leaf, 6		/* 0x200 | 0x400 */
 	LIGHT_LEAF_T _gte_ncdt_leaf, 6
-	COLOUR_LEAF  _gte_cc_leaf,   5
+	COLOUR_LEAF  _gte_cc_leaf_old,   5
 	COLOUR_LEAF  _gte_cdp_leaf,  6
 
 /* ---- MVMVA ---- */
@@ -2877,9 +3144,9 @@ gl_mvmva_bug:
 	 nop
 
 	.balign	4
-	.global	_gte_mvmva_leaf
-	.type	_gte_mvmva_leaf, @function
-_gte_mvmva_leaf:
+	.global	_gte_mvmva_leaf_old
+	.type	_gte_mvmva_leaf_old, @function
+_gte_mvmva_leaf_old:
 	ILEAF_ENTER
 	add	#-20, r15		/* room for the bugged matrix; op @(20,r15) */
 	mov.l	@(20, r15), r8		/* the op word (r1 is scratch by now) */
@@ -2985,6 +3252,622 @@ _gte_mvmva_leaf:
 	 nop
 38:	add	#20, r15
 	ILEAF_LEAVE
+	.size	_gte_mvmva_leaf_old, . - _gte_mvmva_leaf_old
+
+
+/* ======================================================================
+ * Bleem-shaped leaves (asm/gte_cop2.md §6, §9, §11, §12, §13.1).  Straight
+ * GBR-relative code, one flag word in r6, IEEE single intermediates, no
+ * MAC overflow bits, sf/lm honoured only where bleem honours them.  Each
+ * leaf clobbers r0-r6 and leaves r3 == GBR.
+ *
+ * file = GBR + 264: V0 264  RGBC 288  IR0 296  IR1..3 300/304/308
+ * SXY0..2 312/316/320  RGB0..2 344/348/352  MAC0 360  MAC1..3 364/368/372
+ * RT 392  TR 412  LLM 424  BK 444  LCM 456  FC 476/480/484  FLAG 516
+ * ====================================================================== */
+
+/* ---- NCLIP: one fipr (§9) ---- */
+	.balign	4
+	.global	_gte_nclip_leaf
+	.type	_gte_nclip_leaf, @function
+_gte_nclip_leaf:
+	mov.w	@(312, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr4		/* SX0 */
+	mov.w	@(314, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr10		/* SY0 */
+	mov.w	@(316, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr5		/* SX1 */
+	mov.w	@(318, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr8		/* SY1 */
+	mov.w	@(320, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr6		/* SX2 */
+	mov.w	@(322, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr9		/* SY2 */
+	fmov	fr8, fr1
+	fsub	fr9, fr8		/* SY1 - SY2 */
+	fsub	fr10, fr9		/* SY2 - SY0 */
+	fsub	fr1, fr10		/* SY0 - SY1 */
+	fldi0	fr7
+	fldi0	fr11
+	fipr	fv4, fv8
+	ftrc	fr11, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360, gbr)		/* MAC0 */
+	mov	#0, r0
+	rts
+	 mov.l	r0, @(516, gbr)
+	.size	_gte_nclip_leaf, . - _gte_nclip_leaf
+
+/* ---- DPCS / INTPL: dpq_stage + colour_tail (§13.1), integer ---- */
+
+/* r1 = the colour term (16*Cn or IRn), r3 = IR0, r2 -> RGB2, r6 = FLAG. */
+.macro DQ_COMP p, n
+	mov.l	@(472 + 4 * \n, gbr), r0	/* FCn */
+	sub	r1, r0
+	mov.w	.L\p\()k7fff, r4
+	cmp/gt	r4, r0
+	bt	.L\p\()d\n
+	mov.w	.L\p\()k8000, r4
+	cmp/ge	r4, r0
+	bf	.L\p\()d\n
+.L\p\()dr\n:
+	mul.l	r3, r0
+	sts	macl, r0
+	mov	#-12, r4
+	shad	r4, r0
+	add	r1, r0				/* MACn */
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	mov.w	.L\p\()k7fff, r4
+	cmp/gt	r4, r0
+	bt	.L\p\()i\n
+	mov.w	.L\p\()k8000, r4
+	cmp/ge	r4, r0
+	bf	.L\p\()i\n
+.L\p\()ir\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)	/* IRn */
+	mov	#-4, r4
+	shad	r4, r0
+	cmp/pz	r0
+	bf	.L\p\()c\n
+	extu.b	r0, r4
+	cmp/hi	r4, r0
+	bt	.L\p\()c\n
+.L\p\()cr\n:
+	mov.b	r0, @(\n - 1, r2)
+.endm
+
+.macro DQ_STUBS p, n
+.L\p\()d\n:
+	mov.l	.L\p\()f\n, r0
+	or	r0, r6
+	bra	.L\p\()dr\n
+	 mov	r4, r0
+.L\p\()i\n:
+	mov.l	.L\p\()f\n, r0
+	or	r0, r6
+	bra	.L\p\()ir\n
+	 mov	r4, r0
+.L\p\()c\n:
+	mov.l	.L\p\()g\n, r4
+	or	r4, r6
+	mov	#-31, r4
+	rotcr	r0
+	bra	.L\p\()cr\n
+	 shad	r4, r0
+.endm
+
+.macro DQ_POOL p
+.L\p\()k7fff:	.word	0x7fff
+.L\p\()k8000:	.word	0x8000
+.L\p\()k352:	.word	352
+	.align	2
+.L\p\()f1:	.long	0x81000000
+.L\p\()f2:	.long	0x80800000
+.L\p\()f3:	.long	0x00400000
+.L\p\()g1:	.long	0x00200000
+.L\p\()g2:	.long	0x00100000
+.L\p\()g3:	.long	0x00080000
+.endm
+
+/* RGB0 <- RGB1 <- RGB2 <- RGBC (whole word, CODE included), r2 -> RGB2. */
+.macro CT_FIFO p
+	stc	gbr, r2
+	mov.w	.L\p\()k352, r0
+	add	r0, r2
+	mov.l	@(348, gbr), r0
+	mov.l	r0, @(344, gbr)
+	mov.l	@(352, gbr), r0
+	mov.l	r0, @(348, gbr)
+	mov.l	@(288, gbr), r0
+	mov.l	r0, @(352, gbr)
+.endm
+
+	.balign	4
+	.global	_gte_dpcs_leaf
+	.type	_gte_dpcs_leaf, @function
+_gte_dpcs_leaf:
+	CT_FIFO	dp
+	mov	r0, r5				/* RGBC */
+	mov.w	@(296, gbr), r0
+	mov	r0, r3				/* IR0 */
+	mov	#0, r6
+	extu.b	r5, r1
+	shll2	r1
+	shll2	r1
+	DQ_COMP	dp, 1
+	shlr8	r5
+	extu.b	r5, r1
+	shll2	r1
+	shll2	r1
+	DQ_COMP	dp, 2
+	shlr8	r5
+	extu.b	r5, r1
+	shll2	r1
+	shll2	r1
+	DQ_COMP	dp, 3
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	DQ_STUBS dp, 1
+	DQ_STUBS dp, 2
+	DQ_STUBS dp, 3
+	DQ_POOL	dp
+	.size	_gte_dpcs_leaf, . - _gte_dpcs_leaf
+
+	.balign	4
+	.global	_gte_intpl_leaf
+	.type	_gte_intpl_leaf, @function
+_gte_intpl_leaf:
+	CT_FIFO	ip
+	mov.w	@(296, gbr), r0
+	mov	r0, r3				/* IR0 */
+	mov	#0, r6
+	mov.w	@(300, gbr), r0
+	mov	r0, r1
+	DQ_COMP	ip, 1
+	mov.w	@(304, gbr), r0
+	mov	r0, r1
+	DQ_COMP	ip, 2
+	mov.w	@(308, gbr), r0
+	mov	r0, r1
+	DQ_COMP	ip, 3
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	DQ_STUBS ip, 1
+	DQ_STUBS ip, 2
+	DQ_STUBS ip, 3
+	DQ_POOL	ip
+	.size	_gte_intpl_leaf, . - _gte_intpl_leaf
+
+/* ---- GPF / GPL (§11), integer ---- */
+
+/* r3 = IR0, r5 = -12 (sf) or 0, r2 -> RGB2, r6 = FLAG.  acc: GPL adds MACn. */
+.macro GP_COMP p, n, acc
+	mov.w	@(296 + 4 * \n, gbr), r0
+	mul.l	r3, r0
+	sts	macl, r0
+	shad	r5, r0
+	.if \acc
+	mov	r0, r4
+	mov.l	@(360 + 4 * \n, gbr), r0
+	add	r4, r0
+	.endif
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	cmp/gt	r1, r0
+	bt	.L\p\()hi\n
+	mov.w	.L\p\()k8000, r4
+	cmp/ge	r4, r0
+	bf	.L\p\()lo\n
+.L\p\()ir\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)
+	cmp/pz	r0
+	bf	.L\p\()c\n
+	shlr2	r0
+	shlr2	r0
+	extu.b	r0, r4
+	cmp/hi	r4, r0
+	bt	.L\p\()c\n
+.L\p\()cr\n:
+	mov.b	r0, @(\n - 1, r2)
+.endm
+
+.macro GP_STUBS p, n
+.L\p\()hi\n:
+	mov.l	.L\p\()f\n, r0
+	or	r0, r6
+	bra	.L\p\()ir\n
+	 mov	r1, r0
+.L\p\()lo\n:
+	mov.l	.L\p\()f\n, r0
+	or	r0, r6
+	bra	.L\p\()ir\n
+	 mov	r4, r0
+.L\p\()c\n:
+	mov.l	.L\p\()g\n, r4
+	or	r4, r6
+	mov	#-31, r4
+	rotcr	r0
+	bra	.L\p\()cr\n
+	 shad	r4, r0
+.endm
+
+.macro GP_LEAF name, p, acc
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	CT_FIFO	\p
+	mov.w	@(296, gbr), r0
+	mov	r0, r3				/* IR0 */
+	mov	r1, r0
+	shlr16	r0
+	tst	#8, r0				/* sf */
+	mov	#0, r5
+	bt	1f
+	mov	#-12, r5
+1:	mov	#0, r6
+	mov.w	.L\p\()k7fff, r1
+	GP_COMP	\p, 1, \acc
+	GP_COMP	\p, 2, \acc
+	GP_COMP	\p, 3, \acc
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	GP_STUBS \p, 1
+	GP_STUBS \p, 2
+	GP_STUBS \p, 3
+	DQ_POOL	\p
+	.size	\name, . - \name
+.endm
+
+	GP_LEAF	_gte_gpf_leaf, gf, 0
+	GP_LEAF	_gte_gpl_leaf, gl, 1
+
+/* ---- CC (§12): BK + LCM*IR/4096 by fmac, float clamp, x RGBC/256 ---- */
+
+/* one column j of LCM into fr4-6 and fmac with fr0 = IRj/4096 */
+.macro CC_COL a, b, c
+	mov.w	@(\a, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(\b, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(\c, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+.endm
+
+/* clamp fr(7+n) to [0, 32767] in float, flags */
+.macro CC_LIM n, f
+	ftrc	\f, fpul
+	sts	fpul, r0
+	cmp/pz	r0
+	bf	.Lcclo\n
+	cmp/hi	r1, r0
+	bt	.Lcchi\n
+.Lccb\n:
+.endm
+
+/* colour_tail, one component from fr(7+n) */
+.macro CC_OUT n, f
+	ftrc	\f, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	cmp/gt	r1, r0
+	bt	.Lcchi2\n
+	cmp/ge	r5, r0
+	bf	.Lcclo2\n
+.Lccir\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)
+	shad	r3, r0
+	cmp/pz	r0
+	bf	.Lccc\n
+	extu.b	r0, r4
+	cmp/hi	r4, r0
+	bt	.Lccc\n
+.Lcccr\n:
+	mov.b	r0, @(\n - 1, r2)
+.endm
+
+.macro CC_STUBS_LIM n, f
+.Lcclo\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	bra	.Lccb\n
+	 fldi0	\f
+.Lcchi\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	mov.l	.Lcc32767, r0
+	lds	r0, fpul
+	bra	.Lccb\n
+	 fsts	fpul, \f
+.endm
+
+.macro CC_STUBS n, f
+.Lcchi2\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	bra	.Lccir\n
+	 mov	r1, r0
+.Lcclo2\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	bra	.Lccir\n
+	 mov	r5, r0
+.Lccc\n:
+	mov.l	.Lccg\n, r4
+	or	r4, r6
+	mov	#-31, r4
+	rotcr	r0
+	bra	.Lcccr\n
+	 shad	r4, r0
+.endm
+
+	.balign	4
+	.global	_gte_cc_leaf
+	.type	_gte_cc_leaf, @function
+_gte_cc_leaf:
+	mov.l	@(444, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr8		/* RBK */
+	mov.l	@(448, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr9
+	mov.l	@(452, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr10
+	mov.l	.Lcc4096, r0
+	lds	r0, fpul
+	fsts	fpul, fr3		/* 1/4096 */
+	mov.w	@(300, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr3, fr0		/* IR1/4096 */
+	CC_COL	456, 462, 468		/* L11 L21 L31 */
+	mov.w	@(304, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr3, fr0
+	CC_COL	458, 464, 470
+	mov.w	@(308, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr3, fr0
+	CC_COL	460, 466, 472
+	mov	#0, r6
+	mov.w	.Lcck7fff, r1
+	mov.l	.Lcc256, r0
+	lds	r0, fpul
+	fsts	fpul, fr3		/* 1/256 */
+	mov.l	@(288, gbr), r0
+	mov	r0, r5			/* RGBC */
+	extu.b	r5, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	fmul	fr3, fr4
+	fmul	fr4, fr8
+	shlr8	r5
+	extu.b	r5, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	fmul	fr3, fr4
+	fmul	fr4, fr9
+	shlr8	r5
+	extu.b	r5, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	fmul	fr3, fr4
+	fmul	fr4, fr10
+	CT_FIFO	cc
+	mov.w	.Lcck8000, r5
+	mov	#-4, r3
+	CC_OUT	1, fr8
+	CC_OUT	2, fr9
+	CC_OUT	3, fr10
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	CC_STUBS 1, fr8
+	CC_STUBS 2, fr9
+	CC_STUBS 3, fr10
+	DQ_POOL	cc
+.Lcc4096:	.long	0x39800000
+.Lcc256:	.long	0x3b800000
+.Lcc32767:	.long	0x46fffe00
+	.size	_gte_cc_leaf, . - _gte_cc_leaf
+
+/* ---- MVMVA (§6), scalar fmac, matrix reloaded every call as bleem does ---- */
+	.balign	4
+	.global	_gte_mvmva_leaf
+	.type	_gte_mvmva_leaf, @function
+_gte_mvmva_leaf:
+	stc	gbr, r2
+	mov	r1, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	mov	r0, r6			/* op >> 12: mx*32 in 0x60, vv*8 in 0x18, sf in 0x80 */
+	/* matrix: 3 -> RT */
+	and	#0x60, r0
+	cmp/eq	#0x60, r0
+	bf	1f
+	mov	#0, r0
+1:	mov.w	.Lmvk392, r4
+	add	r0, r4
+	add	r2, r4
+	/* translation: cv*32 = (op >> 8) & 0x60, 3 -> none */
+	mov	r1, r0
+	shlr8	r0
+	and	#0x60, r0
+	cmp/eq	#0x60, r0
+	bt	2f
+	mov.w	.Lmvk412, r5
+	add	r0, r5
+	add	r2, r5
+	mov.l	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr8
+	mov.l	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr9
+	mov.l	@r5, r0
+	lds	r0, fpul
+	bra	3f
+	 float	fpul, fr10
+2:	fldi0	fr8
+	fldi0	fr9
+	fldi0	fr10
+3:	/* vector: 3 -> IR */
+	mov	r6, r0
+	and	#0x18, r0
+	cmp/eq	#0x18, r0
+	bt	4f
+	mov.w	.Lmvk264, r5
+	add	r0, r5
+	add	r2, r5
+	mov.w	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr0
+	mov.w	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr1
+	mov.w	@r5, r0
+	lds	r0, fpul
+	bra	5f
+	 float	fpul, fr2
+4:	mov.w	@(300, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	mov.w	@(304, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr1
+	mov.w	@(308, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr2
+5:	/* sf: prescale V by 1/4096, else TR by 4096 */
+	mov	r6, r0
+	tst	#0x80, r0
+	mov.l	.Lmv4096i, r0
+	bt	6f
+	lds	r0, fpul
+	fsts	fpul, fr3
+	fmul	fr3, fr0
+	fmul	fr3, fr1
+	bra	7f
+	 fmul	fr3, fr2
+6:	mov.l	.Lmv4096f, r0
+	lds	r0, fpul
+	fsts	fpul, fr3
+	fmul	fr3, fr8
+	fmul	fr3, fr9
+	fmul	fr3, fr10
+7:	/* MAC_i += M(i,j) V_j, column by column; fr0 is the multiplier */
+	mov.w	@(0, r4), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(6, r4), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(12, r4), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+	fmov	fr1, fr0
+	mov.w	@(2, r4), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(8, r4), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(14, r4), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+	fmov	fr2, fr0
+	mov.w	@(4, r4), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(10, r4), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(16, r4), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+	/* lm: lower bound 0 or -0x8000 */
+	mov	r1, r0
+	shlr8	r0
+	tst	#4, r0
+	mov.w	.Lmvk8000, r5
+	bt	8f
+	mov	#0, r5
+8:	mov.w	.Lmvk7fff, r4
+	mov	#0, r6
+.macro MV_OUT n, f
+	ftrc	\f, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	cmp/gt	r4, r0
+	bt	.Lmvhi\n
+	cmp/ge	r5, r0
+	bf	.Lmvlo\n
+.Lmvb\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)
+.endm
+	MV_OUT	1, fr8
+	MV_OUT	2, fr9
+	MV_OUT	3, fr10
+	mov	r6, r0
+	rts
+	 mov.l	r0, @(516, gbr)
+.macro MV_STUBS n
+.Lmvhi\n:
+	mov.l	.Lmvf\n, r0
+	or	r0, r6
+	bra	.Lmvb\n
+	 mov	r4, r0
+.Lmvlo\n:
+	mov.l	.Lmvf\n, r0
+	or	r0, r6
+	bra	.Lmvb\n
+	 mov	r5, r0
+.endm
+	MV_STUBS 1
+	MV_STUBS 2
+	MV_STUBS 3
+.Lmvk392:	.word	392
+.Lmvk412:	.word	412
+.Lmvk264:	.word	264
+.Lmvk7fff:	.word	0x7fff
+.Lmvk8000:	.word	0x8000
+	.align	2
+.Lmv4096i:	.long	0x39800000
+.Lmv4096f:	.long	0x45800000
+.Lmvf1:	.long	0x81000000
+.Lmvf2:	.long	0x80800000
+.Lmvf3:	.long	0x00400000
 	.size	_gte_mvmva_leaf, . - _gte_mvmva_leaf
 
 /* C-callable: gte_leaf_call(file, leaf, op) -- bloom's self-test. */

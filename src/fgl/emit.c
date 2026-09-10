@@ -2464,6 +2464,29 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 			sh4_emit_mov_l_load(&e->cg, FGL_R_XFER, FGL_R_T1);
 			sh4_emit_add_imm(&e->cg, 1, FGL_R_T1);
 			sh4_emit_mov_l_store(&e->cg, FGL_R_T1, FGL_R_XFER);
+
+			/* AND A SECOND COUNTER, FOR THE REGISTERS THAT MATTER.
+			 *
+			 * The RTPS leaf caches XMTRX and the projection
+			 * offsets, and those come from RT/TR (cp2c 0-7) and
+			 * OFX/OFY (24, 25) alone -- `PSXCP2_RT_REG` in
+			 * libpcsxcore/gte.h, which is where the pair is
+			 * defined.  Keying the leaf on the coarse counter made
+			 * a write to H, DQA, DQB or a light matrix throw the
+			 * matrix away for nothing.  The word at +4 is that
+			 * finer count; the register number is known here, so
+			 * the four instructions are only emitted where they
+			 * can fire. */
+			if ((unsigned)(p->imm - FGL_AT_CP2C) < 8u ||
+			    p->imm - FGL_AT_CP2C == 24u ||
+			    p->imm - FGL_AT_CP2C == 25u) {
+				sh4_emit_add_imm(&e->cg, 4, FGL_R_XFER);
+				sh4_emit_mov_l_load(&e->cg, FGL_R_XFER,
+						    FGL_R_T1);
+				sh4_emit_add_imm(&e->cg, 1, FGL_R_T1);
+				sh4_emit_mov_l_store(&e->cg, FGL_R_T1,
+						     FGL_R_XFER);
+			}
 		}
 		break;
 

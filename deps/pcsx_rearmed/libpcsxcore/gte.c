@@ -378,10 +378,12 @@ void MTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 
 /* Bumped on every write to a control register, so a consumer that caches
  * anything derived from them can tell in one compare whether it went stale. */
-u32 psxCP2CtrlGen;
+u32 psxCP2Gen[2];
 
 void CTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 	psxCP2CtrlGen++;
+	if (PSXCP2_RT_REG(reg))
+		psxCP2RtGen++;
 
 	switch (reg) {
 		case 4:

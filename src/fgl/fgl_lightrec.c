@@ -153,7 +153,7 @@ FGL_ASSERT(!ENABLE_FIRST_PASS || OPT_HANDLE_LOAD_DELAYS, first_pass_load_delay);
  * the same reason. */
 extern void *gte_fpu_resolve(u32 op);
 extern int gte_fpu_leaf_cmd(u32 op);
-extern uint32_t psxCP2CtrlGen;
+extern uint32_t psxCP2Gen[2];
 
 /* The leaf routines themselves (src/gte_rtp.S).  Declared as data because
  * nothing here calls them -- their addresses go into emitted code, and they
@@ -670,7 +670,7 @@ static void fgl_targets_once(void)
 	fgl_dc_targets.mtc      = (u32)(uintptr_t)fgl_mtc;
 	fgl_dc_targets.mfc      = (u32)(uintptr_t)fgl_mfc;
 	fgl_dc_targets.rfe      = (u32)(uintptr_t)fgl_rfe;
-	fgl_dc_targets.cp2_ctrl_gen = (u32)(uintptr_t)&psxCP2CtrlGen;
+	fgl_dc_targets.cp2_ctrl_gen = (u32)(uintptr_t)&psxCP2Gen[0];
 	fgl_dc_targets.wild     = (u32)(uintptr_t)fgl_wild_store;
 	fgl_dc_targets.gte_body = fgl_gte_body;
 	fgl_dc_targets.gte_leaf = fgl_gte_leaf;
