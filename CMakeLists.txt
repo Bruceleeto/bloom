@@ -8,7 +8,7 @@ include(kallistios)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 if (NOT CMAKE_BUILD_TYPE)
-	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Type of build" FORCE)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Type of build" FORCE)
 	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
 		None Debug Release RelWithDebInfo MinSizeRel
 	)
@@ -232,7 +232,7 @@ option(WITH_480P "Enable high-resolution 480p mode" ON)
 option(WITH_HYBRID_RENDERING "Enable hybrid rendering" ON)
 option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF)
 option(WITH_CLIPPING "Enable pixel clipping" ON)
-option(WITH_FPS_OVERLAY "Draw an on-screen fps/frame-time counter" OFF)
+option(WITH_FPS_OVERLAY "Draw an on-screen fps/frame-time counter" ON)
 
 if (WITH_HYBRID_RENDERING)
 	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
@@ -395,7 +395,12 @@ if (WITH_EMBEDDED_BIOS_PATH)
 endif()
 
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
-set(WITH_GAME_PATH "" CACHE PATH "If set, auto-boot the CD image at the given path")
+set(WITH_GAME_PATH "/ide/bloom/game.bin" CACHE PATH "If set, auto-boot the CD image at the given path")
+
+# If set, load this savestate once the game is up, so every run benches the same
+# scene.  Lives in romdisk/, so hardware and Flycast measure the same thing.
+# Same file as rearmed_bloom's game/bench.sav.gz.  Set "" to boot normally.
+set(WITH_BENCH_STATE "/rd/bench.sav.gz" CACHE PATH "Savestate to load at boot, e.g. /rd/bench.sav.gz")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
 set(WITH_MCD2_PATH "/dev/mcd1" CACHE PATH "Runtime path to the second memory card image")
