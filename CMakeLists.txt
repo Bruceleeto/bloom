@@ -254,7 +254,12 @@ endif()
 
 if (SPU_PLUGIN STREQUAL Null)
 	add_library(spu STATIC
-		${PCSX_REAL_DIR}/plugins/spunull/spunull.c
+		${PCSX_REAL_DIR}/plugins/dfsound/dma.c
+		${PCSX_REAL_DIR}/plugins/dfsound/freeze.c
+		${PCSX_REAL_DIR}/plugins/dfsound/registers.c
+		${PCSX_REAL_DIR}/plugins/dfsound/spu.c
+		${PCSX_REAL_DIR}/plugins/dfsound/out.c
+		${PCSX_REAL_DIR}/plugins/dfsound/nullsnd.c
 	)
 elseif(SPU_PLUGIN STREQUAL AICA)
 	add_library(spu STATIC src/aica.c)
