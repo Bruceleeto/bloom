@@ -22,6 +22,7 @@
 
 #include "bloom-config.h"
 #include "emu.h"
+#include "overlay.h"
 #include "pvr.h"
 
 #define MAX_LAG_FRAMES 3
@@ -307,6 +308,10 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   (float)frames, screen_w, screen_h, screen_bpp,
 			   (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
+
+		overlay_set("%.1f fps  %.2f ms",
+			    (float)frames * 1000.0f / (float)(new_timer - timer_ms),
+			    (float)(new_timer - timer_ms) / (float)frames);
 
 		timer_ms = new_timer;
 		frames = 0;
