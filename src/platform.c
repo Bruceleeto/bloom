@@ -23,6 +23,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "overlay.h"
+#include "prof.h"
 #include "pvr.h"
 
 #define MAX_LAG_FRAMES 3
@@ -281,7 +282,9 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		pvr_prim(&vert, sizeof(vert));
 
 		pvr_list_finish();
+		prof_enter(PROF_FLIP);
 		pvr_scene_finish();
+		prof_leave();
 	}
 
 	frame_was_24bpp = bgr24;
@@ -292,11 +295,21 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 
 	if (timer_ms == 0) {
 		timer_ms = new_timer;
+
+		/* Started here, not at boot, so the BIOS and the savestate load
+		 * stay out of the numbers. */
+		prof_start();
+		prof_calibrate();
 		return;
 	}
 
+	/* After the start above, so frame 1 isn't counted before the counters
+	 * are running. */
+	prof_frame();
+
 	if (new_timer > (timer_ms + 1000)) {
 		pvr_get_stats(&pvr_stats);
+
 
 		cputime = timer_ms_gettime64();
 		idletime = thd_get_cpu_time(thd_get_idle());

@@ -29,6 +29,8 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "prof.h"
+
 static struct block * lightrec_precompile_block(struct lightrec_state *state,
 						u32 pc);
 static bool lightrec_block_is_fully_tagged(const struct block *block);
@@ -399,9 +401,13 @@ static void lightrec_rw_helper(struct lightrec_state *state,
 	}
 }
 
+/* The two callbacks below, not lightrec_rw() itself: these are what emitted
+ * code calls, and lightrec_rw() has a return in every arm of a large switch. */
 static void lightrec_rw_cb(struct lightrec_state *state, u32 arg)
 {
+	prof_enter(PROF_IO);
 	lightrec_rw_helper(state, (union code) arg, NULL, NULL, 0);
+	prof_leave();
 }
 
 static void lightrec_rw_generic_cb(struct lightrec_state *state, u32 arg)
@@ -410,17 +416,22 @@ static void lightrec_rw_generic_cb(struct lightrec_state *state, u32 arg)
 	struct opcode *op;
 	u16 offset = (u16)arg;
 
+	prof_enter(PROF_IO);
+
 	block = lightrec_find_block_from_lut(state->block_cache,
 					     arg >> 16, state->curr_pc);
 	if (unlikely(!block)) {
 		pr_err("rw_generic: No block found in LUT for "PC_FMT" offset 0x%"PRIx16"\n",
 			 state->curr_pc, offset);
 		lightrec_set_exit_flags(state, LIGHTREC_EXIT_SEGFAULT);
+		prof_leave();
 		return;
 	}
 
 	op = &block->opcode_list[offset];
 	lightrec_rw_helper(state, op->c, &op->flags, block, offset);
+
+	prof_leave();
 }
 
 static u32 clamp_s32(s32 val, s32 min, s32 max)
@@ -740,7 +751,11 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 		if (func && func != state->get_next_block)
 			break;
 
+		/* Decode and optimise. This is the miss path: a hit broke out
+		 * of the loop above without reaching here. */
+		prof_enter(PROF_COMPILE);
 		block = lightrec_get_block(state, pc);
+		prof_leave();
 
 		if (unlikely(!block))
 			break;
@@ -761,7 +776,9 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 			if (ENABLE_THREADED_COMPILER) {
 				lightrec_recompiler_add(state->rec, block);
 			} else {
+				prof_enter(PROF_COMPILE);
 				err = lightrec_compile_block(state->cstate, block);
+				prof_leave();
 				if (err) {
 					state->exit_flags = LIGHTREC_EXIT_NOMEM;
 					return NULL;
@@ -788,7 +805,9 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 				pc = lightrec_emulate_block(state, block, pc);
 
 			/* Then compile it using the profiled data */
+			prof_enter(PROF_COMPILE);
 			err = lightrec_compile_block(state->cstate, block);
+			prof_leave();
 			if (err) {
 				state->exit_flags = LIGHTREC_EXIT_NOMEM;
 				return NULL;

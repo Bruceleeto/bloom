@@ -234,6 +234,38 @@ option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF
 option(WITH_CLIPPING "Enable pixel clipping" ON)
 option(WITH_FPS_OVERLAY "Draw an on-screen fps/frame-time counter" ON)
 
+# The instrument is not free, so a frame time to be quoted comes from an OFF
+# build.
+option(WITH_PROF "Profile with the SH7750 performance counters" OFF)
+set(WITH_PROF_FRAMES 400 CACHE STRING
+	"Report after this many frames, then stop. ~30s at 13fps")
+
+# Paths go in unconditionally: prof.h is included from the vendored trees and
+# stubs itself out when WITH_PROF is off. `gpu`'s PVR branch doesn't link
+# libpcsxcore, so it needs its own copy.
+target_include_directories(libpcsxcore PUBLIC
+	${CMAKE_CURRENT_SOURCE_DIR}/src
+	${CMAKE_CURRENT_BINARY_DIR}
+)
+target_include_directories(gpu PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/src
+	${CMAKE_CURRENT_BINARY_DIR}
+)
+# add_subdirectory target, inherits nothing from here.
+target_include_directories(lightrec PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/src
+	${CMAKE_CURRENT_BINARY_DIR}
+)
+if (WITH_PROF)
+	# Its own library: lightrec doesn't link libpcsxcore back, so a prof.c
+	# in there would leave lightrec's brackets unresolved.
+	add_library(prof STATIC src/prof.c)
+	target_include_directories(prof PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+	target_link_libraries(lightrec PUBLIC prof)
+	target_link_libraries(libpcsxcore PUBLIC prof)
+	target_link_libraries(gpu PUBLIC prof)
+endif(WITH_PROF)
+
 if (WITH_HYBRID_RENDERING)
 	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
 	math(EXPR POLY_BUFFER_SIZE "0x400 * ${WITH_POLYBUF_SIZE_KB}")

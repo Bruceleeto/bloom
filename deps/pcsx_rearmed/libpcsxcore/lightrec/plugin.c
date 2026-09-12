@@ -26,6 +26,7 @@
 
 #include "mem.h"
 #include "plugin.h"
+#include "prof.h"
 
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
@@ -143,6 +144,8 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 
 	psxRegs.code = func;
 
+	prof_enter(PROF_GTE);
+
 	if (unlikely(!cp2_ops[func & 0x3f])) {
 		fprintf(stderr, "Invalid CP2 function %u\n", func);
 	} else {
@@ -150,6 +153,8 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 		 * so it can be cast to a pcsxCP2Regs pointer. */
 		cp2_ops[func & 0x3f]((psxCP2Regs *) regs->cp2d);
 	}
+
+	prof_leave();
 }
 
 static bool has_interrupt(void)

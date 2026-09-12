@@ -22,6 +22,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "overlay.h"
+#include "prof.h"
 #include "pvr.h"
 
 #if ENABLE_THREADED_RENDERER
@@ -2838,6 +2839,9 @@ int do_cmd_list(uint32_t *list, int list_len,
 	const union PacketBuffer *pbuffer;
 	unsigned int i, len_polyline;
 
+	/* One exit, the `out:` label below, so a single leave is enough. */
+	prof_enter(PROF_GPUFRONT);
+
 	for (; list < list_end; list += 1 + len)
 	{
 		cmd = *list >> 24;
@@ -2963,6 +2967,7 @@ out:
 	*cycles_sum_out += cpu_cycles_sum;
 	*cycles_last = cpu_cycles;
 	*last_cmd = cmd;
+	prof_leave();
 	return list - list_start;
 }
 
@@ -3156,6 +3161,8 @@ void hw_render_stop(void)
 {
 	bool overpaint;
 
+	prof_enter(PROF_RENDER);
+
 	process_gpu_commands();
 
 	if (unlikely(pvr.new_frame)) {
@@ -3204,7 +3211,9 @@ void hw_render_stop(void)
 	if (WITH_CLIPPING && pvr.nb_clips)
 		pvr_render_modifier_volumes();
 
+	prof_enter(PROF_FLIP);
 	pvr_scene_finish();
+	prof_leave();
 
 	/* Discard any textures covered by the draw area */
 	pvr_update_caches(pvr.start_x, pvr.start_y,
@@ -3214,6 +3223,8 @@ void hw_render_stop(void)
 	pvr.start_y = pvr.view_y;
 	pvr.draw_offt_x = pvr.draw_dx - pvr.start_x + gpu.screen.x;
 	pvr.draw_offt_y = pvr.draw_dy - pvr.start_y + gpu.screen.y;
+
+	prof_leave();
 }
 
 void renderer_flush_queues(void)

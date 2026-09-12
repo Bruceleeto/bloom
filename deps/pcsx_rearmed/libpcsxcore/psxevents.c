@@ -5,6 +5,7 @@
 #include "psxdma.h"
 #include "mdec.h"
 #include "psxevents.h"
+#include "prof.h"
 
 //#define evprintf printf
 #define evprintf(...)
@@ -91,8 +92,10 @@ void gen_interupt(psxCP0Regs *cp0)
 	evprintf("  +ge %08x, %u->%u (%d)\n", regs->pc, regs->cycle,
 		regs->next_interupt, regs->next_interupt - regs->cycle);
 
+	prof_enter(PROF_EVT);
 	irq_test(cp0);
 	schedule_timeslice(regs);
+	prof_leave();
 
 	evprintf("  -ge %08x, %u->%u (%d)\n", regs->pc, regs->cycle,
 		regs->next_interupt, regs->next_interupt - regs->cycle);
