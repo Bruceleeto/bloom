@@ -1001,6 +1001,24 @@ _casx(jit_state_t *_jit, jit_int32_t r0, jit_int32_t r1,
 static void
 _addr(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_uint16_t r2)
 {
+	jit_uint16_t t;
+
+	/* GBR has no ALU encoding: bring it into a GPR first. */
+	if (r2 == _GBR) {
+		t = r1; r1 = r2; r2 = t;
+	}
+	if (r1 == _GBR) {
+		if (r0 != r2) {
+			STCGBR(r0);
+			ADD(r0, r2);
+		} else {
+			assert(r0 != _R0);
+			STCGBR(_R0);
+			ADD(r0, _R0);
+		}
+		return;
+	}
+
 	if (r0 == r2) {
 		ADD(r0, r1);
 	} else {
@@ -1030,6 +1048,11 @@ _addxr(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_uint16_t r2)
 static void
 _addi(jit_state_t *_jit, jit_uint16_t r0, jit_uint16_t r1, jit_word_t i0)
 {
+	if (r1 == _GBR) {
+		STCGBR(r0);
+		r1 = r0;
+	}
+
 	if (i0 >= -128 && i0 < 127) {
 		movr(r0, r1);
 		ADDI(r0, i0);
