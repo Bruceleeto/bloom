@@ -64,7 +64,7 @@ set(HAS_DEFAULT_ELM ${CMAKE_COMPILER_IS_GNUCC})
 
 option(ENABLE_FIRST_PASS "Run the interpreter as first-pass optimization" ON)
 
-option(ENABLE_THREADED_COMPILER "Enable threaded compiler" ON)
+option(ENABLE_THREADED_COMPILER "Enable threaded compiler" OFF)
 if (ENABLE_THREADED_COMPILER)
 	target_sources(lightrec PRIVATE recompiler.c reaper.c)
 
