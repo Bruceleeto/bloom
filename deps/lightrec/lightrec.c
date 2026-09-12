@@ -1967,11 +1967,30 @@ struct lightrec_state * lightrec_init(char *argv0,
 
 	init_jit_with_debug(argv0, stdout);
 
-	state = calloc(1, sizeof(*state) + lut_size);
-	if (!state)
-		goto err_finish_jit;
+	/* The operand cache is direct mapped, so the low bits of an address
+	 * pick the set. The scratchpad is touched on every block entry and so
+	 * is the state block: keep them out of each other's sets. */
+	{
+		uintptr_t sp = (uintptr_t)maps[PSX_MAP_SCRATCH_PAD].address;
+		size_t splen = maps[PSX_MAP_SCRATCH_PAD].length;
+		size_t slack = splen + 32;
+		char *base = calloc(1, sizeof(*state) + lut_size + slack);
+		uintptr_t p;
 
-	lightrec_register(MEM_FOR_LIGHTREC, sizeof(*state) + lut_size);
+		if (!base)
+			goto err_finish_jit;
+
+		p = ((uintptr_t)base + 31) & ~(uintptr_t)31;
+		if ((p & (OCACHE_SIZE - 1)) - (sp & (OCACHE_SIZE - 1)) < splen)
+			p += splen;
+
+		state = (struct lightrec_state *)p;
+		state->alloc_base = base;
+		state->alloc_slack = slack;
+	}
+
+	lightrec_register(MEM_FOR_LIGHTREC,
+			  sizeof(*state) + lut_size + state->alloc_slack);
 
 	state->tlsf = tlsf;
 	state->with_32bit_lut = with_32bit_lut;
@@ -2061,8 +2080,9 @@ err_free_block_cache:
 	lightrec_free_block_cache(state->block_cache);
 err_free_state:
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
-			    lut_elm_size(state) * CODE_LUT_SIZE);
-	free(state);
+			    lut_elm_size(state) * CODE_LUT_SIZE
+			    + state->alloc_slack);
+	free(state->alloc_base);
 err_finish_jit:
 	finish_jit();
 	if (ENABLE_CODE_BUFFER && tlsf)
@@ -2092,8 +2112,9 @@ void lightrec_destroy(struct lightrec_state *state)
 		tlsf_destroy(state->tlsf);
 
 	lightrec_unregister(MEM_FOR_LIGHTREC, sizeof(*state) +
-			    lut_elm_size(state) * CODE_LUT_SIZE);
-	free(state);
+			    lut_elm_size(state) * CODE_LUT_SIZE
+			    + state->alloc_slack);
+	free(state->alloc_base);
 }
 
 void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)

@@ -90,6 +90,9 @@
 
 #define CODE_LUT_SIZE	((RAM_SIZE + BIOS_SIZE) >> 2)
 
+/* SH-4 operand cache: 16 KiB, direct mapped. */
+#define OCACHE_SIZE	0x4000
+
 #define REG_LO 32
 #define REG_HI 33
 #define REG_TEMP (offsetof(struct lightrec_state, temp_reg) / sizeof(u32))
@@ -199,6 +202,8 @@ struct lightrec_state {
 	u32 opt_flags;
 	_Bool with_32bit_lut;
 	_Bool mirrors_mapped;
+	void *alloc_base;
+	size_t alloc_slack;
 	void *code_lut[];
 };
 
