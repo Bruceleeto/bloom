@@ -165,6 +165,9 @@ typedef jit_int32_t		jit_fpr_t;
 #define jit_flag_synth		0x0010	/* synthesized instruction */
 #define jit_flag_head		0x1000	/* label reached by normal flow */
 #define jit_flag_varargs	0x2000	/* call{r,i} to varargs function */
+#define jit_flag_far		0x8000	/* forward conditional branch whose target
+					 * a previous emit pass proved out of
+					 * BF/BT range, so it needs the BRA pad */
 
 #define JIT_R(index)		jit_r(index)
 #define JIT_V(index)		jit_v(index)

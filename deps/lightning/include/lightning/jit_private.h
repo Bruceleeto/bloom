@@ -603,6 +603,14 @@ struct jit_function {
 
 /* data used only during jit generation */
 struct jit_compiler {
+    /* THE NODE BEING EMITTED. The SH backend's conditional branches need to
+     * know whether a previous pass proved this branch far, and the emitters
+     * are reached through macros that do not carry the node. Set once per
+     * node in emit_code() rather than threaded through twenty signatures. */
+    jit_node_t		*cur_node;
+    /* SH: the node being emitted needs the long branch form, because a
+     * previous pass of this function found its label out of range. */
+    jit_bool_t		 far;
 #if __ia64__
     struct {
 	jit_uint64_t	  i : 41;

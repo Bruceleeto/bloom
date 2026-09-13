@@ -892,10 +892,38 @@ emit_branch_opcode(jit_state_t *_jit, jit_word_t i0, jit_word_t w,
 		else
 			BF(0);
 
-		/* Leave space after the BF/BT in case we need to add a
-		 * BRA opcode. */
-		w = _jit->code.length - (_jit->pc.uc - _jit->code.ptr);
-		if (w > 254) {
+		/* SPACE FOR A BRA, BUT ONLY FOR A BRANCH THAT NEEDS ONE.
+		 *
+		 * A forward BF/BT reaches +254 bytes. When the target turns out
+		 * to be further, patch_at() inverts the condition and writes a
+		 * BRA into the next word, whose delay slot is the word after --
+		 * so two words have to be reserved. Reserving them for every
+		 * forward conditional branch is what this used to do, and the
+		 * old test (`bytes left in the buffer > 254`) is true for
+		 * essentially all of them, so the pad was always paid.
+		 *
+		 * Measured on Spyro's boot: 2654 of these branches are in range
+		 * and 11 are not. The pad was 4 dead bytes on 99.6% of them, or
+		 * 10.6 KiB of a 247 KiB code buffer -- 4.3% of everything
+		 * emitted, which on a Dreamcast is icache.
+		 *
+		 * So it is reserved only for a branch a previous pass proved
+		 * far.
+		 *
+		 * WHERE THE PROOF COMES FROM, AND WHY NOT THE PATCH LOOP. The
+		 * first pass over a function pads every forward branch; at its
+		 * epilog every label address is known, so each pending patch can
+		 * be measured and the near ones marked on their nodes, and
+		 * _jitc->again re-emits the function from the prolog. That is
+		 * lightning's own restart -- it rewinds the constant pools and
+		 * the patch list with the code -- which is what makes this safe
+		 * where the final patch loop was not: that loop runs after
+		 * flush_consts(1) has already placed the pools, and returning
+		 * NULL from it measured 28 SH-4 faults.
+		 *
+		 * Passes after the first only ever *clear* the mark, so the loop
+		 * cannot oscillate and terminates. */
+		if (_jitc->far) {
 			NOP();
 			NOP();
 		}
@@ -2890,7 +2918,11 @@ _jmpi(jit_state_t *_jit, jit_word_t i0, jit_bool_t force)
 	w = _jit->pc.w;
 	disp = (i0 - w >> 1) - 2;
 
-	if (force || (disp >= -2048 && disp <= 2046)) {
+	/* A forward jump to a label of this function is emitted as a bare BRA
+	 * and verified at the epilog; only a target a previous pass found out
+	 * of +-4 KiB takes the register form below. Without that check
+	 * patch_at()'s case 0xa would assert on a jump it cannot express. */
+	if ((force && !_jitc->far) || (!force && disp >= -2048 && disp <= 2046)) {
 		BRA(disp);
 		NOP();
 	} else if (0) {

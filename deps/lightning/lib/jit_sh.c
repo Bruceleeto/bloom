@@ -554,6 +554,65 @@ _jit_regarg_p(jit_state_t *_jit, jit_node_t *node, jit_int32_t regno)
     return (0);
 }
 
+/* WHICH BRANCHES OF THIS FUNCTION NEED THEIR LONG FORM.
+ *
+ * Called at the epilog, where every label of the function has its address, so
+ * each patch still pending can be measured instead of guessed. A forward
+ * branch is emitted in its short form first -- a bare BF/BT with nothing
+ * reserved behind it, a bare BRA -- and anything that turns out not to reach
+ * is flagged jit_flag_far and the function emitted again through lightning's
+ * own _jitc->again path, which rewinds the constant pools and the patch list
+ * along with the code. That is what makes this safe where the final patch loop
+ * was not: that loop runs after flush_consts(1) has placed the pools, and
+ * returning NULL from it measured 28 SH-4 faults.
+ *
+ * The flagged set only ever grows, so the re-emit loop terminates.
+ *
+ * Ported from za/bloom 80f4776, where it measured ~1 ms on Spyro. */
+static jit_bool_t
+_relax_branches(jit_state_t *_jit, jit_int32_t first_patch)
+{
+    jit_int32_t		 offset;
+    jit_word_t		 inst;
+    jit_word_t		 disp;
+    jit_uint16_t	 op;
+    jit_node_t		*node;
+    jit_node_t		*target;
+    jit_bool_t		 changed = 0;
+
+    for (offset = first_patch; offset < _jitc->patches.offset; offset++) {
+	node = _jitc->patches.ptr[offset].node;
+	inst = _jitc->patches.ptr[offset].inst;
+	op = *(jit_uint16_t *)inst;
+
+	/* A movi patch is a pool word, not a displacement, and a node already
+	 * known far keeps the form it was emitted with. */
+	if (node->code == jit_code_movi || (node->flag & jit_flag_far))
+	    continue;
+
+	target = node->u.n;
+
+	if ((op & 0xf900) == 0x8900) {			/* BT/BF(/S) */
+	    disp = ((target->u.w - inst) >> 1) - 2;
+	    if (!(target->flag & jit_flag_patch)
+		|| disp < -128 || disp > 127) {
+		node->flag |= jit_flag_far;
+		changed = 1;
+	    }
+	} else if ((op & 0xf000) == 0xa000) {		/* BRA */
+	    disp = ((target->u.w - inst) >> 1) - 2;
+	    if (!(target->flag & jit_flag_patch)
+		|| disp < -2048 || disp > 2046) {
+		node->flag |= jit_flag_far;
+		changed = 1;
+	    }
+	}
+    }
+
+    return (changed);
+}
+#define relax_branches(f)		_relax_branches(_jit, f)
+
 jit_pointer_t
 _emit_code(jit_state_t *_jit)
 {
@@ -746,6 +805,9 @@ _emit_code(jit_state_t *_jit)
     for (node = _jitc->head; node; node = node->next) {
 	if (_jit->pc.uc >= _jitc->code.end)
 	    return (NULL);
+
+	_jitc->cur_node = node;
+	_jitc->far = !!(node->flag & jit_flag_far);
 
 #if DEVEL_DISASSEMBLER
 	node->offset = (jit_uword_t)_jit->pc.w - (jit_uword_t)prevw;
@@ -1258,6 +1320,12 @@ _emit_code(jit_state_t *_jit)
 		break;
 	    case jit_code_epilog:
 		assert(_jitc->function == _jitc->functions.ptr + node->w.w);
+
+		/* Measure this function's branches while the labels still have
+		 * addresses and the pools can still be rewound. */
+		if (relax_branches(undo.patch_offset))
+			_jitc->again = 1;
+
 		if (_jitc->again) {
 		    for (temp = undo.node->next;
 			 temp != node; temp = temp->next) {
