@@ -785,32 +785,22 @@ static void load_block_4bpp(struct texture_page *page,
 }
 
 static void load_block(struct texture_page *page, unsigned int page_offset,
-		       unsigned int x, unsigned int y)
+		       unsigned int x, unsigned int y, uint32_t *sq)
 {
 	const void *src = texture_page_get_addr(page_offset);
-	uint32_t *sq;
-	pvr_ptr_t dst;
 
 	src += y * 16 * 2048 + x * 32;
 
 	if (likely(page->settings.bpp == TEXTURE_4BPP)) {
-		dst = &page->vq->frame[y * 16 * 256 + x * 64];
-		sq = sq_lock(pvr_ptr_get_sq_addr(dst));
-
+		sq += (y * 16 * 256 + x * 64) / sizeof(*sq);
 		load_block_4bpp(page, sq, src);
 	} else if (page->settings.bpp == TEXTURE_8BPP) {
-		dst = &page->vq->frame[y * 16 * 128 + x * 32];
-		sq = sq_lock(pvr_ptr_get_sq_addr(dst));
-
+		sq += (y * 16 * 128 + x * 32) / sizeof(*sq);
 		load_block_8bpp(page, sq, src);
 	} else {
-		dst = (pvr_ptr_t)((uintptr_t)page->tex + y * 16 * 128 + x * 32);
-		sq = sq_lock(pvr_ptr_get_sq_addr(dst));
-
+		sq += (y * 16 * 128 + x * 32) / sizeof(*sq);
 		load_block_16bpp(to_texture_page_16bpp(page), sq, src);
 	}
-
-	sq_unlock();
 }
 
 __noinline
@@ -818,13 +808,24 @@ static void update_texture(struct texture_page *page,
 			   unsigned int page_offset, uint64_t to_load)
 {
 	unsigned int idx;
+	uint32_t *sq;
+	pvr_ptr_t addr;
+
+	if (page->settings.bpp == TEXTURE_16BPP)
+		addr = page->tex;
+	else
+		addr = page->vq->frame;
+
+	sq = sq_lock(addr);
 
 	for (idx = 0; idx < 64; idx++) {
 		if (to_load & BITLL(idx)) {
-			load_block(page, page_offset, idx % 4, idx / 4);
+			load_block(page, page_offset, idx % 4, idx / 4, sq);
 			page->block_mask |= BITLL(idx);
 		}
 	}
+
+	sq_unlock();
 }
 
 static void maybe_update_texture(struct texture_page *page,
