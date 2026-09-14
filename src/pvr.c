@@ -645,8 +645,49 @@ static inline bool clut_is_outdated(const struct texture_clut *clut, bool bpp4)
 	return false;
 }
 
+/* CODEBOOK MEMO -- see PVR.md. find_texture_codebook() is a linear scan over
+ * nb_cluts whose every step calls clut_is_outdated(), which for 8bpp walks up
+ * to four texture pages. It runs once per textured polygon while the same
+ * (page, clut) repeats ~37 times in a row.
+ *
+ * Safe because a HIT writes nothing: clut_is_outdated() and clut_is_used() are
+ * pure functions of the inval counters, and only the palette-load path at the
+ * bottom stores. poly_get_texture_page() is deliberately NOT memoized -- its
+ * block_mask is UV-derived and maybe_update_texture() uploads missing blocks. */
+static struct texture_page *cb_memo_page;
+static uint16_t cb_memo_clut;
+static uint16_t cb_memo_gen;
+static unsigned int cb_memo_codebook;
+
+static inline void cb_memo_flush(void)
+{
+	cb_memo_page = NULL;
+}
+
 static unsigned int
+find_texture_codebook_slow(struct texture_page *page, uint16_t clut);
+
+static inline unsigned int
 find_texture_codebook(struct texture_page *page, uint16_t clut)
+{
+	unsigned int codebook;
+
+	if (likely(cb_memo_page == page && cb_memo_clut == clut
+		   && cb_memo_gen == pvr.inval_counter))
+		return cb_memo_codebook;
+
+	codebook = find_texture_codebook_slow(page, clut);
+
+	cb_memo_page = page;
+	cb_memo_clut = clut;
+	cb_memo_gen = pvr.inval_counter;
+	cb_memo_codebook = codebook;
+
+	return codebook;
+}
+
+static unsigned int
+find_texture_codebook_slow(struct texture_page *page, uint16_t clut)
 {
 	struct texture_page_4bpp *page4 = to_texture_page_4bpp(page);
 	bool bpp4 = page->settings.bpp == TEXTURE_4BPP;
@@ -921,6 +962,7 @@ static void discard_texture_page(struct texture_page *page)
 	pvr_reap_ptr(page->tex);
 	page->tex = NULL;
 	page->block_mask = 0;
+	cb_memo_flush();
 }
 
 static void invalidate_texture(struct texture_page *page, uint64_t block_mask)
@@ -1300,6 +1342,7 @@ static void pvr_maybe_free_page(struct texture_page *page)
 	if (page->tex && !page->inuse_mask && !page->old_inuse_mask) {
 		pvr_mem_free(page->tex);
 		page->tex = NULL;
+		cb_memo_flush();
 	}
 }
 
@@ -1373,6 +1416,7 @@ poly_get_texture_page(const struct poly *poly)
 		page->block_mask = 0;
 		page->inuse_mask = 0;
 		page->old_inuse_mask = 0;
+		cb_memo_flush();
 	}
 
 	if (unlikely(poly->flags & POLY_FB))
