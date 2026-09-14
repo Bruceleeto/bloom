@@ -11,7 +11,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define REG_PC (offsetof(struct lightrec_state, curr_pc) / sizeof(u32))
+/* NOT AN OFFSET, A SIGNED INDEX OFF regs.gpr. clean_reg() stores a dirty
+ * register at `regs.gpr + (emulated_register << 2)`, so the id that makes a
+ * dirty PC land on curr_pc is its distance from gpr[0] in words -- which is
+ * negative now that curr_pc sits in front of the register file. It stays
+ * clear of every real id: guest registers are 0..31 and "unmapped" is -1. */
+#define REG_PC ((s16)(((s32)offsetof(struct lightrec_state, curr_pc)	\
+		       - (s32)offsetof(struct lightrec_state, regs.gpr))	\
+		      / (s32)sizeof(u32)))
 
 enum reg_priority {
 	REG_IS_TEMP,
@@ -544,7 +551,10 @@ void lightrec_load_next_pc(struct regcache *cache, jit_state_t *_jit, u8 reg)
 static void free_reg(struct native_register *nreg)
 {
 	/* Set output registers as dirty */
-	if (nreg->used && nreg->output && nreg->emulated_register > 0)
+	/* REG_PC is negative now, so "a real destination" is no longer "> 0":
+	 * 0 is $zero, which is never dirty, and -1 is unmapped. */
+	if (nreg->used && nreg->output &&
+	    (nreg->emulated_register > 0 || nreg->emulated_register == REG_PC))
 		nreg->prio = REG_IS_DIRTY;
 	if (nreg->output) {
 		nreg->extended = nreg->extend;

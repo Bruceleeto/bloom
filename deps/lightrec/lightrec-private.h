@@ -95,7 +95,13 @@
 
 #define REG_LO 32
 #define REG_HI 33
-#define REG_TEMP (offsetof(struct lightrec_state, temp_reg) / sizeof(u32))
+/* NOT AN OFFSET, A SIGNED INDEX OFF regs.gpr, like REG_PC in regcache.c: the
+ * register cache stores a dirty register at `regs.gpr + (id << 2)`, so an id
+ * derived from the raw offset only lands on its field while regs sits at the
+ * top of the struct. It does not any more. */
+#define REG_TEMP ((s16)(((s32)offsetof(struct lightrec_state, temp_reg)	\
+			 - (s32)offsetof(struct lightrec_state, regs.gpr)) \
+			/ (s32)sizeof(u32)))
 
 /* Definition of jit_state_t (avoids inclusion of <lightning.h>) */
 struct jit_node;
@@ -169,10 +175,39 @@ struct lightrec_cstate {
 };
 
 struct lightrec_state {
-	struct lightrec_registers regs;
-	u32 temp_reg;
+	/* THE FIRST SIXTY BYTES ARE THE CHEAP ONES ON SH-4, so the three fields
+	 * emitted code touches most live here rather than behind the 520-byte
+	 * register file.
+	 *
+	 * `mov.l @(disp,Rm),Rn` reaches 60 bytes. Anything past it costs
+	 * `mov #imm,R0` first, and anything past 127 costs a constant-pool load
+	 * instead -- two instructions, four bytes of pool, and a data fetch to
+	 * read the offset. With `regs` first, every scalar in this struct
+	 * started at 520 and paid that.
+	 *
+	 * Measured on Spyro's boot: of 9,728 pool-form state accesses, 8,367
+	 * were these three -- next_pc 4,883 (4,877 of them stores, one per
+	 * block exit), curr_pc 2,010, c_wrapper 1,474. Moving them costs
+	 * gpr[13..15] their one-instruction form, which is 1,077 accesses.
+	 * Emitted code 361,526 -> 341,676 bytes at a fixed checkpoint on
+	 * Spyro's boot, RAM hashes identical over 34 of them. */
 	u32 curr_pc;
 	u32 next_pc;
+	void *c_wrapper;
+
+	/* AND THE REGISTER FILE STAYS ON A CACHE LINE. The operand cache is
+	 * direct mapped with 32-byte lines and the state block is allocated
+	 * 32-byte aligned on purpose (see lightrec_init) -- that alignment was
+	 * worth 4 ms on its own. Starting `regs` at 12 would shift every line
+	 * of the register file by three words, so a pair of guest registers
+	 * that used to share a line can straddle two. The prefix is padded to
+	 * a full line instead: gpr[0..7] keep the one-instruction form, and
+	 * gpr[8..15] pay `mov #imm,R0` for it. Unpadded measured 95.90 ms/frame
+	 * against 94.91, with icache freeze 0.25 -> 0.27. */
+	u32 pad_to_line[5];
+
+	struct lightrec_registers regs;
+	u32 temp_reg;
 	uintptr_t wrapper_regs[NUM_TEMPS];
 	u8 in_delay_slot_n;
 	u32 current_cycle;
@@ -180,7 +215,6 @@ struct lightrec_state {
 	u32 exit_flags;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
-	void *c_wrapper;
 	struct block *dispatcher, *c_wrapper_block;
 	void *c_wrappers[C_WRAPPERS_COUNT];
 	struct blockcache *block_cache;
