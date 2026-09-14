@@ -313,6 +313,16 @@ add_executable(bloom
 	src/platform.c
 	src/plugins.c
 )
+
+target_sources(bloom PRIVATE src/gte_fpu.c)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "SH4|sh4" OR KOS_BASE)
+	target_sources(bloom PRIVATE src/gte_rtp.S)
+endif()
+option(WITH_GTE_RTP_SELFTEST "Compare the RTPS/RTPT assembly against the C at boot" OFF)
+if (WITH_GTE_RTP_SELFTEST)
+	target_compile_definitions(bloom PRIVATE GTE_RTP_SELFTEST=1)
+endif()
+
 if (WITH_FPS_OVERLAY)
 	target_sources(bloom PRIVATE src/overlay.c)
 	# pvrtex/file_dctex.h, for the embedded .dt font

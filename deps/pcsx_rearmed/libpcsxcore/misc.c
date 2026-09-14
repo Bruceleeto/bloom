@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <assert.h>
 #include "misc.h"
+#include "gte.h"
 #include "cdrom.h"
 #include "cdrom-async.h"
 #include "mdec.h"
@@ -844,6 +845,9 @@ int LoadState(const char *file) {
 	SaveFuncs.read(f, psxR, 0x00080000);
 	SaveFuncs.read(f, psxH, 0x00010000);
 	SaveFuncs.read(f, &psxRegs, offsetof(psxRegisters, gteBusyCycle));
+	/* The COP2 control file just arrived without a single CTC2, so anything
+	 * caching off it has to be told. */
+	psxCP2CtrlGen++;
 	psxRegs.gteBusyCycle = psxRegs.cycle;
 	psxRegs.branching = 0;
 	psxRegs.biosBranchCheck = ~0;
