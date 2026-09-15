@@ -1232,3 +1232,911 @@ _gte_mvmva_sf0_asm:
 	.long	0x20000000, 0x84000000, 0x80800000
 	.long	0x10000000, 0x82000000, 0x00400000
 	.size	_gte_mvmva_sf0_asm, . - _gte_mvmva_sf0_asm
+
+/*
+ * ================================================================
+ * THE LIGHTING FAMILY -- NCS/NCT, NCCS/NCCT, NCDS/NCDT, CC, CDP
+ * ================================================================
+ *
+ * From bloom's `fuckGNULightning` branch (`9c6dd3d`), where these are leaves
+ * under fgl's no-ABI calling convention.  The arithmetic is taken verbatim;
+ * only ILEAF_ENTER and ILEAF_LEAVE are rewritten, because fgl finds the COP2
+ * file through GBR and returns GBR in r3, and here the file arrives in r4 and
+ * the op word in r5 as ordinary C arguments.
+ *
+ * These are integer, not FPU: pcsx's gte.c arithmetic done exactly, flags
+ * included -- sequential 44-bit overflow per addend, the clamps, the master
+ * bit.  That makes them *more* faithful than the C in gte_fpu.c, which takes
+ * the float shortcut and hardcodes sf = 1 and lm = 1 because no game was seen
+ * to ask for anything else.  These decode both from the op word.
+ *
+ * Why they exist at all: this family has had no assembly, and it is 11.7% of
+ * Crash Bandicoot's GTE commands (NCCT alone 12,262) and 4.4% of Colin
+ * McRae's.  On Spyro, GT and F1 it is under 3% and this changes nothing.
+ *
+ * Register plan (all of it fgl's):
+ *   r4   the file                 r2   file + 32: IR0 @0, IR1..3 @4/8/12
+ *   r6   file + 64: SZ @0..12, RGB0..2 @16/20/24, MAC0 @32, MAC1..3 @36/40/44
+ *   r3   the flags, no master bit (ILEAF_LEAVE adds it and writes FLAG)
+ *   r14  -shift (0 or -12)        r13  lm's low bound (0 or -0x8000)
+ *   r15  the op word is at @(0,r15) after ILEAF_ENTER
+ *
+ * The 44-bit accumulator is kept the way pcsx keeps it: as a 64-bit value
+ * scaled by 2^20, so a signed overflow of the high word IS the 44-bit
+ * overflow, `addv`/`subv` report it, and the final `>> (shift + 20)` is
+ * either the high word or a 12-bit funnel shift.
+ */
+/* ---- the small building blocks ---- */
+
+/* The flag bits, built with shifts so the cold stubs carry no literals. */
+.macro FLAG_A_POS n		/* 1 << (31 - n): 30, 29, 28 */
+	.if \n == 1
+	mov	#0x40, r0
+	.elseif \n == 2
+	mov	#0x20, r0
+	.else
+	mov	#0x10, r0
+	.endif
+	shll16	r0
+	shll8	r0
+.endm
+.macro FLAG_A_NEG n		/* 1 << (28 - n): 27, 26, 25 */
+	.if \n == 1
+	mov	#8, r0
+	.elseif \n == 2
+	mov	#4, r0
+	.else
+	mov	#2, r0
+	.endif
+	shll16	r0
+	shll8	r0
+.endm
+
+/* hi:lo (x 2^20) += p << 20, with the 44-bit overflow flags of component n.
+ * r1 = p on entry and is destroyed; r0 scratch. */
+.macro MACADD n, lo, hi
+	mov	r1, r0
+	shll16	r0
+	shll2	r0
+	shll2	r0			/* p << 20 */
+	clrt
+	addc	r0, \lo
+	mov	#-12, r0
+	shad	r0, r1			/* p >> 12 */
+	movt	r0
+	add	r0, r1			/* + carry */
+	addv	r1, \hi
+	bf	8f
+	cmp/pz	\hi
+	bt	1f
+	FLAG_A_POS \n			/* wrapped negative: overflowed up */
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:
+.endm
+
+/* r0 = (hi:lo x 2^20) >> (shift + 20).  r1 scratch. */
+.macro EXTR20 lo, hi
+	mov	\hi, r0
+	tst	r14, r14
+	bf	3f			/* shift 12: the high word */
+	shll8	r0
+	shll2	r0
+	shll2	r0
+	mov	\lo, r1
+	shlr16	r1
+	shlr2	r1
+	shlr2	r1
+	or	r1, r0
+3:
+.endm
+
+/* r0 = (hi:lo, plain 64-bit) >> shift.  r1 scratch. */
+.macro EXTR0 lo, hi
+	mov	\lo, r0
+	tst	r14, r14
+	bt	3f			/* shift 0: the low word */
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	mov	\hi, r1
+	shll16	r1
+	shll2	r1
+	shll2	r1
+	or	r1, r0
+3:
+.endm
+
+/* limB\n: clamp reg to [min, 0x7fff], flag bit 25 - n.  r0 scratch. */
+.macro LIMB reg, n, min
+	mov	#-1, r0
+	shlr16	r0
+	shlr	r0			/* 0x7fff */
+	cmp/gt	r0, \reg
+	bt	5f
+	cmp/ge	\min, \reg
+	bt	7f
+	mov	\min, \reg
+	bra	6f
+	 nop
+5:	mov	r0, \reg
+6:	mov	#0x40, r0
+	shll16	r0
+	.if \n == 1
+	shll2	r0
+	.elseif \n == 2
+	shll	r0
+	.endif
+	or	r0, r3
+7:
+.endm
+
+/* limC\n on reg >> 4 into byte n-1 of r12, flag bit 22 - n.  reg destroyed. */
+.macro LIMC reg, n
+	mov	#-4, r0
+	shad	r0, \reg
+	mov	#-1, r0
+	extu.b	r0, r0			/* 255 */
+	cmp/hi	r0, \reg
+	bf	2f
+	cmp/pz	\reg
+	bt	1f
+	mov	#0, \reg
+	bra	3f
+	 nop
+1:	mov	r0, \reg
+3:	.if \n == 1
+	mov	#0x20, r0
+	.elseif \n == 2
+	mov	#0x10, r0
+	.else
+	mov	#8, r0
+	.endif
+	shll16	r0
+	or	r0, r3
+2:	.if \n == 1
+	mov	\reg, r12
+	.elseif \n == 2
+	shll8	\reg
+	or	\reg, r12
+	.else
+	shll16	\reg
+	or	\reg, r12
+	.endif
+.endm
+
+/* r13 = lm's low bound from the op word at @(off, r15).  r0, r1 scratch. */
+.macro LMB off
+	mov.l	@(\off, r15), r0
+	mov	#4, r1
+	shll8	r1			/* 1 << 10 */
+	tst	r1, r0
+	movt	r13
+	neg	r13, r13		/* -1 when lm == 0 */
+	mov	#1, r0
+	shll16	r0
+	shlr	r0
+	neg	r0, r0			/* -0x8000 */
+	and	r0, r13
+.endm
+
+/* RGB0 = RGB1, RGB1 = RGB2 */
+.macro SHIFT_RGB
+	mov.l	@(20, r6), r0
+	mov.l	r0, @(16, r6)
+	mov.l	@(24, r6), r0
+	mov.l	r0, @(20, r6)
+.endm
+
+/* The colour word in r12 gets CODE and lands at file + 64 + (r8 & 0xff). */
+.macro RGB_OUT
+	mov.l	@(24, r4), r1
+	mov	#-1, r0
+	shll16	r0
+	shll8	r0
+	and	r0, r1
+	or	r1, r12
+	mov	r8, r0
+	and	#0xff, r0
+	mov.l	r12, @(r0, r6)
+.endm
+
+/*
+ * Prologue and epilogue for the family.  fgl's originals are leaves: entered
+ * by `jsr` with GBR holding the state block, the file at GBR + 264, the op
+ * word already in a register, and `rts` handing GBR back in r3.  There is no
+ * GBR here and the recompiler calls through the C ABI, so these two are the
+ * only things that change -- the file arrives in r4 and the op word in r5,
+ * exactly what the body wants, so the four instructions fgl spends deriving
+ * the base off GBR turn into one `mov`.  Everything between them is fgl's,
+ * unaltered, because it was already written against r4/r2/r6.
+ */
+.macro ILEAF_ENTER
+	sts.l	pr, @-r15
+	mov.l	r7, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+	mov.l	r5, @-r15		/* the op word, @(0, r15) */
+	mov	r5, r1
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov	#0, r3
+	mov	#8, r0
+	shll16	r0			/* sf, 1 << 19 */
+	tst	r0, r1
+	movt	r14
+	add	#-1, r14		/* -1 when sf, else 0 */
+	shll2	r14
+	mov	r14, r0
+	add	r0, r14
+	add	r0, r14			/* -12 or 0 */
+	LMB	0
+.endm
+
+.macro ILEAF_LEAVE
+	mov.l	98f, r0
+	tst	r0, r3
+	bt	99f
+	mov	#1, r0
+	rotr	r0
+	or	r0, r3			/* the master bit */
+99:	mov	#63, r0
+	shll2	r0			/* 252 */
+	mov.l	r3, @(r0, r4)		/* FLAG */
+	add	#4, r15
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	mov.l	@r15+, r8
+	mov.l	@r15+, r7
+	lds.l	@r15+, pr
+	rts
+	 nop
+	.align	2
+98:	.long	0x7f87e000
+.endm
+
+/*
+ * One component of pcsx's runColor2 on the value in r5:
+ *   ir  = limB(((FC << 12) - (mac << 20 >> 20... i.e. FC<<12 - mac) >> shift), lm = 0)
+ *   mac = (IR0 * ir + (s64)mac) >> shift
+ * r7 = IR0, r9 = file + 212 (RFC/GFC/BFC).  r0, r1, r10, r11 scratch.
+ */
+.macro RC2_CORE n
+	mov.l	@(4 * (\n - 1), r9), r11	/* hi = FC */
+	mov	r5, r0
+	shll16	r0
+	shll2	r0
+	shll2	r0			/* mac << 20 */
+	mov	#0, r1
+	clrt
+	subc	r0, r1			/* lo = -(mac << 20), T = borrow */
+	mov	#-12, r0
+	mov	r5, r10
+	shad	r0, r10			/* mac >> 12 */
+	movt	r0
+	add	r0, r10			/* + borrow */
+	subv	r10, r11		/* hi -= ; T = 44-bit overflow */
+	bf	8f
+	cmp/pz	r11
+	bt	1f
+	FLAG_A_POS \n
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:	mov	r11, r10
+	tst	r14, r14
+	bf	3f			/* shift 12: the high word */
+	shll8	r10
+	shll2	r10
+	shll2	r10
+	shlr16	r1
+	shlr2	r1
+	shlr2	r1
+	or	r1, r10
+3:	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1			/* -0x8000: this clamp ignores lm */
+	LIMB	r10, \n, r1
+	mul.l	r7, r10
+	sts	macl, r0		/* IR0 * ir */
+	mov	r5, r11
+	shll	r11
+	subc	r11, r11		/* sign of mac */
+	mov	r0, r10
+	shll	r10
+	subc	r10, r10		/* sign of the product */
+	clrt
+	addc	r0, r5			/* lo */
+	addc	r10, r11		/* hi */
+	tst	r14, r14
+	bt	4f			/* shift 0: the low word */
+	shlr8	r5
+	shlr2	r5
+	shlr2	r5
+	shll16	r11
+	shll2	r11
+	shll2	r11
+	or	r11, r5
+4:
+.endm
+	.align	2
+gl_zeros:
+	.long	0, 0, 0
+
+/*
+ * pcsx's gteMAC123f: MAC1..3 = (t << 12 + m * v) >> shift, with the 44-bit
+ * overflow flags raised per addend, written to the file.
+ *   r5 = the vector (three s16), r1 = its stride (2: V0..2, 4: IR1..3)
+ *   r7 = the matrix, nine s16 in a row     r11 = the translation, 3 x s32
+ * Clobbers r0, r1, r5, r7, r9, r10, r11, r12, r13.  Preserves r8.
+ */
+.macro MACROW n
+	mov.l	@r11+, r13		/* hi = t: t << 12 in x 2^20 form */
+	mov	#0, r12
+	mov.w	@r7+, r1
+	mul.l	r9, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	mov.w	@r7+, r1
+	mul.l	r10, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	mov.w	@r7+, r1
+	mul.l	r5, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	EXTR20	r12, r13
+	mov.l	r0, @(32 + 4 * \n, r6)
+.endm
+
+gl_mac123f:
+	mov.w	@r5, r9
+	add	r1, r5
+	mov.w	@r5, r10
+	add	r1, r5
+	mov.w	@r5, r5			/* vx r9, vy r10, vz r5 */
+	MACROW 1
+	MACROW 2
+	MACROW 3
+	rts
+	 nop
+
+/* ---- the lighting family ---- */
+
+/*
+ * One component of pcsx's runColor1 after the colour matrix.  r5 = MACn
+ * from the file; r8 = dest | 0x100 (ncc: modulate by the colour) | 0x200
+ * (ncd: modulate, then the depth cue) | 0x400 (writeback: MAC, IR).
+ */
+.macro RC1_COMP n
+	mov.l	@(32 + 4 * \n, r6), r5
+	mov	r8, r0
+	shlr8	r0
+	tst	#3, r0
+	bt	20f			/* NCS: the colour stage is the result */
+	mov	r5, r10
+	LIMB	r10, \n, r13		/* ir = limB(mac, lm) */
+	mov.l	@(24, r4), r0
+	.if \n == 2
+	shlr8	r0
+	.elseif \n == 3
+	shlr16	r0
+	.endif
+	extu.b	r0, r0
+	mul.l	r10, r0
+	sts	macl, r5
+	shll2	r5
+	shll2	r5			/* (C * ir) << 4 */
+	mov	r8, r0
+	shlr8	r0
+	tst	#2, r0
+	bf	21f
+	bra	20f
+	 shad	r14, r5			/* NCC: >> shift */
+21:	RC2_CORE \n			/* NCD: the depth cue */
+20:	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	22f
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	bra	23f
+	 mov.w	r0, @(4 * \n, r2)	/* IRn */
+22:	mov	r5, r10
+	LIMB	r10, \n, r13		/* flags only */
+23:	LIMC	r5, \n
+.endm
+
+/* CC / CDP enter here: the colour matrix on IR as it stands. */
+gl_rc3:
+	sts.l	pr, @-r15
+	bra	gl_rc1_c
+	 nop
+
+/* One vertex of NCS/NCT/NCCS/NCCT/NCDS/NCDT: r5 = the vertex, r1 = 2,
+ * r8 = dest | mode bits. */
+gl_rc1:
+	sts.l	pr, @-r15
+	mov	r4, r7
+	add	#80, r7
+	add	#80, r7			/* the light matrix @160 */
+	mov.l	92f, r11		/* no translation */
+	bsr	gl_mac123f
+	 nop
+	bra	93f
+	 nop
+	.align	2
+92:	.long	gl_zeros
+93:	LMB	4
+	mov.l	@(36, r6), r5
+	LIMB	r5, 1, r13
+	mov	r5, r0
+	mov.w	r0, @(4, r2)
+	mov.l	@(40, r6), r5
+	LIMB	r5, 2, r13
+	mov	r5, r0
+	mov.w	r0, @(8, r2)
+	mov.l	@(44, r6), r5
+	LIMB	r5, 3, r13
+	mov	r5, r0
+	mov.w	r0, @(12, r2)		/* IR = limB(light), the next vector */
+gl_rc1_c:
+	mov	r2, r5
+	add	#4, r5
+	mov	#4, r1
+	mov	r4, r7
+	add	#96, r7
+	add	#96, r7			/* the colour matrix @192 */
+	mov	r4, r11
+	add	#90, r11
+	add	#90, r11		/* the background colour @180 */
+	bsr	gl_mac123f
+	 nop
+	LMB	4
+	mov	#106, r9
+	shll	r9
+	add	r4, r9			/* the far colour @212 */
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+	RC1_COMP 1
+	RC1_COMP 2
+	RC1_COMP 3
+	RGB_OUT
+	lds.l	@r15+, pr
+	rts
+	 nop
+
+/* ---- the lighting family, one entry per command ---- */
+
+.macro LIGHT_LEAF name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov	r4, r5			/* V0 */
+	mov	#2, r1
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8			/* RGB2 */
+	bsr	gl_rc1
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+.macro LIGHT_LEAF_T name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	mov	r4, r5
+	mov	#2, r1
+	mov	#\mode - 4, r8
+	shll8	r8
+	add	#16, r8			/* RGB0, no writeback */
+	bsr	gl_rc1
+	 nop
+	mov	r4, r5
+	add	#8, r5
+	mov	#2, r1
+	mov	#\mode - 4, r8
+	shll8	r8
+	add	#20, r8			/* RGB1 */
+	bsr	gl_rc1
+	 nop
+	mov	r4, r5
+	add	#16, r5
+	mov	#2, r1
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8			/* RGB2, writeback */
+	bsr	gl_rc1
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+.macro COLOUR_LEAF name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8
+	bsr	gl_rc3
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+	LIGHT_LEAF   _gte_ncs_asm,  4		/* 0x400 */
+	LIGHT_LEAF_T _gte_nct_asm,  4
+	LIGHT_LEAF   _gte_nccs_asm, 5		/* 0x100 | 0x400 */
+	LIGHT_LEAF_T _gte_ncct_asm, 5
+	LIGHT_LEAF   _gte_ncds_asm, 6		/* 0x200 | 0x400 */
+	LIGHT_LEAF_T _gte_ncdt_asm, 6
+	COLOUR_LEAF  _gte_cc_asm,   5
+	COLOUR_LEAF  _gte_cdp_asm,  6
+
+/* ===================================================================== */
+/* NCCT, in float                                                        */
+/* ===================================================================== */
+
+/*
+ * The same command as _gte_ncct_asm above, done approximately on the FPU.
+ * `GTE_FAST` bit 6 chooses between them; both stay in the binary, because the
+ * integer one is bit-exact against pcsx's gte.c and is what you want when
+ * something looks wrong.
+ *
+ * Why this command and not the others: Crash Bandicoot issues NCCT 12262
+ * times in a bench window, 15% of its GTE commands and **53.5% of its GTE
+ * instructions** at 1756.6 SH-4 instructions a call.  Nothing else in the
+ * lighting family appears in any bench title except Colin's 6417 NCCT.
+ *
+ * NCCT is three vertices through two 3x3 matrices:
+ *
+ *	IR  = clamp(L  . N,        0, 0x7fff)		the light matrix
+ *	IR  = clamp(BK + LC . IR,  0, 0x7fff)		the colour matrix
+ *	MAC = (RGBC * IR) >> 8    RGB = clamp(MAC >> 4, 0, 0xff)
+ *
+ * Four things make this cheap, and three of them are only available because
+ * it is the *triple*:
+ *
+ * **Two XMTRX loads, not six.**  `ftrv` takes its matrix from the back bank,
+ * so a per-vertex loop would reload it twice a vertex.  Ordering by matrix
+ * instead -- all three normals through the light matrix, then all three
+ * results through the colour matrix -- costs two loads for the whole command.
+ *
+ * **Three `ftrv` in flight.**  fv0, fv4 and fv8 hold the three vertices at
+ * once and the three transforms are independent, so the 4-cycle F0/F1 lock
+ * one `ftrv` takes (table 8.3 #234) is covered by the next one's issue rather
+ * than stalling.  fv12 is left for constants.
+ *
+ * **The background colour is free.**  `ftrv` is 4x4 and the fourth column of
+ * the cached colour matrix is already BK (gte_col[2][1], the cv*8+5 entry),
+ * with w = 1.0 carried in fr3/fr7/fr11.  Stage two's add happens inside the
+ * same instruction as its multiply.
+ *
+ * **Half the clamp is branchless**, which is the part that usually kills this:
+ *
+ *	max(0, x) == (x + |x|) / 2
+ *
+ * `fabs` is LS group with latency 0 (table 8.3 #182), so two of the three
+ * instructions dual-issue against the FE stream.  The upper bound at 0x7fff
+ * is a not-taken branch; it was left out first, and Crash said no.  See
+ * GLF_POS3.
+ *
+ * The final clamp cannot underflow -- IR is >= 0 by the line above and RGBC is
+ * three unsigned bytes -- so it is a single unsigned compare against 255
+ * rather than a pair of signed ones.
+ *
+ * And the RGB FIFO shifts three times over three vertices, so RGB0, RGB1 and
+ * RGB2 simply *are* the three results: three stores, no shifting.
+ *
+ * What is not faithful: FLAG is written as zero rather than accumulated, and
+ * the arithmetic is float32 throughout.  Measured against integer gte.c on
+ * 409831 real NCCT calls in Crash: no RGB channel off by more than 1, 0.5% of
+ * channels off by 1 at all, worst MAC/IR delta 2.  328 SH-4 instructions a
+ * call against the integer assembly's 1756.6.
+ */
+
+/* limB(x, lm=1): clamp to 0 .. 0x7fff, three components at a time.
+ *
+ * The low end is branchless -- max(0, x) is (x + |x|) / 2, and `fabs` is an
+ * LS instruction with no latency, so two of every three issue alongside the
+ * FE stream.  Two scratch registers, not three, because fr13 has to hold
+ * 32767.0: the fadds still interleave, which is the point of doing three.
+ *
+ * The high end is a branch, and it is not optional.  Dropping it was the
+ * first thing measured and it cost real colour: on Crash, 8.3% of the RGB
+ * channels a lighting command hands the guest came out more than 8 off, worst
+ * 66, because the *second* stage saturates routinely -- the background colour
+ * alone puts MAC near 0x7fff before the light matrix adds anything.  The
+ * branch is not taken on the common path, which is one cycle. */
+.macro GLF_POS3 a, b, c
+	fmov	\a, fr14
+	fmov	\b, fr15
+	fabs	fr14
+	fabs	fr15
+	fadd	fr14, \a		/* 2 * max(0, x) */
+	fadd	fr15, \b
+	fmov	\c, fr14
+	fabs	fr14
+	fadd	fr14, \c
+	fmul	fr12, \a		/* * 0.5 */
+	fmul	fr12, \b
+	fmul	fr12, \c
+	fcmp/gt	fr13, \a		/* T = x > 32767.0 */
+	bf	1f
+	fmov	fr13, \a
+1:	fcmp/gt	fr13, \b
+	bf	2f
+	fmov	fr13, \b
+2:	fcmp/gt	fr13, \c
+	bf	3f
+	fmov	fr13, \c
+3:
+.endm
+
+/* Load XMTRX from a cached 3x3 and its translation column.  Same eight moves
+ * gte_mtx_load() makes; inline because this command needs two matrices and the
+ * residency check in gte_mtx_use() can never hit for both. */
+.macro GLF_XMTRX rot, col
+	mov.l	\rot, r1
+	mov.l	\col, r2
+	fschg
+	fmov.d	@r1+, xd0
+	fmov.d	@r1+, xd2
+	fmov.d	@r1+, xd4
+	fmov.d	@r1+, xd6
+	fmov.d	@r1+, xd8
+	fmov.d	@r1+, xd10
+	fmov.d	@r2+, xd12
+	fmov.d	@r2+, xd14
+	fschg
+.endm
+
+/* One s16 out of the register file, into an FP register as a float. */
+.macro GLF_LDV off, fr
+	mov.w	@(\off, r8), r0
+	lds	r0, fpul
+	float	fpul, \fr
+.endm
+
+/* 0 .. 255.  The value is known non-negative, so one unsigned compare does
+ * both ends and the common case falls through. */
+.macro GLF_B255 r
+	cmp/hi	r10, \r
+	bf	1f
+	mov	r10, \r
+1:
+.endm
+
+/* One vertex's colour: MAC = RGBC * IR / 256, the byte is MAC >> 4.
+ * `last` writes MAC1-3 and IR1-3, which only the third vertex leaves behind. */
+.macro GLF_OUT a, b, c, rgbofs, last
+	fmul	fr13, \a
+	fmul	fr14, \b
+	fmul	fr15, \c
+	ftrc	\a, fpul
+	sts	fpul, r1
+	ftrc	\b, fpul
+	sts	fpul, r2
+	ftrc	\c, fpul
+	sts	fpul, r3
+.if \last
+	mov.l	r1, @(36, r9)		/* MAC1 */
+	mov.l	r2, @(40, r9)		/* MAC2 */
+	mov.l	r3, @(44, r9)		/* MAC3 */
+	mov	r1, r0
+	mov.w	r0, @(4, r13)		/* IR1 = (s16)MAC1, no clamp */
+	mov	r2, r0
+	mov.w	r0, @(8, r13)
+	mov	r3, r0
+	mov.w	r0, @(12, r13)
+.endif
+	shad	r11, r1			/* >> 4 */
+	shad	r11, r2
+	shad	r11, r3
+	GLF_B255 r1
+	GLF_B255 r2
+	GLF_B255 r3
+	shll8	r2
+	shll16	r3
+	mov	r12, r0			/* CODE << 24 */
+	or	r1, r0
+	or	r2, r0
+	or	r3, r0
+	mov.l	r0, @(\rgbofs, r9)
+.endm
+
+	.balign	4
+	.global	_gte_ncct_fast
+	.type	_gte_ncct_fast, @function
+_gte_ncct_fast:
+	sts.l	pr, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov	r4, r8
+
+	/* Both matrices at the current generation.  gte_mtx_use_slow() checks
+	 * the 3x3 before the column, so the column's generation answers for
+	 * both.  It also loads XMTRX, which is wasted here -- but only on the
+	 * cold path, which is a control-file write. */
+	mov.l	40f, r0
+	mov.l	@r0, r3			/* psxCP2CtrlGen */
+	mov.l	42f, r0
+	mov.l	@(16, r0), r1		/* gte_col[LIGHT][NONE].gen */
+	cmp/eq	r3, r1
+	bt	1f
+	mov	r8, r4
+	mov	#1, r5			/* GTE_MTX_LIGHT */
+	mov	#3, r6			/* GTE_CV_NONE */
+	mov	#7, r7			/* key = mx * 4 + cv */
+	mov.l	44f, r0
+	jsr	@r0
+	 nop
+	mov.l	40f, r0
+	mov.l	@r0, r3
+1:	mov.l	43f, r0
+	mov.l	@(16, r0), r1		/* gte_col[COLOUR][BK].gen */
+	cmp/eq	r3, r1
+	bt	2f
+	mov	r8, r4
+	mov	#2, r5			/* GTE_MTX_COLOUR */
+	mov	#1, r6			/* cv 1: CP2C[13], the background */
+	mov	#9, r7
+	mov.l	44f, r0
+	jsr	@r0
+	 nop
+2:
+	mov	r8, r9
+	add	#64, r9			/* MAC and RGB are past disp reach */
+	mov	#-1, r10
+	shlr16	r10
+	shlr8	r10			/* 255 */
+	mov	#-4, r11
+	mov	r8, r13
+	add	#32, r13		/* IR1-3 are past mov.w's 30-byte reach */
+
+	mov.l	45f, r0
+	fmov.s	@r0, fr12		/* 0.5 */
+	add	#8, r0
+	fmov.s	@r0, fr13		/* 32767.0, limB's upper end */
+
+	/* ---- stage one: the light matrix on the three normals ---- */
+	GLF_XMTRX 41f, 42f
+
+	GLF_LDV	0,  fr0
+	GLF_LDV	2,  fr1
+	GLF_LDV	4,  fr2
+	fldi1	fr3
+	GLF_LDV	8,  fr4
+	GLF_LDV	10, fr5
+	GLF_LDV	12, fr6
+	fldi1	fr7
+	GLF_LDV	16, fr8
+	GLF_LDV	18, fr9
+	GLF_LDV	20, fr10
+	fldi1	fr11
+
+	ftrv	xmtrx, fv0
+	ftrv	xmtrx, fv4
+	ftrv	xmtrx, fv8
+
+	GLF_POS3 fr0, fr1, fr2
+	GLF_POS3 fr4, fr5, fr6
+	GLF_POS3 fr8, fr9, fr10
+
+	/* ---- stage two: the colour matrix, background in column four ---- */
+	GLF_XMTRX 46f, 43f
+
+	ftrv	xmtrx, fv0
+	ftrv	xmtrx, fv4
+	ftrv	xmtrx, fv8
+
+	GLF_POS3 fr0, fr1, fr2
+	GLF_POS3 fr4, fr5, fr6
+	GLF_POS3 fr8, fr9, fr10
+
+	/* ---- stage three: modulate by RGBC and pack ---- */
+	mov.l	@(24, r8), r7		/* RGBC */
+	mov.l	45f, r0
+	add	#4, r0
+	fmov.s	@r0, fr12		/* 1/256 */
+
+	mov	r7, r0
+	extu.b	r0, r0
+	lds	r0, fpul
+	float	fpul, fr13
+	mov	r7, r0
+	shlr8	r0
+	extu.b	r0, r0
+	lds	r0, fpul
+	float	fpul, fr14
+	mov	r7, r0
+	shlr16	r0
+	extu.b	r0, r0
+	lds	r0, fpul
+	float	fpul, fr15
+	fmul	fr12, fr13		/* R / 256 */
+	fmul	fr12, fr14
+	fmul	fr12, fr15
+
+	mov.l	47f, r0
+	and	r0, r7
+	mov	r7, r12			/* CODE << 24 */
+
+	GLF_OUT	fr0,  fr1, fr2,  16, 0	/* RGB0 */
+	GLF_OUT	fr4,  fr5, fr6,  20, 0	/* RGB1 */
+	GLF_OUT	fr8,  fr9, fr10, 24, 1	/* RGB2, and the MAC/IR left behind */
+
+	/* FLAG.  Not accumulated on this path; say zero rather than stale. */
+	mov	r9, r3
+	add	#124, r3
+	add	#64, r3			/* CP2C[31], 252 bytes in */
+	mov	#0, r0
+	mov.l	r0, @r3
+
+	/* XMTRX is not what the cache thinks it is any more. */
+	mov.l	48f, r0
+	mov	#-1, r1
+	mov.l	r1, @(16, r0)		/* gte_hot.xmtrx_key */
+	mov.l	r1, @(20, r0)		/* gte_hot.xmtrx_mx  */
+
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	mov.l	@r15+, r8
+	lds.l	@r15+, pr
+	rts
+	 nop
+
+	.balign	4
+40:	.long	_psxCP2CtrlGen
+41:	.long	_gte_rot + 64		/* gte_rot[GTE_MTX_LIGHT].m       */
+42:	.long	_gte_col + 224		/* gte_col[GTE_MTX_LIGHT][3].t    */
+43:	.long	_gte_col + 288		/* gte_col[GTE_MTX_COLOUR][1].t   */
+44:	.long	_gte_mtx_use_slow
+45:	.long	gl_ncct_const
+46:	.long	_gte_rot + 128		/* gte_rot[GTE_MTX_COLOUR].m      */
+47:	.long	0xff000000
+48:	.long	_gte_hot
+	.size	_gte_ncct_fast, . - _gte_ncct_fast
+
+	.balign	4
+gl_ncct_const:
+	.float	0.5
+	.float	0.00390625		/* 1 / 256 */
+	.float	32767.0

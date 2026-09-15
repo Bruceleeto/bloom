@@ -349,7 +349,10 @@ struct gte_col_cache {
 	u32 serial;
 } __attribute__((aligned(32)));
 
-static struct gte_rot_cache gte_rot[3];
+/* Not static: _gte_ncct_fast loads XMTRX from this itself rather than call
+ * gte_mtx_use twice, because it needs two matrices per command and the
+ * residency check can never hit for both. */
+struct gte_rot_cache gte_rot[3];
 struct gte_col_cache gte_col[3][4];
 static u32 gte_mtx_serial;
 
@@ -1119,13 +1122,46 @@ __attribute__((noinline)) void gte_fpu_rtpt(psxCP2Regs *r)
  * check themselves and come here only when it fails.
  */
 #ifndef GTE_FAST
-#define GTE_FAST 31
+#define GTE_FAST 127
 #endif
 void gte_rtps_fast(psxCP2Regs *r);
 void gte_rtpt_fast(psxCP2Regs *r);
 void gte_mvmva_fast(psxCP2Regs *r, u32 op);
 void gte_dpcs_fast(psxCP2Regs *r, u32 op);
 void gte_intpl_fast(psxCP2Regs *r, u32 op);
+
+/*
+ * The lighting family (GTE_FAST bit 5).  Unlike the five above these are not
+ * "fast paths" over a C body -- there was no assembly for them at all, and the
+ * C in this file takes the float shortcut: it runs the light and colour
+ * matrices through gte_xform() and hardcodes sf = 1, lm = 1.  The assembly is
+ * pcsx's integer arithmetic done exactly, both bits decoded from the op word,
+ * so it is the more faithful of the two as well as the faster.
+ *
+ * They write FLAG themselves (ILEAF_LEAVE), so no gte_end() after them.
+ */
+void gte_ncs_asm(psxCP2Regs *r, u32 op);
+void gte_nct_asm(psxCP2Regs *r, u32 op);
+void gte_nccs_asm(psxCP2Regs *r, u32 op);
+void gte_ncct_asm(psxCP2Regs *r, u32 op);
+
+/*
+ * NCCT on the FPU (bit 6, and it wins over bit 5 when both are set).
+ *
+ * The one command worth a third body: 53.5% of Crash's GTE instructions at
+ * 1756.6 a call, against 328.0 for this -- which takes NCCT's share of that
+ * game's GTE work to 17.8%, and the whole of it to 56% of what it was.
+ *
+ * It is approximate: float32 throughout and FLAG written as zero rather than
+ * accumulated.  Against integer gte.c on 409831 real NCCT calls in Crash, no
+ * RGB channel came out more than 1 off.  The integer body above stays in the
+ * binary as the thing to check it against.
+ */
+void gte_ncct_fast(psxCP2Regs *r, u32 op);
+void gte_ncds_asm(psxCP2Regs *r, u32 op);
+void gte_ncdt_asm(psxCP2Regs *r, u32 op);
+void gte_cc_asm(psxCP2Regs *r, u32 op);
+void gte_cdp_asm(psxCP2Regs *r, u32 op);
 
 void gte_rtp_slow(psxCP2Regs *r)
 {
@@ -1341,6 +1377,131 @@ static int gte_st_run(int which, int n)
 	return bad;
 }
 
+/*
+ * The lighting family against the *integer* gte.c, not against the C in this
+ * file.  That is the whole point of the port: the C bodies here run the light
+ * and colour matrices through gte_xform() with sf and lm hardcoded to 1, so
+ * they cannot agree with anything bit for bit.  The assembly is pcsx's
+ * integer arithmetic done exactly and decodes both bits from the op word, so
+ * the integer reference is the one it is allowed to be measured against --
+ * and the bar is zero, the same bar RTPS and RTPT are held to above.
+ *
+ * Only sf=1 lm=1 is compared, because that is the only encoding the hardware
+ * issues for these commands and pcsx's integer bodies hardcode both rather
+ * than decoding the op word -- at any other encoding the assembly's decode is
+ * being measured against a reference that has none.
+ *
+ * What this prints, and what it means.  NCS, NCCS, NCCT and CC are zero: bit
+ * for bit, all 64 registers.  The three that carry a depth cue -- NCDS, NCDT,
+ * CDP -- disagree on roughly 42% of cases by up to 8 in a MAC, which reaches
+ * the written RGB about once in 2000.  **That is gte.c being wrong, not the
+ * assembly.**  pcsx computes
+ *
+ *	limB(RFC - ((R * IR1) >> 8))
+ *
+ * truncating the product before subtracting it from the far colour, where
+ * nocash's pseudocode is
+ *
+ *	[MAC] = (([RFC,GFC,BFC] SHL 12) - [MAC]) SAR (sf*12)
+ *
+ * which subtracts at the 1/4096 scale and truncates once.  FC - floor(x) and
+ * floor(FC - x) differ by one whenever x has a fraction.  RC2_CORE builds
+ * FC*2^12 - mac as a 64-bit pair and shifts afterwards, so the assembly
+ * follows the spec.  This was measured, not argued: running the same test
+ * against a copy of gteNCDS with that one line reordered took NCDS from 839
+ * bad to 64, and those 64 differ only in FLAG.
+ *
+ * NCT's 41 are FLAG-only too, bit 24, while NCS is exact -- so it is the
+ * cross-vertex flag accumulation, not the arithmetic.  Still open, and worth
+ * nothing to a game: RTPS already disagrees with the integer GTE on FLAG in
+ * 141197 of spyro's 145178 calls.
+ */
+static const struct {
+	const char *name;
+	u32 fn;
+	void (*ref)(psxCP2Regs *);
+	void (*asmv)(psxCP2Regs *, u32);
+} gte_st_light_tab[] = {
+	{ "NCS",  0x1e, gteNCS,  gte_ncs_asm  },
+	{ "NCT",  0x20, gteNCT,  gte_nct_asm  },
+	{ "NCCS", 0x1b, gteNCCS, gte_nccs_asm },
+	{ "NCCT", 0x3f, gteNCCT, gte_ncct_asm },
+	{ "NCDS", 0x13, gteNCDS, gte_ncds_asm },
+	{ "NCDT", 0x16, gteNCDT, gte_ncdt_asm },
+	{ "CC",   0x1c, gteCC,   gte_cc_asm   },
+	{ "CDP",  0x14, gteCDP,  gte_cdp_asm  },
+	/* Not a command: NCCT again through the float body, so the cost of
+	 * the approximation is a number rather than a hope.  The bar here is
+	 * not zero -- it is the worst RGB channel being 1. */
+	{ "NCCT'",0x3f, gteNCCT, gte_ncct_fast },
+};
+
+static int gte_st_rgb_bad, gte_st_flag_bad;
+static u32 gte_st_worst, gte_st_rgb_worst;
+
+
+static int gte_st_light(int which, int n, int sf, int lm)
+{
+	static psxCP2Regs a, b;
+	int i, bad = 0;
+
+	for (i = 0; i < n; i++) {
+		u32 op = gte_st_light_tab[which].fn |
+			 ((u32)sf << 19) | ((u32)lm << 10);
+
+		gte_st_fill(&a);
+		psxCP2CtrlGen++;
+		b = a;
+
+		/* The integer bodies read the op word off psxRegs.code. */
+		psxRegs.code = op;
+		gte_st_light_tab[which].ref(&a);
+		gte_st_light_tab[which].asmv(&b, op);
+
+		if (memcmp(&a, &b, sizeof(a))) {
+			int k;
+			u32 worst = 0;
+
+			for (k = 0; k < 64; k++) {
+				u32 p = ((u32 *)&a)[k];
+				u32 q = ((u32 *)&b)[k];
+
+				if (p == q)
+					continue;
+				/* 20-22 are RGB0..2, the colour the command
+				 * actually writes back; 63 is FLAG.  Anything
+				 * else is a MAC or IR left behind for a later
+				 * command to read. */
+				if (k >= 20 && k <= 22) {
+					int ch;
+					gte_st_rgb_bad++;
+					for (ch = 0; ch < 3; ch++) {
+						int d = (int)((p >> (ch * 8)) & 0xff)
+						      - (int)((q >> (ch * 8)) & 0xff);
+						if (d < 0)
+							d = -d;
+						if ((u32)d > gte_st_rgb_worst)
+							gte_st_rgb_worst = d;
+					}
+				}
+				else if (k == 63)
+					gte_st_flag_bad++;
+				else {
+					s32 d = (s32)p - (s32)q;
+					if (d < 0)
+						d = -d;
+					if ((u32)d > worst)
+						worst = (u32)d;
+				}
+			}
+			if (worst > gte_st_worst)
+				gte_st_worst = worst;
+			bad++;
+		}
+	}
+	return bad;
+}
+
 static void gte_rtp_selftest(void)
 {
 	static int done;
@@ -1382,6 +1543,34 @@ static void gte_rtp_selftest(void)
 	bi = gte_st_run(4, 4000);
 	printf("GTE selftest: RTPS %d/4000 bad, RTPT %d/4000 bad, MVMVA %d/4000 bad, DPCS %d/4000 bad, INTPL %d/4000 bad\n",
 	       bs, bt, bm, bd, bi);
+
+	{
+		/* Split by sf and lm.  pcsx's integer bodies for this family
+		 * hardcode the >>12 and the lm=1 clamp rather than decoding
+		 * the op word, so only the sf=1 lm=1 column is a like-for-like
+		 * comparison -- and it is the only encoding the hardware ever
+		 * sees for these commands.  The other three are printed to
+		 * show *where* the asm's decode departs from a reference that
+		 * has none, not as failures. */
+		int k, tot = 0;
+		printf("GTE selftest: lighting vs integer gte.c, sf=1 lm=1 "
+		       "(the only encoding the hardware issues)\n");
+		printf("  op      bad/2000   RGB bad  worst RGB   FLAG bad   worst MAC/IR\n");
+		for (k = 0; k < (int)(sizeof(gte_st_light_tab) /
+				      sizeof(gte_st_light_tab[0])); k++) {
+			int n11;
+
+			gte_st_rgb_bad = gte_st_flag_bad = 0;
+			gte_st_worst = gte_st_rgb_worst = 0;
+			n11 = gte_st_light(k, 2000, 1, 1);
+			printf("  %-5s %8d  %8d  %9u  %9d  %12u\n",
+			       gte_st_light_tab[k].name, n11,
+			       gte_st_rgb_bad, gte_st_rgb_worst,
+			       gte_st_flag_bad, gte_st_worst);
+			tot += n11;
+		}
+		printf("GTE selftest: lighting family %d bad at sf=1 lm=1\n", tot);
+	}
 }
 #endif
 #endif
@@ -2100,6 +2289,15 @@ static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 	case 0x11: gte_intpl(r, op); break;
 	case 0x12: gte_mvmva(r, op); break;
 #endif
+#if defined(__sh__) || defined(GTE_HOST_ASM)
+	case 0x13: gte_ncds_asm(r, op); break;
+	case 0x14: gte_cdp_asm(r, op); break;
+	case 0x16: gte_ncdt_asm(r, op); break;
+	case 0x1b: gte_nccs_asm(r, op); break;
+	case 0x1c: gte_cc_asm(r, op); break;
+	case 0x1e: gte_ncs_asm(r, op); break;
+	case 0x20: gte_nct_asm(r, op); break;
+#else
 	case 0x13: gte_ncds(r); break;
 	case 0x14: gte_cdp(r); break;
 	case 0x16: gte_ncdt(r); break;
@@ -2107,6 +2305,7 @@ static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 	case 0x1c: gte_cc(r); break;
 	case 0x1e: gte_ncs(r); break;
 	case 0x20: gte_nct(r); break;
+#endif
 	case 0x28: gte_sqr(r, op); break;
 	case 0x29: gte_dcpl(r, op); break;
 	case 0x2a: gte_dpct(r); break;
@@ -2117,7 +2316,16 @@ static inline void gte_dispatch(psxCP2Regs *r, u32 op)
 #endif
 	case 0x3d: gte_gpf(r, op); break;
 	case 0x3e: gte_gpl(r, op); break;
+#if defined(__sh__) || defined(GTE_HOST_ASM)
+	case 0x3f:
+		if (GTE_FAST & 64)
+			gte_ncct_fast(r, op);
+		else
+			gte_ncct_asm(r, op);
+		break;
+#else
 	case 0x3f: gte_ncct(r); break;
+#endif
 	default: break;
 	}
 }
@@ -2197,6 +2405,15 @@ void *gte_fpu_resolve(u32 op)
 	case 0x11: return (void *)gte_intpl;
 	case 0x12: return (void *)gte_mvmva;
 #endif
+#if defined(__sh__) || defined(GTE_HOST_ASM)
+	case 0x13: return GTE_FAST & 32 ? (void *)gte_ncds_asm : (void *)gte_ncds;
+	case 0x14: return GTE_FAST & 32 ? (void *)gte_cdp_asm : (void *)gte_cdp;
+	case 0x16: return GTE_FAST & 32 ? (void *)gte_ncdt_asm : (void *)gte_ncdt;
+	case 0x1b: return GTE_FAST & 32 ? (void *)gte_nccs_asm : (void *)gte_nccs;
+	case 0x1c: return GTE_FAST & 32 ? (void *)gte_cc_asm : (void *)gte_cc;
+	case 0x1e: return GTE_FAST & 32 ? (void *)gte_ncs_asm : (void *)gte_ncs;
+	case 0x20: return GTE_FAST & 32 ? (void *)gte_nct_asm : (void *)gte_nct;
+#else
 	case 0x13: return (void *)gte_ncds;
 	case 0x14: return (void *)gte_cdp;
 	case 0x16: return (void *)gte_ncdt;
@@ -2204,6 +2421,7 @@ void *gte_fpu_resolve(u32 op)
 	case 0x1c: return (void *)gte_cc;
 	case 0x1e: return (void *)gte_ncs;
 	case 0x20: return (void *)gte_nct;
+#endif
 	case 0x28: return (void *)gte_sqr;
 	case 0x29: return (void *)gte_dcpl;
 	case 0x2a: return (void *)gte_dpct;
@@ -2214,7 +2432,12 @@ void *gte_fpu_resolve(u32 op)
 #endif
 	case 0x3d: return (void *)gte_gpf;
 	case 0x3e: return (void *)gte_gpl;
+#if defined(__sh__) || defined(GTE_HOST_ASM)
+	case 0x3f: return GTE_FAST & 64 ? (void *)gte_ncct_fast
+		       : GTE_FAST & 32 ? (void *)gte_ncct_asm : (void *)gte_ncct;
+#else
 	case 0x3f: return (void *)gte_ncct;
+#endif
 	default: return NULL;
 	}
 }
