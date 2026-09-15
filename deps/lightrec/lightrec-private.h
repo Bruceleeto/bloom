@@ -195,6 +195,23 @@ struct lightrec_state {
 	u32 next_pc;
 	void *c_wrapper;
 
+	/* AND SO IS THE SPILL AREA FOR A C CALL, for the same reason and out of
+	 * the same 60 bytes. Every call emitted code makes -- a GTE command, an
+	 * io helper, any c_wrapper -- saves the cycle register and the
+	 * temporaries here on the way in and reloads them on the way out
+	 * (lightrec_save_temps / lightrec_restore_temps, regcache.c). Behind
+	 * `regs` these sat at 556-564 and each one cost four instructions:
+	 * `mov #imm,R0; shll8 R0; add #imm,R0` to build the offset, then the
+	 * indexed store. Here they are `mov.l Rm,@(disp,Rn)`, one instruction.
+	 *
+	 * Measured on the emitted SH-4 for a block holding a COP2 op: the call
+	 * sequence around a GTE command was 32 instructions, 24 of them these
+	 * six spills and reloads. Spyro issues 257,184 GTE commands in the
+	 * bench scene, so the offset arithmetic alone was ~4.6M SH-4
+	 * instructions -- and the GTE is only one of the callers. */
+	uintptr_t wrapper_cycle;
+	uintptr_t wrapper_regs[NUM_TEMPS];
+
 	/* AND THE REGISTER FILE STAYS ON A CACHE LINE. The operand cache is
 	 * direct mapped with 32-byte lines and the state block is allocated
 	 * 32-byte aligned on purpose (see lightrec_init) -- that alignment was
@@ -204,12 +221,11 @@ struct lightrec_state {
 	 * a full line instead: gpr[0..7] keep the one-instruction form, and
 	 * gpr[8..15] pay `mov #imm,R0` for it. Unpadded measured 95.90 ms/frame
 	 * against 94.91, with icache freeze 0.25 -> 0.27. */
-	u32 pad_to_line[5];
+	u32 pad_to_line[(32 - 3 * sizeof(u32)
+			 - (NUM_TEMPS + 1) * sizeof(uintptr_t)) / sizeof(u32)];
 
 	struct lightrec_registers regs;
 	u32 temp_reg;
-	uintptr_t wrapper_regs[NUM_TEMPS];
-	uintptr_t wrapper_cycle;
 	u8 in_delay_slot_n;
 	u32 current_cycle;
 	u32 target_cycle;
@@ -241,6 +257,14 @@ struct lightrec_state {
 	size_t alloc_slack;
 	void *code_lut[];
 };
+
+/* The prefix is sized by hand above; say so out loud rather than discover it
+ * as a 1 ms regression. `regs` on the line, the spill slots inside the 60
+ * bytes SH-4's displacement addressing reaches. */
+_Static_assert(offsetof(struct lightrec_state, regs) == 32,
+	       "lightrec_state prefix is no longer one cache line");
+_Static_assert(offsetof(struct lightrec_state, wrapper_regs[NUM_TEMPS - 1])
+	       <= 60, "the call spill area fell out of displacement reach");
 
 #define lightrec_offset(ptr) \
 	offsetof(struct lightrec_state, ptr)
