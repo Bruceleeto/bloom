@@ -13,7 +13,15 @@ struct blockcache;
 struct block * lightrec_find_block(struct blockcache *cache, u32 pc);
 struct block * lightrec_find_block_from_lut(struct blockcache *cache,
 					    u16 lut_entry, u32 addr_in_block);
+struct block * lightrec_find_block_from_code(struct blockcache *cache,
+					     uintptr_t addr);
 u16 lightrec_get_lut_entry(const struct block *block);
+
+void lightrec_foreach_block(struct lightrec_state *state,
+			    void (*cb)(struct block *block, void *data),
+			    void *data);
+void lightrec_block_info(const struct block *block, uintptr_t *fn,
+			 unsigned *code_size, unsigned *pc, unsigned *nb_ops);
 
 void lightrec_register_block(struct blockcache *cache, struct block *block);
 void lightrec_unregister_block(struct blockcache *cache, struct block *block);

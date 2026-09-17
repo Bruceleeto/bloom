@@ -9,7 +9,7 @@
 #include "lightrec.h"
 #include "memmanager.h"
 #include "optimizer.h"
-#include "regcache.h"
+#include "lightrec-private.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -396,7 +396,7 @@ static bool opcode_is_load(union code op)
 	}
 }
 
-static bool opcode_is_store(union code op)
+bool opcode_is_store(union code op)
 {
 	switch (op.i.op) {
 	case OP_SB:
@@ -663,7 +663,8 @@ lightrec_remove_useless_lui(struct block *block, unsigned int offset,
 	}
 }
 
-static void lightrec_lui_to_movi(struct block *block, unsigned int offset)
+static void lightrec_lui_to_movi(struct lightrec_state *state,
+				 struct block *block, unsigned int offset)
 {
 	struct opcode *ori, *lui = &block->opcode_list[offset];
 	int next;
@@ -684,6 +685,20 @@ static void lightrec_lui_to_movi(struct block *block, unsigned int offset)
 		case OP_LHU:
 		case OP_LWR:
 		case OP_META_LWU:
+			/* THE TAG IS A CONTRACT WITH THE CODE GENERATOR.
+			 *
+			 * The LUI emits nothing, its immediate is parked, and
+			 * the consumer materialises the whole constant.  A
+			 * backend that only honours that for the ALU cases
+			 * would flush the parked half as an ordinary register
+			 * write and then let the load add its immediate a
+			 * second time -- an untranslated guest address, and a
+			 * fault.  The fold is a saving, not a requirement, so
+			 * a backend that cannot take it says so and the load
+			 * cases stay out. */
+			if (state->backend_ops->flags &
+			    LIGHTREC_BACKEND_NO_LUI_LOAD_FOLD)
+				break;
 			if (op_flag_load_delay(ori->flags))
 				break;
 			fallthrough;
@@ -1036,7 +1051,7 @@ static int lightrec_transform_ops(struct lightrec_state *state, struct block *bl
 				lightrec_modify_lui(block, i);
 			lightrec_remove_useless_lui(block, i, v);
 			if (!is_delay_slot(list, i))
-				lightrec_lui_to_movi(block, i);
+				lightrec_lui_to_movi(state, block, i);
 			break;
 
 		/* Transform ORI/ADDI/ADDIU with imm #0 or ORR/ADD/ADDU/SUB/SUBU
@@ -1244,12 +1259,33 @@ static int lightrec_transform_ops(struct lightrec_state *state, struct block *bl
 				if (is_known(v, op->i.rs)
 				    && lightrec_should_exit(v[op->i.rs].value)) {
 					op->flags |= LIGHTREC_EARLY_EXIT;
+					break;
 				}
 
+				/*
+				 * A BIOS call vector is caught above and left
+				 * as a JR: 0xa0/0xb0/0xc0 kunseg to the same
+				 * top nibble as any RAM block, so the test
+				 * below would accept one and rebuild it as
+				 * (block->pc & 0xf0000000) | 0xa0 -- a jump
+				 * into RAM instead of a call into the BIOS.
+				 */
+				/*
+				 * J keeps only the low 28 bits and takes the
+				 * top nibble from the block it is in, so the
+				 * conversion is only safe when the target
+				 * already shares that nibble.  Comparing the
+				 * kunseg'd values instead - as this did - is
+				 * not the same test: 0x00000000, 0x80000000
+				 * and 0xa0000000 all kunseg to the same
+				 * nibble, so a jr into uncached memory from a
+				 * cached block passed and came back rebuilt
+				 * as a cached jump.
+				 */
 				if (is_known(v, op->i.rs)
-				    && kunseg(v[op->i.rs].value) >> 28 == kunseg(block->pc) >> 28) {
+				    && v[op->i.rs].value >> 28 == block->pc >> 28) {
 					pr_debug("Convert JR to J\n");
-					op->j.imm = kunseg(v[op->i.rs].value) >> 2;
+					op->j.imm = (v[op->i.rs].value & 0x0fffffff) >> 2;
 					op->j.op = OP_J;
 				}
 				break;
@@ -1260,11 +1296,17 @@ static int lightrec_transform_ops(struct lightrec_state *state, struct block *bl
 					op->flags |= LIGHTREC_EARLY_EXIT;
 				}
 
+				/* Same segment test as JR above: JAL rebuilds
+				 * the target from the block's top nibble, so
+				 * comparing kunseg'd values would convert a
+				 * jalr that crosses between cached and
+				 * uncached memory into a call that does not.
+				 */
 				if (is_known(v, op->r.rs)
 				    && op->r.rd == 31
-				    && kunseg(v[op->r.rs].value) >> 28 == kunseg(block->pc) >> 28) {
+				    && v[op->r.rs].value >> 28 == block->pc >> 28) {
 					pr_debug("Convert JALR to JAL\n");
-					op->j.imm = kunseg(v[op->i.rs].value) >> 2;
+					op->j.imm = (v[op->r.rs].value & 0x0fffffff) >> 2;
 					op->j.op = OP_JAL;
 				}
 				fallthrough;
@@ -1441,11 +1483,38 @@ static bool is_local_branch(const struct block *block, unsigned int idx)
 	}
 }
 
+/* Target of the branch at 'idx' when it is known at compile time: j / jal,
+ * and the PC-relative conditional branches. jr / jalr are not. */
+static bool branch_static_target(const struct block *block, unsigned int idx,
+				 u32 *target)
+{
+	const union code c = block->opcode_list[idx].c;
+	u32 pc = block->pc + (idx << 2);
+
+	switch (c.i.op) {
+	case OP_J:
+	case OP_JAL:
+		*target = (pc & 0xf0000000) | (c.j.imm << 2);
+		return true;
+	case OP_BEQ:
+	case OP_BNE:
+	case OP_BLEZ:
+	case OP_BGTZ:
+	case OP_REGIMM:
+		*target = pc + 4 + ((s16)c.i.imm << 2);
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int lightrec_handle_load_delays(struct lightrec_state *state,
 				       struct block *block)
 {
 	struct opcode *op, *list = block->opcode_list;
+	union code target_op;
 	unsigned int i;
+	u32 target;
 	s16 imm;
 
 	for (i = 0; i < block->nb_ops; i++) {
@@ -1470,6 +1539,20 @@ static int lightrec_handle_load_delays(struct lightrec_state *state,
 				 * the load delay. */
 				continue;
 			}
+		} else if (branch_static_target(block, i - 1, &target)) {
+			/* Same test for a static target outside the block:
+			 * read its first opcode now instead of at every
+			 * execution (lightrec_check_load_delay). If it does
+			 * not read the register, the load can complete in
+			 * the delay slot and the exit stays a plain link.
+			 * Assumes the target's first word does not change
+			 * behind this block's back - the hash does not cover
+			 * it - which is the same assumption a direct link
+			 * makes about the target's code. */
+			target_op = lightrec_read_opcode(state, target);
+
+			if (!opcode_reads_register(target_op, op->c.i.rt))
+				continue;
 		}
 
 		op->flags |= LIGHTREC_LOAD_DELAY;
@@ -1514,6 +1597,11 @@ static int lightrec_swap_load_delays(struct lightrec_state *state,
 				op = block->opcode_list[i];
 				block->opcode_list[i] = block->opcode_list[i + 1];
 				block->opcode_list[i + 1] = op;
+				/* The delay is now spent in the ordering; say
+				 * so, for a back end that would otherwise
+				 * model it again. */
+				block->opcode_list[i + 1].flags |=
+					LIGHTREC_SWAPPED_LOAD;
 				skip_next = true;
 			}
 		}
@@ -1960,6 +2048,28 @@ static int lightrec_flag_io(struct lightrec_state *state, struct block *block)
 				default:
 					break;
 				}
+			}
+
+			switch (list->i.op) {
+			case OP_SWL:
+			case OP_SWR:
+			case OP_LWL:
+			case OP_LWR:
+				/* The unaligned four only ever touch the word
+				 * that holds the address, and the byte offset
+				 * within it decides every shift and mask they
+				 * need.  When the low two bits of the address
+				 * are known the emitter can bake all of that
+				 * in, so record the offset here. */
+				list->flags &= ~LIGHTREC_ALIGN_MASK;
+
+				if ((v[list->i.rs].known & 0x3) == 0x3) {
+					val = v[list->i.rs].value + (s16) list->i.imm;
+					list->flags |= LIGHTREC_ALIGN((val & 0x3) + 1);
+				}
+				break;
+			default:
+				break;
 			}
 
 			if (!LIGHTREC_FLAGS_GET_IO_MODE(list->flags)

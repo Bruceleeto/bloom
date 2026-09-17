@@ -11,7 +11,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define REG_PC (offsetof(struct lightrec_state, curr_pc) / sizeof(u32))
+/* NOT AN OFFSET, A SIGNED INDEX OFF regs.gpr. clean_reg() stores a dirty
+ * register at `regs.gpr + (emulated_register << 2)`, so the id that makes a
+ * dirty PC land on curr_pc is its distance from gpr[0] in words -- which is
+ * negative now that curr_pc sits in front of the register file. It stays
+ * clear of every real id: guest registers are 0..31 and "unmapped" is -1. */
+#define REG_PC ((s16)(((s32)offsetof(struct lightrec_state, curr_pc)	\
+		       - (s32)offsetof(struct lightrec_state, regs.gpr))	\
+		      / (s32)sizeof(u32)))
 
 enum reg_priority {
 	REG_IS_TEMP,
@@ -36,27 +43,9 @@ struct regcache {
 	struct native_register lightrec_regs[NUM_REGS + NUM_TEMPS];
 };
 
-static const char * mips_regs[] = {
-	"zero",
-	"at",
-	"v0", "v1",
-	"a0", "a1", "a2", "a3",
-	"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-	"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-	"t8", "t9",
-	"k0", "k1",
-	"gp", "sp", "fp", "ra",
-	"lo", "hi",
-};
-
 /* Forward declaration(s) */
 static void clean_reg(jit_state_t *_jit,
 		      struct native_register *nreg, u8 jit_reg, bool clean);
-
-const char * lightrec_reg_name(u8 reg)
-{
-	return mips_regs[reg];
-}
 
 static inline bool lightrec_reg_is_zero(u8 jit_reg)
 {
@@ -544,7 +533,10 @@ void lightrec_load_next_pc(struct regcache *cache, jit_state_t *_jit, u8 reg)
 static void free_reg(struct native_register *nreg)
 {
 	/* Set output registers as dirty */
-	if (nreg->used && nreg->output && nreg->emulated_register > 0)
+	/* REG_PC is negative now, so "a real destination" is no longer "> 0":
+	 * 0 is $zero, which is never dirty, and -1 is unmapped. */
+	if (nreg->used && nreg->output &&
+	    (nreg->emulated_register > 0 || nreg->emulated_register == REG_PC))
 		nreg->prio = REG_IS_DIRTY;
 	if (nreg->output) {
 		nreg->extended = nreg->extend;
@@ -728,6 +720,63 @@ void lightrec_free_regcache(struct regcache *cache)
 {
 	return lightrec_free(cache->state, MEM_FOR_LIGHTREC,
 			     sizeof(*cache), cache);
+}
+
+/*
+ * Save and restore the caller-saved temporaries around a direct call to C.
+ *
+ * Marking registers live does not preserve them: jit_live() constrains
+ * lightning's own allocator and emits nothing.  What preserves the temporaries
+ * on the normal path is the C wrapper block, which spills all of them to
+ * state->wrapper_regs on the way in and reloads them on the way out
+ * (lightrec.c, generate_wrapper).  A call that skips the wrapper has to do the
+ * same, or whatever guest register was living in a temporary is destroyed by
+ * the callee.
+ *
+ * The wrapper saves every temporary because it cannot know which are in use.
+ * Here the register cache is in front of us, so only the live ones are spilled.
+ */
+void lightrec_save_temps(struct regcache *cache, jit_state_t *_jit)
+{
+	struct native_register *nreg;
+	unsigned int i;
+
+	/*
+	 * LIGHTREC_REG_CYCLE is JIT_R0 - a temporary, and not one of the
+	 * NUM_TEMPS this loop covers.  The wrapper block preserves it by
+	 * converting the delta it holds into state->current_cycle before the
+	 * call and rebuilding it after; a call that does not need the cycle
+	 * count to be readable during it can just put the register somewhere.
+	 */
+	jit_stxi(lightrec_offset(wrapper_cycle), LIGHTREC_REG_STATE,
+		 LIGHTREC_REG_CYCLE);
+
+	for (i = 0; i < NUM_TEMPS; i++) {
+		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP) {
+			jit_stxi(lightrec_offset(wrapper_regs[i]),
+				 LIGHTREC_REG_STATE, JIT_R(FIRST_TEMP + i));
+		}
+	}
+}
+
+void lightrec_restore_temps(struct regcache *cache, jit_state_t *_jit)
+{
+	struct native_register *nreg;
+	unsigned int i;
+
+	jit_ldxi(LIGHTREC_REG_CYCLE, LIGHTREC_REG_STATE,
+		 lightrec_offset(wrapper_cycle));
+
+	for (i = 0; i < NUM_TEMPS; i++) {
+		nreg = &cache->lightrec_regs[NUM_REGS + i];
+
+		if (nreg->used || nreg->prio > REG_IS_TEMP) {
+			jit_ldxi(JIT_R(FIRST_TEMP + i), LIGHTREC_REG_STATE,
+				 lightrec_offset(wrapper_regs[i]));
+		}
+	}
 }
 
 void lightrec_regcache_mark_live(struct regcache *cache, jit_state_t *_jit)

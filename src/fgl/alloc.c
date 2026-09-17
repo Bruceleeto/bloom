@@ -1,0 +1,986 @@
+/* The allocation pass.  See alloc.h for the shape; this is the walk.
+ *
+ * One forward pass over the nodes.  For each node the sources are taken first
+ * and the destinations after, so that a destination needing a register never
+ * evicts a source it is about to read: taking a register makes it most
+ * recently used, and the victim is always the least.
+ *
+ * Nothing here looks ahead.  A value is written back when its register is
+ * wanted by something else, or when the block ends, and never speculatively.
+ */
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "alloc.h"
+#include "fgl.h"
+#include "fgl_state.h"
+#include "pins.h"
+
+/* THE POOL HAS TO OUTNUMBER WHAT ONE NODE CAN WANT AT ONCE, or a node's own
+ * allocation evicts one of its own operands — the emitter still holds the host
+ * register number the pass gave it, and by the time the code runs something
+ * else is living there.  The worst node is a division: four guest registers
+ * (two sources, LO and HI) and one scratch for the service pointer.
+ *
+ * Nothing enforces this at run time and nothing can: the allocation is already
+ * baked into the node by then.  Ten leaves plenty of room, and the failure at
+ * three is a real one — the oracle finds it in seconds. */
+/* ALLOC_SKIP is not allocatable, so it does not count towards the five. */
+_Static_assert(ALLOC_N - (ALLOC_SKIP >= 0 ? 1 : 0) >= 5,
+	       "a node can want four registers and a scratch");
+
+/* The pinned assignment.  Slot 0 is r3.
+ *
+ * The four that hold nothing are the low-ranked ones, so they are spent first
+ * and a short block never disturbs a pinned register at all.  They are also
+ * the three the block-boundary services use as working storage, which is only
+ * safe because nothing is live in them when a block begins or ends. */
+/* PINNING IS ON.  The assignment lives in pins.h, which the dispatcher also
+ * reads; this is only its per-slot form, where index k means host register
+ * ALLOC_FIRST + k.
+ *
+ * ONE OF THE TWO REASONS IT USED TO BE OFF IS GONE and one is not.
+ *
+ *   - "The dispatcher does not exist."  It does now (dispatch.S).  It touches
+ *     r0, r1 and r2 and nothing else, so a pinned register survives a trip
+ *     through the loop; every route that reaches C publishes and reloads at a
+ *     site marked PIN.
+ *   - "Nothing can check it."  Still true.  The oracle runs one block cold and
+ *     reads the registers out, so a cross-block register handshake is
+ *     invisible to it by construction.  This is a HARDWARE-checked feature.
+ *     Do not read an oracle pass as evidence about pinning either way.
+ *
+ * Set FGL_NUM_PINS to 0 to put it back.  That is the A/B that separates a
+ * pinning bug from an emitter bug, and it needs to keep working. */
+#define PIN_SLOT(host) ((host) - ALLOC_FIRST)
+
+const int8_t ir_pin[ALLOC_N] = {
+        [0 ... ALLOC_N - 1] = -1,
+#if FGL_NUM_PINS > 0
+        [PIN_SLOT(FGL_PIN0_HOST)] = FGL_PIN0_GUEST,
+#endif
+#if FGL_NUM_PINS > 1
+        [PIN_SLOT(FGL_PIN1_HOST)] = FGL_PIN1_GUEST,
+#endif
+#if FGL_NUM_PINS > 2
+        [PIN_SLOT(FGL_PIN2_HOST)] = FGL_PIN2_GUEST,
+#endif
+#if FGL_NUM_PINS > 3
+        [PIN_SLOT(FGL_PIN3_HOST)] = FGL_PIN3_GUEST,
+#endif
+#if FGL_NUM_PINS > 4
+        [PIN_SLOT(FGL_PIN4_HOST)] = FGL_PIN4_GUEST,
+#endif
+#if FGL_NUM_PINS > 5
+        [PIN_SLOT(FGL_PIN5_HOST)] = FGL_PIN5_GUEST,
+#endif
+};
+
+/* REGION PINS (POC, 2026-09-09).  On top of the six fixed pins, a region
+ * may pin up to four more guest registers into the free slots for its own
+ * length.  `ir_pin_cur` is what the walk reads; `ir_pin_region[h]` marks the
+ * extra slots.  They differ from the fixed pins in one way: memory is kept
+ * current at every flush (a dirty one is stored, and after a crossing into C
+ * it is dropped so the next read reloads), so every exit from the region and
+ * every other block sees a state block that is right, and nothing outside the
+ * region has to know they exist.  The first range preloads them. */
+int8_t  ir_pin_cur[ALLOC_N];
+uint8_t ir_pin_region[ALLOC_N];
+static int pin_cur_init;
+
+void ir_pin_set_region(const int8_t *extra)
+{
+        int h;
+
+        for (h = 0; h < ALLOC_N; h++) {
+                ir_pin_cur[h] = ir_pin[h];
+                ir_pin_region[h] = 0;
+                /* The ALLOC_SKIP slot reads as unpinned because nothing guest
+                 * lives there, but it is not free -- it is the high
+                 * guest-file base.  A region pin must not take it. */
+                if (extra && h != ALLOC_SKIP &&
+                    ir_pin[h] < 0 && extra[h] >= 0) {
+                        ir_pin_cur[h] = extra[h];
+                        ir_pin_region[h] = 1;
+                }
+        }
+        pin_cur_init = 1;
+}
+
+/* ---------------------------------------------------------------- */
+/* LRU                                                               */
+/* ---------------------------------------------------------------- */
+
+/* Ten ranks, one nibble each, two to a byte — so five bytes hold the whole
+ * order.  Touching the register at rank k makes it rank 9 and drops everything
+ * above k by one; that transform is a function of the nibble alone, so a table
+ * per k does two registers at a time and the whole update is five loads. */
+#define RANK_BYTES ((ALLOC_N + 1) / 2)
+
+static uint8_t lru_tab[ALLOC_N][256];
+static int     lru_built;
+
+static void lru_build(void)
+{
+        int k, b;
+
+        for (k = 0; k < ALLOC_N; k++)
+                for (b = 0; b < 256; b++) {
+                        int lo = b & 15, hi = (b >> 4) & 15;
+
+                        lo = (lo == k) ? ALLOC_N - 1 : (lo > k ? lo - 1 : lo);
+                        hi = (hi == k) ? ALLOC_N - 1 : (hi > k ? hi - 1 : hi);
+                        lru_tab[k][b] = (uint8_t)((hi << 4) | lo);
+                }
+        lru_built = 1;
+}
+
+typedef struct {
+        int8_t    owner[ALLOC_N];       /* guest register held, -1 for none  */
+        uint8_t   dirty[ALLOC_N];
+        uint8_t   used[ALLOC_N];        /* has ever held anything            */
+        uint8_t   last[ALLOC_N];        /* node of the last reference        */
+        uint8_t   wrote[ALLOC_N];       /* ...and whether it was a write     */
+        int8_t    where[GUEST_HI + 1];  /* pool index per guest register     */
+        uint8_t   defined[GUEST_HI + 1];/* written somewhere in this block   */
+        uint8_t   lastuse[GUEST_HI + 1];/* last node mentioning it, 0xff none */
+        uint16_t  claim[ALLOC_N];       /* node that took it, 0xffff none    */
+        uint8_t   rank[RANK_BYTES];
+        int       node;                 /* the node being allocated for      */
+        ir_alloc *a;
+} allocator;
+
+static int rank_of(const allocator *s, int h)
+{
+        return (s->rank[h >> 1] >> ((h & 1) * 4)) & 15;
+}
+
+static void touch(allocator *s, int h)
+{
+        int k = rank_of(s, h);
+        int b;
+
+        for (b = 0; b < RANK_BYTES; b++)
+                s->rank[b] = lru_tab[k][s->rank[b]];
+}
+
+/* WHAT EVICTING A SLOT ACTUALLY COSTS, in instructions that would not have
+ * been emitted anyway.  LRU answers "who is oldest", which is not the same
+ * question and gets the answer wrong in the one case that matters.
+ *
+ * A dirty non-pinned register is stored by the exit flush regardless, so
+ * evicting it moves that store earlier and adds nothing.  A PIN SITTING AT
+ * HOME is the opposite: the flush skips its store (it is where the next block
+ * expects it) and skips its reload, so taking it creates both -- a store here
+ * and a reload at the exit, tagged PIN, which is 3.6% of every instruction
+ * this emitter executes.  A pin is worth two of anything else, and LRU spends
+ * one to save a register that dies on the next node.
+ *
+ * Region pins keep memory current at every flush, so their store is owed
+ * either way and only the reload is new.
+ *
+ * The last term is the reload this block will need if the value is read
+ * again.  `lastuse` over-approximates -- a later mention that is a pure write
+ * needs no reload -- which can only make a victim look dearer than it is. */
+static int evict_cost(const allocator *s, int h)
+{
+        int g = s->owner[h];
+        int cost = 0;
+
+        if (g < 0)
+                return 0;               /* empty */
+
+        if (ir_pin_cur[h] == (int8_t)g)
+                cost += ir_pin_region[h] ? 1 : (s->dirty[h] ? 2 : 1);
+
+        if (s->lastuse[g] != 0xff && s->lastuse[g] > (uint8_t)s->node)
+                cost += 1;
+
+        return cost;
+}
+
+/* A slot this node has already been handed can never be the victim: the
+ * emitter has the host register number baked into the node by now, and giving
+ * it to a second operand makes the first one read whatever the second wrote.
+ * LRU got this for free -- taking a register makes it most recent -- so the
+ * cost order has to say it out loud. */
+static int claimed_here(const allocator *s, int h)
+{
+        return s->claim[h] == (uint16_t)s->node;
+}
+
+/* Cheapest to evict, oldest of the cheapest.  With every cost equal this is
+ * exactly the old LRU pick, which is what FGL_ALLOC_LRU=1 restores. */
+static int alloc_lru_only = -1;
+
+static int lru_mode(void)
+{
+        if (alloc_lru_only < 0) {
+                const char *e = getenv("FGL_ALLOC_LRU");
+                alloc_lru_only = e && *e != '0';
+        }
+        return alloc_lru_only;
+}
+
+static int victim(const allocator *s)
+{
+        int h, best = -1, best_cost = 0, best_rank = 0;
+
+        for (h = 0; h < ALLOC_N; h++) {
+                int cost, rank;
+
+                if (h == ALLOC_SKIP)
+                        continue;       /* the high guest-file base */
+                if (claimed_here(s, h))
+                        continue;
+
+                rank = rank_of(s, h);
+                cost = lru_mode() ? 0 : evict_cost(s, h);
+
+                if (best < 0 || cost < best_cost ||
+                    (cost == best_cost && rank < best_rank)) {
+                        best      = h;
+                        best_cost = cost;
+                        best_rank = rank;
+                }
+        }
+
+        /* Every slot claimed by this node is impossible -- the pool outnumbers
+         * what one node can want (the assert at the top) -- but a fall-back
+         * beats a -1 escaping into the emitter. */
+        if (best < 0)
+                for (h = 0; h < ALLOC_N; h++)
+                        if (h != ALLOC_SKIP && rank_of(s, h) == 0)
+                                return h;
+        return best < 0 ? 0 : best;
+}
+
+/* ---------------------------------------------------------------- */
+/* Traffic                                                           */
+/* ---------------------------------------------------------------- */
+
+static void fixup_at(allocator *s, int at, int guest, int h, int store)
+{
+        ir_fixup *f;
+
+        if (s->a->n_fix >= ALLOC_MAX_FIXUPS) {
+                static int shouted;
+                if (shouted++ < 4)
+                        fprintf(stderr, "alloc: FIXUP OVERFLOW at node %d\n", at);
+                return;
+        }
+        f = &s->a->fix[s->a->n_fix++];
+        f->at    = (uint8_t)at;
+        f->guest = (uint8_t)guest;
+        f->host  = (uint8_t)(ALLOC_FIRST + h);
+        f->store = (uint8_t)store;
+}
+
+static void fixup(allocator *s, int guest, int h, int store)
+{
+        fixup_at(s, s->node, guest, h, store);
+}
+
+/* A writeback goes to the node where the value was last referenced, not to the
+ * node that evicted it.  The register is untouched in between, so the store is
+ * valid anywhere in that span, and putting it at the near end keeps it away
+ * from the code that wanted the register.
+ *
+ * ONE CASE CANNOT GO THERE.  Writebacks are emitted in front of their node's
+ * code, so if the last reference was a *write*, the register does not hold the
+ * value yet — the store would save what the node is about to overwrite.  Those
+ * are charged to the node after it, which is the same position one instruction
+ * later.
+ */
+static void charge_writeback(allocator *s, int h)
+{
+        int at = s->last[h] + (s->wrote[h] ? 1 : 0);
+
+        if (at > s->node)
+                at = s->node;
+        fixup_at(s, at, s->owner[h], h, 1);
+}
+
+static void evict(allocator *s, int h)
+{
+        if (s->owner[h] < 0)
+                return;
+
+        if (s->dirty[h])
+                charge_writeback(s, h);
+        s->where[s->owner[h]] = -1;
+        s->owner[h] = -1;
+        s->dirty[h] = 0;
+}
+
+/* A guest register into the pool.  `want_value` is whether its current value
+ * matters — a pure destination does not need loading, which is the whole
+ * saving on a register written before it is read. */
+static int take(allocator *s, unsigned g, int want_value)
+{
+        int h;
+
+        if (s->where[g] >= 0) {
+                h = s->where[g];
+                s->last[h] = (uint8_t)s->node;
+                s->claim[h] = (uint16_t)s->node;
+                s->wrote[h] = 0;
+                touch(s, h);
+                return h;
+        }
+
+        h = victim(s);
+        evict(s, h);
+
+        if (want_value) {
+                /* A register nothing has used yet can be loaded at block
+                 * entry, where the load is furthest from its use.  Once it has
+                 * held a value, the load has to wait until that value is
+                 * dead. */
+                /* A LOAD MAY ONLY BE HOISTED FOR A REGISTER THE BLOCK HAS
+                 * NOT WRITTEN.
+                 *
+                 * `used[h]` is a property of the HOST register -- has this
+                 * one ever held anything -- and says nothing about the guest
+                 * register being loaded.  A guest register written earlier in
+                 * the block and since flushed to the state block (every call
+                 * into C flushes) is unbound again, so the next read of it
+                 * takes this path; hoisting that load to block entry reads
+                 * the value from BEFORE the write.
+                 *
+                 * Found in Spyro at 0x800172b0:
+                 *
+                 *      mflo    $v0             ; $v0 = LO, in r7
+                 *      mtc2    $v0,$30         ; a call into C: everything
+                 *                              ; flushed, r7 unbound
+                 *      ...
+                 *      srlv    $v0,$v0,$v1     ; reads $v0 -- hoisted to
+                 *                              ; block entry, into r11
+                 *
+                 * r11 got the value $v0 had when the block started, the shift
+                 * ran on it, and the block's writeback then published r11
+                 * over the correct value.  The result was an angle 2000-odd
+                 * degrees out, which is how the camera came to point at
+                 * nothing and the scene drained away one frame at a time. */
+                if (!s->used[h] && !s->defined[g] &&
+                    s->a->n_preload < ALLOC_N) {
+                        ir_fixup *f = &s->a->preload[s->a->n_preload++];
+
+                        f->at    = 0;
+                        f->guest = (uint8_t)g;
+                        f->host  = (uint8_t)(ALLOC_FIRST + h);
+                        f->store = 0;
+                } else {
+                        fixup(s, (int)g, h, 0);
+                }
+        }
+
+        s->owner[h] = (int8_t)g;
+        s->used[h]  = 1;
+        s->where[g] = (int8_t)h;
+        s->last[h]  = (uint8_t)s->node;
+        s->claim[h] = (uint16_t)s->node;
+        s->wrote[h] = 0;
+        touch(s, h);
+        return h;
+}
+
+/* Guest register 0 is never allocated: it reads zero and discards writes, so
+ * a register holding it would hold nothing. */
+/* -1 IS ALREADY THE ANSWER FOR "IN THE STATE BLOCK", which is why dumb mode
+ * costs three lines and no new code in the emitter: every node already has a
+ * memory path for the case where the allocator could not give it a register.
+ * Returning -1 always simply takes that path every time.  `scratch` is left
+ * alone -- a `jsr` target has to be in a register whatever mode this is. */
+static int8_t host_src(allocator *s, unsigned g)
+{
+        if (g == 0 || FGL_DUMB_REGS)
+                return -1;
+        return (int8_t)(ALLOC_FIRST + take(s, g, 1));
+}
+
+static int8_t host_dst(allocator *s, unsigned g)
+{
+        int h;
+
+        if (g == 0 || FGL_DUMB_REGS)
+                return -1;
+        h = take(s, g, 0);
+        s->dirty[h] = 1;
+        s->wrote[h] = 1;
+        s->defined[g] = 1;
+        return (int8_t)(ALLOC_FIRST + h);
+}
+
+/* THE DESTINATION ONTO A DYING SOURCE, WHICH DELETES A MOVE.
+ *
+ * SH-4 is two-operand: `addu rd,rs,rt` lowers to `mov rs,rd` then `add rt,rd`,
+ * and that move is the single largest non-work item the emitter produces --
+ * 0.597 per guest instruction against bleem's 0.241 once forced R0 bounces are
+ * taken out of both.  It exists only because `host_dst` claims a FRESH
+ * register for rd while rs sits in one that nothing will read again.
+ *
+ * When this node is the last mention of rs, rd can simply take rs's register.
+ * The value rd must start from IS rs's value, which is already there, so
+ * `alu_rr` sees rd == rs and emits no move at all.
+ *
+ * The writeback is not a new cost.  A dirty non-pinned register is stored by
+ * the flush at the block's end regardless; evicting rs here moves that store
+ * earlier rather than adding one.  Pinned slots are excluded because the flush
+ * RELOADS a pin whose host register went elsewhere, which would trade the move
+ * for a load and win nothing. */
+static int8_t host_dst_co(allocator *s, unsigned rd, unsigned rs, int8_t hsrc)
+{
+        int slot, old;
+
+        static int off = -1;
+
+        if (off < 0)
+                off = getenv("FGL_NO_COALESCE") != NULL;
+        if (FGL_DUMB_REGS || rd == 0)
+                return -1;
+        if (off)
+                return host_dst(s, rd);
+        if (rs == 0 || rd == rs || hsrc < 0)
+                return host_dst(s, rd);
+
+        slot = (int)hsrc - ALLOC_FIRST;
+        if (slot < 0 || slot >= ALLOC_N)
+                return host_dst(s, rd);
+        /* Not "is this a pinned slot" but "is rs sitting in its OWN pin".
+         * A pin slot already holding someone else is off-assignment, so the
+         * flush stores it and reloads the pin whatever happens here -- taking
+         * it for rd adds nothing.  Only rs-at-home is worth declining: there
+         * the flush would skip the store (loop 1) and skip the reload, and
+         * stealing the slot creates both. */
+        if (ir_pin_cur[slot] == (int8_t)rs)
+                return host_dst(s, rd);
+        if (s->owner[slot] != (int8_t)rs)
+                return host_dst(s, rd);
+        if (s->lastuse[rs] != (uint8_t)s->node)
+                return host_dst(s, rd);
+        if (s->where[rd] == (int8_t)slot)
+                return host_dst(s, rd);
+
+        /* rd's previous home, if it had one, holds a value this node is about
+         * to overwrite in full.  Dropping it needs no writeback for the same
+         * reason a dead value needs none. */
+        old = s->where[rd];
+        if (old >= 0) {
+                s->owner[old] = -1;
+                s->dirty[old] = 0;
+                s->where[rd]  = -1;
+        }
+
+        evict(s, slot);
+        s->owner[slot]  = (int8_t)rd;
+        s->used[slot]   = 1;
+        s->where[rd]    = (int8_t)slot;
+        s->last[slot]   = (uint8_t)s->node;
+        s->claim[slot]  = (uint16_t)s->node;
+        s->wrote[slot]  = 1;
+        s->dirty[slot]  = 1;
+        s->defined[rd]  = 1;
+        touch(s, slot);
+        return (int8_t)(ALLOC_FIRST + slot);
+}
+
+/* Read and written both — the unaligned loads merge into their destination. */
+static int8_t host_mod(allocator *s, unsigned g)
+{
+        int h;
+
+        if (g == 0 || FGL_DUMB_REGS)
+                return -1;
+        h = take(s, g, 1);
+        s->dirty[h] = 1;
+        s->wrote[h] = 1;
+        s->defined[g] = 1;
+        return (int8_t)(ALLOC_FIRST + h);
+}
+
+/* Working registers for a node that needs more than `r0` and `r1`.  Taken from
+ * the least recently used end and NOT touched, so they stay first in line: a
+ * scratch register holds nothing once the node is done, and the next node that
+ * wants one should get the same one back. */
+static void scratch(allocator *s, ir_node *p, int k)
+{
+        int got = 0;
+
+        /* By cost, then by age, for the same reason as `victim` -- a memory
+         * node wanting a working register is the commonest way a pin gets
+         * spilled, and the old walk took whatever was oldest. */
+        while (got < k) {
+                int h, best = -1, best_cost = 0, best_rank = 0;
+
+                for (h = 0; h < ALLOC_N; h++) {
+                        int cost, rank, i, taken = 0;
+
+                        if (h == ALLOC_SKIP)
+                                continue;       /* the high guest-file base */
+
+                        /* Not one of this node's own operands, and not one
+                         * already handed to it. */
+                        if ((p->hd >= 0 && p->hd == ALLOC_FIRST + h) ||
+                            (p->hs >= 0 && p->hs == ALLOC_FIRST + h) ||
+                            (p->ht >= 0 && p->ht == ALLOC_FIRST + h) ||
+                            (p->hx >= 0 && p->hx == ALLOC_FIRST + h))
+                                continue;
+                        for (i = 0; i < got; i++)
+                                if (p->sc[i] == ALLOC_FIRST + h)
+                                        taken = 1;
+                        if (taken)
+                                continue;
+
+                        rank = rank_of(s, h);
+                        cost = lru_mode() ? 0 : evict_cost(s, h);
+
+                        if (best < 0 || cost < best_cost ||
+                            (cost == best_cost && rank < best_rank)) {
+                                best      = h;
+                                best_cost = cost;
+                                best_rank = rank;
+                        }
+                }
+                if (best < 0)
+                        break;
+
+                evict(s, best);
+                s->used[best] = 1;
+                s->claim[best] = (uint16_t)s->node;
+                p->sc[got++] = (uint8_t)(ALLOC_FIRST + best);
+        }
+}
+
+/* Everything the next block is entitled to assume.
+ *
+ * TWO PASSES, AND THE ORDER IS LOAD BEARING.  Every dirty value goes back
+ * before any register is reloaded, because a pinned register's home may be the
+ * only place some other guest register's value exists — reload it first and
+ * that value is gone.
+ *
+ * Then the pinned assignment is put back where a block moved it, which is what
+ * makes a bare `bra` into the next block legal: the join has no handshake, so
+ * the state at every exit has to be the state at every entry.
+ */
+static void flush(allocator *s);
+
+/* A crossing into C: everything stored, and the region pins forgotten so
+ * whatever C wrote is read back. */
+static void flush_c(allocator *s)
+{
+        int h;
+
+        flush(s);
+        for (h = 0; h < ALLOC_N; h++)
+                if (ir_pin_region[h]) {
+                        s->where[s->owner[h]] = -1;
+                        s->owner[h] = -1;
+                        s->dirty[h] = 0;
+                }
+}
+
+static void flush(allocator *s)
+{
+        int h;
+#ifdef ALLOC_PINNED_LIVE
+        /* Which pinned registers loop 1 declines to store.  Those are the ones
+         * whose only current copy is the host register once this flush is
+         * over, so the walk below has to put the dirty flag straight back --
+         * `flush` also runs MID-BLOCK, and a register left clean here is one
+         * the eviction path will drop. Same reasoning as the entry state in
+         * `ir_allocate`. Fixing only the entry state and not this one leaves
+         * the same hole for any block that flushes part-way through. */
+        uint8_t live[ALLOC_N];
+#endif
+
+        for (h = 0; h < ALLOC_N; h++) {
+                /* THE PINNED REGISTERS ARE LIVE IN HOST REGISTERS, and the
+                 * state block's copy of one is allowed to be stale.
+                 *
+                 * The reference does not store a pinned register that still
+                 * holds its own guest register: the next block assumes `PIN`
+                 * and finds the value already there (`asm/regalloc.md`, the
+                 * flush's loop 1 clearing `C[host]` when `A[host] ==
+                 * B[host]`). We used to store it, on every block.
+                 *
+                 * Worth **-9.1% on Spyro** (3.75 -> 3.41 on the weighted
+                 * census), against the 1.4% it was written off at when priced
+                 * on a spin loop -- `gotchas.md` 305, and the reason `CENSUS=1`
+                 * is not the same instrument as `WEIGHTS=`.
+                 *
+                 * WHAT MAKES IT CORRECT is in `emit.c`: `ld_guest_live` for a
+                 * stub that wants a pinned register, and `emit_publish_pinned`
+                 * at every crossing into C, because gcc knows nothing about
+                 * the pinning. The reference needs neither -- its handlers are
+                 * asm and read r7/r8/r11 directly (`asm/bios_hle.md` 5.5).
+                 * ADD A CROSSING INTO C AND IT NEEDS THE PUBLISH:
+                 * `grep emit_publish_pinned` is the check (296). */
+#ifdef ALLOC_PINNED_LIVE
+                live[h] = (uint8_t)(ir_pin_cur[h] >= 0 &&
+                                    !ir_pin_region[h] &&
+                                    s->owner[h] == ir_pin_cur[h]);
+                if (live[h])
+                        s->dirty[h] = 0;
+#endif
+                if (s->owner[h] >= 0 && (s->dirty[h] ||
+                    (ir_pin_region[h] && getenv("FGL_RPIN_SAFE")))) {
+                        fixup(s, s->owner[h], h, 1);
+                        s->dirty[h] = 0;
+                        s->wrote[h] = 0;
+                        s->last[h] = (uint8_t)s->node;
+                }
+        }
+
+        for (h = 0; h < ALLOC_N; h++)
+                if (ir_pin_cur[h] >= 0 && s->owner[h] != ir_pin_cur[h])
+                        fixup(s, ir_pin_cur[h], h, 0);
+
+        /* The entry state again, so a flush in the middle of a block leaves
+         * the walk describing what the code actually holds. */
+        for (h = 0; h < ALLOC_N; h++) {
+                if (s->owner[h] >= 0)
+                        s->where[s->owner[h]] = -1;
+                s->owner[h] = ir_pin_cur[h];
+#ifdef ALLOC_PINNED_LIVE
+                /* Unstored above, so still the only copy. A register that was
+                 * NOT in its home was reloaded from the state block by the
+                 * loop before this one, and is genuinely clean. */
+                s->dirty[h] = live[h];
+#endif
+                s->last[h] = (uint8_t)s->node;
+                s->wrote[h] = 0;
+        }
+        for (h = 0; h < ALLOC_N; h++)
+                if (ir_pin_cur[h] >= 0)
+                        s->where[ir_pin_cur[h]] = (int8_t)h;
+}
+
+/* ---------------------------------------------------------------- */
+/* The walk                                                          */
+/* ---------------------------------------------------------------- */
+
+void ir_allocate(ir_node *ir, int n, ir_alloc *out)
+{
+        ir_allocate_region(ir, n, out, 0);
+}
+
+void ir_allocate_region(ir_node *ir, int n, ir_alloc *out, int first)
+{
+        allocator s;
+        int i;
+
+        if (!lru_built)
+                lru_build();
+        if (!pin_cur_init)
+                ir_pin_set_region(NULL);
+
+        out->n_preload = 0;
+        out->n_fix = 0;
+        if (first || getenv("FGL_RPIN_SAFE"))
+                for (i = 0; i < ALLOC_N; i++)
+                        if (ir_pin_region[i]) {
+                                ir_fixup *f = &out->preload[out->n_preload++];
+                                f->at = 0;
+                                f->guest = (uint8_t)ir_pin_cur[i];
+                                f->host = (uint8_t)(ALLOC_FIRST + i);
+                                f->store = 0;
+                        }
+
+        /* A pinned register arrives holding its guest register, and it counts
+         * as used: a preload into it would overwrite a value that is already
+         * the right one.
+         *
+         * WHETHER IT ALSO AGREES WITH THE STATE BLOCK IS EXACTLY WHAT
+         * `ALLOC_PINNED_LIVE` CHANGES, and getting this wrong loses a guest
+         * register across two blocks. Without the flag the previous block's
+         * flush stored it, so it is clean. WITH the flag that flush
+         * deliberately skipped the store — so it arrives DIRTY: the host
+         * register is the only current copy.
+         *
+         * Mark it clean anyway and the eviction path believes there is
+         * nothing to save, drops the value, and the flush's reload pulls the
+         * stale copy back out of memory. It needs one block to write a pinned
+         * register and the NEXT to evict that host register, so no host suite
+         * sees it — real blocks never spill (gotchas 33/34), the oracle's
+         * blocks are independent, and cross-block state is the first item in
+         * CLAUDE.md's list of what nothing covers. Spyro found it in one run
+         * (`gotchas.md` 308).
+         *
+         * Dirty here costs nothing when the register is never evicted: the
+         * flush's loop 1 clears the flag again because the register still
+         * holds its own guest register, and no store is emitted. */
+        for (i = 0; i < ALLOC_N; i++) {
+                s.owner[i] = ir_pin_cur[i];
+#ifdef ALLOC_PINNED_LIVE
+                s.dirty[i] = ir_pin_cur[i] >= 0 && !ir_pin_region[i];
+#else
+                s.dirty[i] = 0;
+#endif
+                s.used[i] = ir_pin_cur[i] >= 0;
+                s.claim[i] = 0xffff;
+                s.last[i] = 0;
+                s.wrote[i] = 0;
+        }
+        for (i = 0; i <= GUEST_HI; i++) {
+                s.where[i] = -1;
+                s.defined[i] = 0;
+        }
+        for (i = 0; i < ALLOC_N; i++)
+                if (ir_pin_cur[i] >= 0)
+                        s.where[ir_pin_cur[i]] = (int8_t)i;
+        for (i = 0; i < RANK_BYTES; i++)
+                s.rank[i] = (uint8_t)((2 * i + 1) << 4 | (2 * i));
+        /* Region pins live in the lowest slots, which are the first victims.
+         * Touch them so the free rotating registers are spent first. */
+        for (i = 0; i < ALLOC_N; i++)
+                if (ir_pin_region[i])
+                        touch(&s, i);
+        s.a = out;
+
+        /* Last mention of each guest register, counting a write as a mention.
+         * Over-approximating what is live can only DECLINE a coalesce, never
+         * permit a wrong one, which is the right way round for a pass whose
+         * failure mode is publishing a register over a live value. */
+        memset(s.lastuse, 0xff, sizeof s.lastuse);
+        for (i = 0; i < n; i++) {
+                const ir_node *p = &ir[i];
+
+                if (p->rs <= GUEST_HI) s.lastuse[p->rs] = (uint8_t)i;
+                if (p->rt <= GUEST_HI) s.lastuse[p->rt] = (uint8_t)i;
+                if (p->rd <= GUEST_HI) s.lastuse[p->rd] = (uint8_t)i;
+        }
+
+        for (i = 0; i < n; i++) {
+                ir_node *p = &ir[i];
+
+                s.node = i;
+
+                switch (p->op) {
+                case IR_MOVE:
+                        p->hs = host_src(&s, p->rs);
+                        p->hd = host_dst(&s, p->rd);
+                        break;
+
+                case IR_SET:
+                        p->hd = host_dst(&s, p->rd);
+                        break;
+
+                case IR_MFC0:
+                        /* A coprocessor read carries the same shadow as a
+                         * memory load, so it defers the same way: parked
+                         * value, no destination claimed here. */
+                        p->hd = p->defer ? -1 : host_dst(&s, p->rd);
+                        break;
+
+                case IR_ALU:
+                        p->hs = host_src(&s, p->rs);
+                        p->ht = host_src(&s, p->rt);
+                        p->hd = host_dst_co(&s, p->rd, p->rs, p->hs);
+                        break;
+
+                case IR_SHIFT_REG:
+                        /* The VALUE is rt here and the count is rs, so it is
+                         * rt whose register the destination can inherit. */
+                        p->hs = host_src(&s, p->rs);
+                        p->ht = host_src(&s, p->rt);
+                        p->hd = host_dst_co(&s, p->rd, p->rt, p->ht);
+                        break;
+
+                case IR_ALU_IMM:
+                        p->hs = host_src(&s, p->rs);
+                        p->hd = host_dst_co(&s, p->rd, p->rs, p->hs);
+                        break;
+
+                case IR_LOAD:
+                        p->hs = host_src(&s, p->rs);
+                        /* A deferred load parks its value in the state block
+                         * and writes no register here -- the IR_TEMP_GET
+                         * after the shadow instruction does that. Claiming a
+                         * destination would tell the allocator rd is live
+                         * from here, and the shadow instruction would then
+                         * read the new value instead of the old one. */
+                        p->hd = p->defer ? -1 : host_dst(&s, p->rd);
+                        /* A device access is a call, and `jsr` needs its
+                         * target somewhere that is not r0 or r1 -- both are
+                         * carrying the address and the callee. Memory needs
+                         * nothing: it is two instructions and no call. */
+                        if (p->io == FGL_IO_HW)
+                                scratch(&s, p, 1);
+                        break;
+
+                case IR_TEMP_GET:
+                        p->hd = host_dst(&s, p->rd);
+                        break;
+
+                case IR_SHIFT_IMM:
+                        p->ht = host_src(&s, p->rt);
+                        p->hd = host_dst(&s, p->rd);
+                        break;
+
+                case IR_MULDIV:
+                        p->hs = host_src(&s, p->rs);
+                        p->ht = host_src(&s, p->rt);
+                        /* A HALF NOTHING READS GETS NO REGISTER.
+                         *
+                         * Not an optimisation -- a correctness requirement
+                         * that comes with the emitter's right to skip a dead
+                         * half. `host_dst` claims a pinned register and the
+                         * block's writeback publishes whatever is in it at the
+                         * end; claim one for a result that is never computed
+                         * and the writeback stores garbage into LO or HI.
+                         * So the two decisions are made from the same flag,
+                         * here and in emit.c's `emit_muldiv`. */
+                        p->hd = (p->hint & FGL_H_NO_LO)
+                                        ? -1 : host_dst(&s, GUEST_LO);
+                        p->hx = (p->hint & FGL_H_NO_HI)
+                                        ? -1 : host_dst(&s, GUEST_HI);
+                        /* Division is a service call, and the pointer to it
+                         * has to be somewhere neither operand is. */
+                        if (p->sub == MD_DIV || p->sub == MD_DIVU)
+                                scratch(&s, p, 1);
+                        break;
+
+                case IR_STORE:
+                case IR_STORE_UN:
+                        p->hs = host_src(&s, p->rs);
+                        p->ht = host_src(&s, p->rt);
+                        /* The aligned address and the word read back from it
+                         * are both live across the merge. */
+                        if (p->op == IR_STORE_UN)
+                                scratch(&s, p, 2);
+                        else if (p->io == FGL_IO_HW)
+                                scratch(&s, p, 1);      /* the `jsr` target */
+                        else if (ir_store_invalidates(p))
+                                scratch(&s, p, 1);      /* the table offset */
+                        break;
+
+                case IR_LOAD_UN:
+                        p->hs = host_src(&s, p->rs);
+                        /* Read-modify-write normally; when deferred it only
+                         * READS rd -- the merge is parked and IR_TEMP_GET
+                         * writes the register afterwards. */
+                        p->hd = p->defer ? host_src(&s, p->rd)
+                                         : host_mod(&s, p->rd);
+                        scratch(&s, p, 1);
+                        break;
+
+                case IR_COND:
+                        p->hs = host_src(&s, p->rs);
+                        if (p->sub == CC_EQ || p->sub == CC_NE)
+                                p->ht = host_src(&s, p->rt);
+                        break;
+
+                case IR_CAPTURE:
+                case IR_MTC0:
+                case IR_MTC2:
+                case IR_LWC2:
+                case IR_SWC2:
+                        p->hs = host_src(&s, p->rs);
+                        break;
+
+                case IR_MFC2:
+                        /* Deferred, it claims no destination -- the same
+                         * shadow an ordinary load has. */
+                        p->hd = p->defer ? -1 : host_dst(&s, p->rd);
+                        break;
+
+                case IR_GTE:
+                        /* No guest operands at all -- the command reads and
+                         * writes the COP2 file in the state block. What it
+                         * does need is somewhere to put the shim's address,
+                         * because `jsr` cannot take it in r0 or r1 and both
+                         * of those are carrying the call's arguments.
+                         *
+                         * THE LEAF CONTRACT (gte_rtp.S): a leaf may clobber
+                         * r0-r6 and must keep r7-r14; r3 it rebuilds from GBR.
+                         * So the three rotating registers are evicted here --
+                         * stored if dirty, reloaded on their next use -- which
+                         * is what lets every leaf drop eight pushes and pops.
+                         * `used` is set so no preload is hoisted into them
+                         * across the call. */
+                        {
+                                static int dbg = -1;
+                                int h;
+
+                                if (dbg < 0)
+                                        dbg = getenv("FGL_GTE_DBG") != NULL;
+                                for (h = 0; h < ALLOC_N; h++)
+                                        if (ir_pin_cur[h] < 0) {
+                                                if (dbg && s.owner[h] >= 0)
+                                                        fprintf(stderr, "alloc: gte @%08x node %d evicts r%d=$%d dirty=%d last=%d wrote=%d\n",
+                                                                p->pc, i, ALLOC_FIRST + h, s.owner[h], s.dirty[h], s.last[h], s.wrote[h]);
+                                                evict(&s, h);
+                                                s.used[h] = 1;
+                                        }
+                        }
+                        scratch(&s, p, 1);
+                        break;
+
+                case IR_RW:
+                case IR_MFC2_C:
+                        /* C WRITES THE DESTINATION, AND THE HOIST RULE HAS
+                         * TO KNOW.  The node claims no operands, so nothing
+                         * below marks `defined` for the register the load
+                         * lands in -- and a later read of it then looks like
+                         * the first touch in the block, which `take` hoists
+                         * to block entry: a load of the value from BEFORE
+                         * the call.  Spyro 0x80052318: `lb a3,5(t8)` through
+                         * C, `bne a2,a3` compared the a3 the block started
+                         * with.  Same hole the comment in `take` describes,
+                         * one node type further along. `imm` is the guest
+                         * word; its rt is what C writes. */
+                        s.defined[(p->imm >> 16) & 31] = 1;
+                        /* fallthrough */
+                case IR_MTC_C:
+                case IR_RFE:
+                        /* C performs the whole access against the state
+                         * block, so every guest register the allocator is
+                         * holding has to be there before the call -- and
+                         * reloaded after it, because C writes the destination.
+                         * `flush` does both: it stores what is dirty and
+                         * resets the ownership map, so the next reader
+                         * reloads. The scratch is the `jsr` target, and after
+                         * a flush nothing is dirty so any register will do. */
+                        flush_c(&s);
+                        scratch(&s, p, 1);
+                        break;
+
+                case IR_STOP:
+                case IR_EXIT:
+                        /* It leaves the block through a service routine, so
+                         * everything the guest can see has to be in the state
+                         * block before it goes. IR_EXIT hands control back to
+                         * C, which will read guest registers out of the state
+                         * block and may run an entire BIOS call against them,
+                         * so the same rule applies for the same reason. */
+                        flush(&s);
+                        break;
+
+                default:                /* IR_JUMP, IR_RFE — no operands */
+                        break;
+                }
+        }
+
+        s.node = n;
+        flush(&s);
+
+        /* Charging by last use means the list comes out unordered — an
+         * eviction late in the block can name an early node.  The emitter
+         * walks it once alongside the nodes, so it is put back in order here,
+         * stably: two entries on the same node keep the order they were made
+         * in, which is what makes a writeback precede the reload that took
+         * its register. */
+        for (i = 1; i < out->n_fix; i++) {
+                ir_fixup f = out->fix[i];
+                int j = i;
+
+                while (j > 0 && out->fix[j - 1].at > f.at) {
+                        out->fix[j] = out->fix[j - 1];
+                        j--;
+                }
+                out->fix[j] = f;
+        }
+}

@@ -6,11 +6,16 @@
 #ifndef __LIGHTREC_PRIVATE_H__
 #define __LIGHTREC_PRIVATE_H__
 
+#if !defined(LIGHTREC_NO_LIGHTNING)
 #include "lightning-wrapper.h"
+#endif /* !LIGHTREC_NO_LIGHTNING */
+#include "lightrec-backend.h"
 #include "lightrec-config.h"
 #include "disassembler.h"
 #include "lightrec.h"
+#if !defined(LIGHTREC_NO_LIGHTNING)
 #include "regcache.h"
+#endif /* !LIGHTREC_NO_LIGHTNING */
 
 #if ENABLE_THREADED_COMPILER
 #include <stdatomic.h>
@@ -22,6 +27,13 @@
 
 #include <inttypes.h>
 #include <stdint.h>
+
+/* `__WORDSIZE` reached this file through lightning.h, which an fgl build does
+ * not include, and it is not standard C -- glibc has it, newlib does not.  The
+ * compiler always knows the answer. */
+#ifndef __WORDSIZE
+#define __WORDSIZE (__SIZEOF_POINTER__ * 8)
+#endif
 
 #define X32_FMT "0x%08"PRIx32
 #define PC_FMT "PC "X32_FMT
@@ -90,9 +102,24 @@
 
 #define CODE_LUT_SIZE	((RAM_SIZE + BIOS_SIZE) >> 2)
 
+/* Size of struct lightrec_state::backend, in 32-bit words.  Set on the
+ * compile line by whoever selects the backends; 42 is what fgl needs. */
+#ifndef LIGHTREC_BACKEND_WORDS
+#define LIGHTREC_BACKEND_WORDS 0
+#endif
+
+/* SH-4 operand cache: 16 KiB, direct mapped. */
+#define OCACHE_SIZE	0x4000
+
 #define REG_LO 32
 #define REG_HI 33
-#define REG_TEMP (offsetof(struct lightrec_state, temp_reg) / sizeof(u32))
+/* NOT AN OFFSET, A SIGNED INDEX OFF regs.gpr, like REG_PC in regcache.c: the
+ * register cache stores a dirty register at `regs.gpr + (id << 2)`, so an id
+ * derived from the raw offset only lands on its field while regs sits at the
+ * top of the struct. It does not any more. */
+#define REG_TEMP ((s16)(((s32)offsetof(struct lightrec_state, temp_reg)	\
+			 - (s32)offsetof(struct lightrec_state, regs.gpr)) \
+			/ (s32)sizeof(u32)))
 
 /* Definition of jit_state_t (avoids inclusion of <lightning.h>) */
 struct jit_node;
@@ -114,7 +141,8 @@ struct u16x2 {
 };
 
 struct block {
-	jit_state_t *_jit;
+	jit_state_t *_jit;		/* the Lightning backend's */
+	void *backend_priv;		/* any other backend's */
 	struct opcode *opcode_list;
 	void (*function)(void);
 	const u32 *code;
@@ -138,6 +166,11 @@ struct lightrec_branch {
 
 struct lightrec_branch_target {
 	struct jit_node *label;
+	/* Where the backend actually put this target.  The core writes it
+	 * into the code LUT and must not have to know how a backend names a
+	 * label; `label` above is Lightning's own and means nothing to
+	 * anyone else. */
+	void *host;
 	u32 offset;
 };
 
@@ -160,23 +193,72 @@ struct lightrec_cstate {
 	unsigned int nb_targets;
 	unsigned int cycles;
 
+#if !defined(LIGHTREC_NO_LIGHTNING)
 	struct regcache *reg_cache;
+#endif
 
 	_Bool no_load_delay;
 };
 
+/* THE ORDER OF THE FIRST FIELDS IS A CODE GENERATOR'S ABI, NOT A STYLE
+ * CHOICE.
+ *
+ * On SH-4 fgl points GBR at this struct and reaches every hot field with one
+ * `mov.l @(disp,GBR),r0` -- an 8-bit displacement scaled by four, so 1020
+ * bytes of reach and R0 only -- and those displacements are baked into the
+ * instruction word when the backend is compiled, not when this struct is.
+ * They are written down in fgl_state.h and asserted against this struct in
+ * fgl_lightrec.c, so a field moved without its displacement is a compile
+ * error naming the field rather than a game that hangs on hardware ten
+ * minutes later.
+ *
+ * `regs` is first because a guest register number IS its displacement,
+ * scaled: the writeback flush emits a store whose displacement is the raw
+ * register number and the instruction does the scaling.  The GTE leaves in
+ * gte_rtp.S go further and have CP2D's +264 written into the assembly.
+ *
+ * WHAT THIS COST, SAID OUT LOUD.  Lightning's SH-4 path used to keep
+ * curr_pc, next_pc, c_wrapper and the call spill area in the first sixty
+ * bytes, because Lightning holds the state pointer in a GPR and `@(disp,Rn)`
+ * has a four-bit field.  Measured on Spyro's boot that was worth 361,526 ->
+ * 341,676 bytes of emitted code.  There is no layout that gives both
+ * backends their window, and only one of them can be GBR-based, so the
+ * Lightning SH-4 build pays the difference back.  Every other Lightning
+ * target computes offsets at compile time and does not care.
+ */
 struct lightrec_state {
-	struct lightrec_registers regs;
-	u32 temp_reg;
-	u32 curr_pc;
-	u32 next_pc;
-	u8 in_delay_slot_n;
+	struct lightrec_registers regs;		/* +0   */
+	u32 temp_reg;				/* +520 */
+	u32 curr_pc;				/* +524 */
+	u32 next_pc;				/* +528 */
+
+	/* THE BACKEND'S OWN WORDS, OPAQUE HERE, AND AT A FIXED OFFSET.
+	 *
+	 * fgl keeps a cycle table, the dispatcher address, the LUT base, the
+	 * address mask and a few scratch words in GBR's window, and it cannot
+	 * reach them any other way.  They live here, in a block whose offset
+	 * does not move when a field is added below.  The core never reads it.
+	 *
+	 * Zero words when no backend wants any, in which case this is a
+	 * zero-length array and costs nothing. */
+	u32 backend[LIGHTREC_BACKEND_WORDS];	/* +532 */
+
 	u32 current_cycle;
 	u32 target_cycle;
 	u32 exit_flags;
+
+#if !defined(LIGHTREC_NO_LIGHTNING)
+	/* Lightning's, and only Lightning's: the C-call trampoline and the
+	 * spill area its register allocator saves temporaries into.  NUM_TEMPS
+	 * comes out of regcache.h, which is Lightning's register allocator. */
+	void *c_wrapper;
+	uintptr_t wrapper_cycle;
+	uintptr_t wrapper_regs[NUM_TEMPS];
+#endif
+
+	u8 in_delay_slot_n;
 	u32 old_cycle_counter;
 	u32 cycles_per_op;
-	void *c_wrapper;
 	struct block *dispatcher;
 	void *c_wrappers[C_WRAPPERS_COUNT];
 	struct blockcache *block_cache;
@@ -191,6 +273,7 @@ struct lightrec_state {
 	void (*get_next_block)(void);
 	void (*fast_eob)(void);
 	struct lightrec_ops ops;
+	const struct lightrec_backend *backend_ops;
 	unsigned int nb_precompile;
 	unsigned int nb_compile;
 	unsigned int nb_maps;
@@ -199,6 +282,8 @@ struct lightrec_state {
 	u32 opt_flags;
 	_Bool with_32bit_lut;
 	_Bool mirrors_mapped;
+	void *alloc_base;
+	size_t alloc_slack;
 	void *code_lut[];
 };
 
@@ -208,7 +293,38 @@ struct lightrec_state {
 u32 lightrec_rw(struct lightrec_state *state, union code op, u32 addr,
 		u32 data, u32 *flags, struct block *block, u16 offset);
 
+/* TRACE HOOKS, OFF UNLESS ASKED FOR.
+ *
+ * lightrec runs a block in its own interpreter once before compiling it, so a
+ * trace a backend takes only where emitted code is entered has holes in it --
+ * and the holes read as control-flow divergence when two runs are diffed,
+ * which is a false alarm that costs an hour.  These two let an out-of-tree
+ * instrument see the first pass too.  Undefined by default, in which case
+ * they compile to nothing. */
+#ifdef LIGHTREC_TRACE_HOOKS
+void lightrec_trace_block(struct lightrec_state *state, u32 pc,
+			  unsigned int nb_ops);
+void lightrec_trace_charge(u32 pc, u32 charge);
+#else
+#define lightrec_trace_block(state, pc, nb_ops)	do { } while (0)
+#define lightrec_trace_charge(pc, charge)	do { } while (0)
+#endif
+
 void lightrec_free_block(struct lightrec_state *state, struct block *block);
+
+/* The core services a backend needs to run a guest: the block lookup its
+ * dispatcher makes on every exit, the code arena a backend places its blocks
+ * in, and the three helpers a block can end in.  Static until there was a
+ * second backend to call them. */
+void * lightrec_get_next_block_func(struct lightrec_state *state, u32 pc);
+
+/* The cross-tree census; see the comment on their definitions in lightrec.c. */
+extern unsigned long lr_gnb_calls, lr_gnb_lut_hit, lr_interp_blocks,
+		     lr_blocks_compiled;
+void * lightrec_alloc_code(struct lightrec_state *state, size_t size);
+void lightrec_free_code(struct lightrec_state *state, void *ptr);
+u32 lightrec_memset(struct lightrec_state *state);
+u32 lightrec_check_load_delay(struct lightrec_state *state, u32 pc, u8 reg);
 
 void remove_from_code_lut(struct blockcache *cache, struct block *block);
 
@@ -390,7 +506,18 @@ get_delay_slot(const struct opcode *list, u16 i)
 
 static inline _Bool lightrec_store_next_pc(void)
 {
+#if defined(LIGHTREC_NO_LIGHTNING)
+	/* Under GNU Lightning this was a register-pressure question and the
+	 * answer varied by architecture.  A hand-written backend does not have
+	 * the choice and does not want it: fgl's block ends in an indirect
+	 * jump whose delay slot the store of next_pc fills, so publishing the
+	 * PC costs nothing and the dispatcher reads it from the state block.
+	 * Only Lightning's own files ask, so this is the answer for everyone
+	 * else. */
+	return 1;
+#else
 	return NUM_REGS + NUM_TEMPS <= 4;
+#endif
 }
 
 static inline _Bool lightrec_should_exit(u32 pc)

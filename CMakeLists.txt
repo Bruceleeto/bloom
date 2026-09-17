@@ -81,6 +81,16 @@ file(REAL_PATH ${LIGHTREC_DIR} LIGHTREC_REAL_DIR EXPAND_TILDE)
 set(PCSX_DIR deps/pcsx_rearmed CACHE STRING "PCSX directory")
 file(REAL_PATH ${PCSX_DIR} PCSX_REAL_DIR EXPAND_TILDE)
 
+# ONE BACKEND PER IMAGE.  fgl replaces GNU Lightning rather than joining it, so
+# an fgl build compiles neither Lightning nor lightrec's Lightning-specific
+# halves (deps/lightrec/CMakeLists.txt).  Declared here rather than left to
+# lightrec's own CMakeLists because the Lightning library below is built before
+# that subdirectory is added.
+option(WITH_FGL "Build the fgl SH-4 code generator instead of GNU Lightning" ON)
+
+
+if (NOT WITH_FGL)
+
 set(MAYBE_INCLUDE_STDINT_H "#include <stdint.h>")
 configure_file(${LIGHTNING_REAL_DIR}/include/lightning.h.in include/lightning.h @ONLY)
 
@@ -110,6 +120,8 @@ set(ENABLE_CODE_BUFFER ON CACHE INTERNAL "" FORCE)
 # Point Lightrec to Lightning's lib and include directories
 set(LIBLIGHTNING lightning)
 set(LIBLIGHTNING_INCLUDE_DIR $<TARGET_PROPERTY:lightning,INTERFACE_INCLUDE_DIRECTORIES>)
+
+endif (NOT WITH_FGL)
 
 # Include Lightrec's own CMake file
 add_subdirectory(${LIGHTREC_REAL_DIR} ${CMAKE_BINARY_DIR}/lightrec)
@@ -166,6 +178,9 @@ target_include_directories(libpcsxcore PUBLIC
 	${PCSX_REAL_DIR}
 )
 target_include_directories(libpcsxcore PRIVATE ${LIGHTREC_REAL_DIR})
+# plugin.c's profiler resolves emitted code back to guest blocks, which
+# needs lightrec-private.h and so the generated lightrec-config.h.
+target_include_directories(libpcsxcore PRIVATE ${CMAKE_BINARY_DIR}/lightrec)
 target_include_directories(libpcsxcore INTERFACE ${PCSX_REAL_DIR})
 target_compile_definitions(libpcsxcore PUBLIC
 	LIGHTREC
@@ -229,9 +244,20 @@ option(WITH_FSAA "Enable horizontal anti-aliasing" OFF)
 option(WITH_24BPP "Enable 24-bit framebuffer (no dithering)" OFF)
 option(WITH_BILINEAR "Enable bilinear texture filtering" OFF)
 option(WITH_480P "Enable high-resolution 480p mode" ON)
-option(WITH_HYBRID_RENDERING "Enable hybrid rendering" ON)
+option(WITH_HYBRID_RENDERING "Enable hybrid rendering" OFF)
 option(WITH_MAGENTA_BG "Enable magenta background to detect painting issues" OFF)
 option(WITH_CLIPPING "Enable pixel clipping" ON)
+
+# THE FPU BACK BANK BELONGS TO THE CODE GENERATOR, NOT TO THE RENDERER.
+#
+# fgl caches the GTE's rotation matrix in XMTRX and reloads it only when the
+# COP2 control generation moves, so the polygon matrix cannot simply be left
+# loaded from dc_vout_set_mode: pvr.c loads its own around each flush and puts
+# the guest's back.  Upstream's name is kept -- Lightning's OPT_SH4_USE_MATRIX
+# creates exactly the same situation -- so that patch merges unchanged.
+if (WITH_FGL)
+	set(OPT_SH4_USE_MATRIX ON)
+endif()
 
 if (WITH_HYBRID_RENDERING)
 	set(WITH_POLYBUF_SIZE_KB 128 CACHE STRING "Poly buffer size for hybrid rendering, in KiB")
@@ -284,7 +310,7 @@ target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 )
 
 option(WITH_CDROM_DMA "Read CD-ROM sectors using DMA" ON)
-set(WITH_CDROM_CACHE_SIZE 16 CACHE STRING "CD-ROM cache size in sectors")
+set(WITH_CDROM_CACHE_SIZE 0 CACHE STRING "CD-ROM cache size in sectors")
 
 option(WITH_SDCARD "Enable SD cards support" ON)
 if (WITH_SDCARD)
@@ -385,14 +411,18 @@ if (WITH_EMBEDDED_BIOS_PATH)
 	)
 endif()
 
+
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
-set(WITH_GAME_PATH "" CACHE PATH "If set, auto-boot the CD image at the given path")
-set(WITH_BOOT_SSTATE "" CACHE PATH "If set, load this savestate at boot")
+set(WITH_GAME_PATH "/ide/bloom/game.bin" CACHE PATH "If set, auto-boot the CD image at the given path")
+set(WITH_BOOT_SSTATE "/rd/bench.sav.gz" CACHE PATH "If set, load this savestate at boot")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
 set(WITH_MCD2_PATH "/dev/mcd1" CACHE PATH "Runtime path to the second memory card image")
 
 if (LOG_LEVEL STREQUAL "Debug")
+	# binutils is Lightning's disassembler, and an fgl build has no Lightning
+	# to disassemble.  fgl dumps its own code with FGL_DUMP_CODE instead.
+	if (NOT WITH_FGL)
 	find_library(OPCODES_LIBRARIES opcodes REQUIRED)
 	find_library(BFD_LIBRARIES bfd REQUIRED)
 	find_library(SFRAME_LIBRARIES sframe REQUIRED)
@@ -412,6 +442,7 @@ if (LOG_LEVEL STREQUAL "Debug")
 		${IBERTY_LIBRARIES}
 		zlib
 	)
+	endif (NOT WITH_FGL)
 
 	set(WITH_CACHED_STDIO ON)
 endif()
@@ -425,6 +456,7 @@ endif()
 # would generate a bigger file. We also need this file to be present at
 # configuration time, hence the execute_process() calls.
 file(COPY romdisk DESTINATION ${CMAKE_BINARY_DIR})
+
 file(WRITE ${CMAKE_BINARY_DIR}/dummy.c "")
 execute_process(
 	COMMAND $ENV{KOS_CC} ${CMAKE_BINARY_DIR}/dummy.c -c

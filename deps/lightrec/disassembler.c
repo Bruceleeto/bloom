@@ -9,7 +9,30 @@
 #include <string.h>
 
 #include "lightrec-private.h"
-#include "regcache.h"
+
+/* THE ONE THING THE REGISTER CACHE LEFT BEHIND.
+ *
+ * `lightrec_reg_name` lived in regcache.c, which is GNU Lightning's register
+ * allocator and is not built by every backend -- it is a table of guest
+ * register names and had nothing to do with register allocation beyond being
+ * next to it.  It is here now, because this file is its main caller. */
+static const char * const mips_regs[] = {
+	"zero",
+	"at",
+	"v0", "v1",
+	"a0", "a1", "a2", "a3",
+	"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+	"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+	"t8", "t9",
+	"k0", "k1",
+	"gp", "sp", "fp", "ra",
+	"lo", "hi",
+};
+
+const char * lightrec_reg_name(u8 reg)
+{
+	return mips_regs[reg];
+}
 
 static const char * const std_opcodes[] = {
 	[OP_J]			= "j       ",

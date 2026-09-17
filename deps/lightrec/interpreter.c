@@ -7,7 +7,7 @@
 #include "interpreter.h"
 #include "lightrec-private.h"
 #include "optimizer.h"
-#include "regcache.h"
+#include "lightrec-private.h"
 
 #include <stdbool.h>
 
@@ -613,6 +613,27 @@ static u32 int_io(struct interpreter *inter, bool is_load)
 	if (!inter->load_delay && inter->block)
 		flags = &inter->op->flags;
 
+	/* THE CLOCK GOES FIRST.
+	 *
+	 * lightrec interprets every block once before compiling it, so this
+	 * path executes real guest code and answers real device reads.  The
+	 * cycles this block has spent are still in the accumulator and do not
+	 * reach `current_cycle` until the block ends -- so a timer read taken
+	 * here is answered as though no time had passed since the block
+	 * started.  pcsx's interpreter charges each instruction as it retires
+	 * and gets a different number out of the same hardware.
+	 *
+	 * The load's own cycle is part of that -- pcsx charges an instruction
+	 * before it executes -- and it is paid here rather than twice:
+	 * negating the accumulator cancels the add this opcode still owes,
+	 * which is the same trick `update_cycles_before_branch` uses. */
+	{
+		u32 own = lightrec_cycles_of_opcode(inter->state, inter->op->c);
+
+		inter->state->current_cycle += inter->cycles + own;
+		inter->cycles = -own;
+	}
+
 	val = lightrec_rw(inter->state, inter->op->c,
 			  reg_cache[op->rs], reg_cache[op->rt],
 			  flags, inter->block, inter->offset);
@@ -1211,6 +1232,10 @@ static u32 lightrec_emulate_block_list(struct lightrec_state *state,
 	/* Add the cycles of the last branch */
 	inter.cycles += lightrec_cycles_of_opcode(inter.state, inter.op->c);
 
+	/* ENTRY pc: lightrec_int_op returns the exit pc, which would file
+	 * every block under the name of the next one. */
+	lightrec_trace_charge(block->pc + (offset << 2), inter.cycles);
+
 	state->current_cycle += inter.cycles;
 
 	if (lightrec_should_exit(pc)) {
@@ -1223,7 +1248,11 @@ static u32 lightrec_emulate_block_list(struct lightrec_state *state,
 
 u32 lightrec_emulate_block(struct lightrec_state *state, struct block *block, u32 pc)
 {
-	u32 offset = (kunseg(pc) - kunseg(block->pc)) >> 2;
+	u32 offset;
+
+	lightrec_trace_block(state, pc, block->nb_ops);
+
+	offset = (kunseg(pc) - kunseg(block->pc)) >> 2;
 
 	if (offset < block->nb_ops)
 		return lightrec_emulate_block_list(state, block, offset);
@@ -1300,6 +1329,8 @@ u32 lightrec_handle_load_delay(struct lightrec_state *state,
 		if (!opcode_writes_register(c, reg))
 			state->regs.gpr[reg] = state->temp_reg;
 	}
+
+	lightrec_trace_charge(pc, inter.cycles);
 
 	state->current_cycle += inter.cycles;
 

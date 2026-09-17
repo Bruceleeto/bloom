@@ -1,0 +1,3782 @@
+/* RTPS / RTPT in SH-4 assembly: the arithmetic of gte_fpu.c in the same
+ * order and precision (one ftrv, one fdiv, fmac projections, ftrc), so
+ * results are bit-identical to the C (gte_rtp_selftest).
+ *
+ * r4 = the COP2 file (psxCP2Regs *), r5 = &gte_hot.  The caller has XMTRX =
+ * rotation matrix / 4096 with TR in the fourth column, ofx/ofy current.
+ *
+ *   r2  file + 32   IR0..IR3 @0/4/8/12, SXY0..2 @16/20/24, SZ0..3 @32..44
+ *   r3  file + 232  H @0, DQA @4, DQB @8, FLAG @20
+ *   r4  file        VX/VY/VZ for vertex n at 8n/8n+2/8n+4
+ *   r6  file + 64   SZ0..3 @0/4/8/12 (halfwords), MAC0 @32, MAC1..3 @36/40/44
+ *   r5  gte_hot     flag @0, ofx @4, ofy @8
+ *   r7  the flag word being accumulated
+ *   r1  IR1   r8  IR2   r9  MAC3, then SZ, then SX   r10  quotient
+ *   fr5  -32768.0   fr6 ofx   fr7 ofy   fr8 65536.0   fr9 1/65536
+ *   fr10 0.5        fr11 32768.0        fv0 the vertex, then scratch
+ *
+ * In-range falls through; each bound branches to a stub that ORs its flag
+ * and substitutes the bound.  Constant pools follow each vertex's stubs:
+ * `mov.w @(disp,PC)` reaches 510 bytes. */
+
+	.text
+	.little
+
+/* One vertex.  voff: offset from r4; szoff: SZ slot from r6; sxyoff: SXY
+ * slot from r2.  SZ is a halfword store.  Leaves the quotient in r10. */
+.macro RTP_VERTEX voff, szoff, sxyoff
+	/* V -> fv0, w = 1 */
+	mov.w	@(\voff, r4), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	mov.w	@(\voff + 2, r4), r0
+	lds	r0, fpul
+	float	fpul, fr1
+	mov.w	@(\voff + 4, r4), r0
+	lds	r0, fpul
+	float	fpul, fr2
+	fldi1	fr3
+	ftrv	xmtrx, fv0
+
+	/* MAC1, IR1 = limB1(MAC1) -> r1 */
+	ftrc	fr0, fpul
+	sts	fpul, r1
+	mov.l	r1, @(36, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	11f
+12:	mov.w	r0, @(4, r2)
+
+	/* MAC2, IR2 = limB2(MAC2) -> r8 */
+	ftrc	fr1, fpul
+	sts	fpul, r8
+	mov.l	r8, @(40, r6)
+	exts.w	r8, r0
+	cmp/eq	r0, r8
+	bf	21f
+22:	mov.w	r0, @(8, r2)
+
+	/* MAC3 -> r9 (unclamped, limD wants it), IR3 = limB3(MAC3) */
+	ftrc	fr2, fpul
+	sts	fpul, r9
+	mov.l	r9, @(44, r6)
+	exts.w	r9, r0
+	cmp/eq	r0, r9
+	bf	31f
+32:	mov.w	r0, @(12, r2)
+
+	/* SZ = limD(MAC3) -> r9.  Unsigned compare catches negatives too. */
+	mov.l	81f, r0
+	cmp/hi	r0, r9
+	bt	41f
+42:	mov	r9, r0
+	mov.w	r0, @(\szoff, r6)
+
+	/* POC: q = H / SZ in float -> fr4 (bleem's shape, no integer quotient,
+	 * no rounding), limE flagged when H >= 2 SZ */
+	mov.w	@(0, r3), r0
+	extu.w	r0, r0
+	mov	r9, r10
+	shll	r10
+	cmp/hs	r10, r0
+	bt	52f
+	lds	r0, fpul
+	float	fpul, fr4
+	lds	r9, fpul
+	float	fpul, fr1
+	fdiv	fr1, fr4
+53:
+	/* SX = limG1(ofx + IR1 * q) -> r9, no project saturation */
+	lds	r1, fpul
+	float	fpul, fr1
+	fmov	fr6, fr2
+	fmov	fr4, fr0
+	fmac	fr0, fr1, fr2
+	ftrc	fr2, fpul
+	sts	fpul, r0
+63:	mov.w	85f, r1
+	cmp/gt	r1, r0
+	bt	64f
+	mov.w	86f, r1
+	cmp/ge	r1, r0
+	bf	64f
+66:	extu.w	r0, r9
+
+	/* SY = limG2(ofy + IR2 * q), packed with SX */
+	lds	r8, fpul
+	float	fpul, fr1
+	fmov	fr7, fr2
+	fmov	fr4, fr0
+	fmac	fr0, fr1, fr2
+	ftrc	fr2, fpul
+	sts	fpul, r0
+73:	mov.w	85f, r1
+	cmp/gt	r1, r0
+	bt	74f
+	mov.w	86f, r1
+	cmp/ge	r1, r0
+	bf	74f
+76:	shll16	r0
+	or	r9, r0
+	bra	99f
+	 mov.l	r0, @(\sxyoff, r2)
+
+	/* --- the stubs --- */
+
+	/* IR1 out of range: flag, bound into r0 and r1 */
+11:	mov.l	91f, r0
+	or	r0, r7
+	cmp/pz	r1
+	bt	13f
+	mov.w	84f, r0
+	bra	12b
+	 mov	r0, r1
+13:	mov.w	83f, r0
+	bra	12b
+	 mov	r0, r1
+
+	/* IR2 */
+21:	mov.l	92f, r0
+	or	r0, r7
+	cmp/pz	r8
+	bt	23f
+	mov.w	84f, r0
+	bra	22b
+	 mov	r0, r8
+23:	mov.w	83f, r0
+	bra	22b
+	 mov	r0, r8
+
+	/* IR3: only the stored value, r9 keeps MAC3 */
+31:	mov.l	93f, r0
+	or	r0, r7
+	cmp/pz	r9
+	bt	33f
+	mov.w	84f, r0
+	bra	32b
+	 nop
+33:	mov.w	83f, r0
+	bra	32b
+	 nop
+
+	/* limD */
+41:	mov.l	94f, r0
+	or	r0, r7
+	cmp/pz	r9
+	bt	43f
+	bra	42b
+	 mov	#0, r9
+43:	mov.l	81f, r9
+	bra	42b
+	 nop
+
+	/* limE, also the H >= 2 SZ path: q = 0x1ffff / 65536 */
+52:	mov.l	95f, r10
+	or	r10, r7
+	mov.l	82f, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	bra	53b
+	 fmul	fr9, fr4
+
+	/* limG1: r1 holds the bound that failed */
+64:	mov.l	98f, r0
+	or	r0, r7
+	bra	66b
+	 mov	r1, r0
+
+	/* SY */
+74:	mov.l	100f, r0
+	or	r0, r7
+	bra	76b
+	 mov	r1, r0
+
+	.align	2
+81:	.long	0xffff
+82:	.long	0x1ffff
+83:	.word	0x7fff
+84:	.word	0x8000		/* sign-extends to -32768 */
+85:	.word	0x3ff
+86:	.word	0xfc00		/* -1024 */
+	.align	2
+91:	.long	0x81000000	/* limB1: master | bit 24 */
+92:	.long	0x80800000	/* limB2: master | bit 23 */
+93:	.long	0x00400000	/* limB3: bit 22, no master */
+94:	.long	0x80040000	/* limD */
+95:	.long	0x80020000	/* limE */
+96:	.long	0x80010000	/* project: >= 2^15 */
+97:	.long	0x80008000	/* project: < -2^15 */
+98:	.long	0x80004000	/* limG1 */
+100:	.long	0x80002000	/* limG2 */
+99:
+.endm
+
+/* Prologue: save r8-r10, set up the bases and the float constants. */
+.macro RTP_ENTER
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov.w	2f, r3
+	add	r4, r3
+	mov	#0, r7
+	mova	3f, r0
+	fmov.s	@r0+, fr8
+	fmov.s	@r0+, fr9
+	fmov.s	@r0+, fr10
+	fmov.s	@r0+, fr11
+	mov	r5, r1
+	add	#4, r1
+	fmov.s	@r1+, fr6
+	fmov.s	@r1, fr7
+	fmov	fr11, fr5
+	bra	1f
+	 fneg	fr5
+2:	.word	232
+	.align	2
+3:	.long	0x47800000	/* 65536.0 */
+	.long	0x37800000	/* 1/65536 */
+	.long	0x3f000000	/* 0.5 */
+	.long	0x47000000	/* 32768.0 */
+1:
+.endm
+
+/* The depth cue from the last quotient (r10), the flag word out, return. */
+.macro RTP_LEAVE
+	/* POC: MAC0 = ftrc(DQB + DQA * 65536 * q) in float */
+	mov.w	@(4, r3), r0		/* DQA */
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr8, fr0
+	fmul	fr4, fr0
+	mov.l	@(8, r3), r0		/* DQB */
+	lds	r0, fpul
+	float	fpul, fr1
+	fadd	fr1, fr0
+	ftrc	fr0, fpul
+	sts	fpul, r9
+	mov.l	r9, @(32, r6)		/* MAC0 */
+	mov	#-12, r0
+	shad	r0, r9
+	mov.w	4f, r0
+	cmp/gt	r0, r9
+	bt	1f
+	cmp/pz	r9
+	bf	2f
+	mov	r9, r0
+3:	mov.w	r0, @(0, r2)		/* IR0 */
+	mov.l	r7, @(20, r3)		/* FLAG */
+	mov.l	r7, @r5			/* gte_hot.flag */
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	rts
+	 mov.l	@r15+, r8
+1:	mov.w	4f, r1
+	or	r1, r7
+	bra	3b
+	 nop
+2:	mov.w	4f, r1
+	or	r1, r7
+	bra	3b
+	 mov	#0, r0
+4:	.word	0x1000			/* limH bound, and its flag bit */
+.endm
+
+	.balign	4
+	.global	_gte_rtpt_asm
+	.type	_gte_rtpt_asm, @function
+_gte_rtpt_asm:
+	RTP_ENTER
+	/* SZ0 takes the old SZ3 before anything is written */
+	mov.w	@(12, r6), r0
+	mov.w	r0, @(0, r6)
+	RTP_VERTEX 0, 4, 16
+	RTP_VERTEX 8, 8, 20
+	RTP_VERTEX 16, 12, 24
+	RTP_LEAVE
+	.size	_gte_rtpt_asm, . - _gte_rtpt_asm
+
+	.balign	4
+	.global	_gte_rtps_asm
+	.type	_gte_rtps_asm, @function
+_gte_rtps_asm:
+	RTP_ENTER
+	/* Both stacks shift before the new vertex lands */
+	mov.w	@(4, r6), r0
+	mov.w	r0, @(0, r6)
+	mov.w	@(8, r6), r0
+	mov.w	r0, @(4, r6)
+	mov.w	@(12, r6), r0
+	mov.w	r0, @(8, r6)
+	mov.l	@(20, r2), r0
+	mov.l	r0, @(16, r2)
+	mov.l	@(24, r2), r0
+	mov.l	r0, @(20, r2)
+	RTP_VERTEX 0, 12, 24
+	RTP_LEAVE
+	.size	_gte_rtps_asm, . - _gte_rtps_asm
+
+/* MVMVA, the fast shape: sf=1, a real matrix, lm=0.
+ *   r4  the COP2 file      r5  the vector (three s16)      r6  their stride
+ *   r7  &gte_hot
+ * XMTRX holds the matrix and translation.  A1..A3 (MAC out of 32-bit range)
+ * is ftrc having saturated, never a valid IR, so the tests are in the
+ * clamp stubs. */
+	.balign	4
+	.global	_gte_mvmva_asm
+	.type	_gte_mvmva_asm, @function
+_gte_mvmva_asm:
+	mov.w	@r5, r0
+	lds	r0, fpul
+	add	r6, r5
+	float	fpul, fr0
+	mov.w	@r5, r0
+	lds	r0, fpul
+	add	r6, r5
+	float	fpul, fr1
+	mov.w	@r5, r0
+	lds	r0, fpul
+	mov	r4, r6
+	float	fpul, fr2
+	add	#64, r6			/* MAC1..3 @36/40/44 */
+	fldi1	fr3
+	mov	r4, r2
+	ftrv	xmtrx, fv0
+	add	#32, r2			/* IR1..3 @4/8/12 */
+	mov	#0, r3
+
+	/* MAC1 / IR1 */
+	ftrc	fr0, fpul
+	sts	fpul, r1
+	mov.l	r1, @(36, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	11f
+12:	mov.w	r0, @(4, r2)
+
+	/* MAC2 / IR2 */
+	ftrc	fr1, fpul
+	sts	fpul, r1
+	mov.l	r1, @(40, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	21f
+22:	mov.w	r0, @(8, r2)
+
+	/* MAC3 / IR3 */
+	ftrc	fr2, fpul
+	sts	fpul, r1
+	mov.l	r1, @(44, r6)
+	exts.w	r1, r0
+	cmp/eq	r0, r1
+	bf	31f
+32:	mov.w	r0, @(12, r2)
+
+	mov.l	r3, @r7			/* gte_hot.flag */
+	mov.w	80f, r0
+	rts
+	 mov.l	r3, @(r0, r4)		/* FLAG */
+
+	/* Out of range.  r1 = MAC: raise the saturation flag if ftrc
+	 * saturated, then the clamp's, and substitute the bound. */
+11:	mov.l	91f, r0
+	or	r0, r3
+	cmp/pz	r1
+	bt	13f
+	mov.l	81f, r0
+	cmp/eq	r0, r1
+	bf	14f
+	mov.l	94f, r0
+	or	r0, r3
+14:	mov.w	84f, r0
+	bra	12b
+	 nop
+13:	mov.l	82f, r0
+	cmp/eq	r0, r1
+	bf	15f
+	mov.l	97f, r0
+	or	r0, r3
+15:	mov.w	83f, r0
+	bra	12b
+	 nop
+
+21:	mov.l	92f, r0
+	or	r0, r3
+	cmp/pz	r1
+	bt	23f
+	mov.l	81f, r0
+	cmp/eq	r0, r1
+	bf	24f
+	mov.l	95f, r0
+	or	r0, r3
+24:	mov.w	84f, r0
+	bra	22b
+	 nop
+23:	mov.l	82f, r0
+	cmp/eq	r0, r1
+	bf	25f
+	mov.l	98f, r0
+	or	r0, r3
+25:	mov.w	83f, r0
+	bra	22b
+	 nop
+
+31:	mov.l	93f, r0
+	or	r0, r3
+	cmp/pz	r1
+	bt	33f
+	mov.l	81f, r0
+	cmp/eq	r0, r1
+	bf	34f
+	mov.l	96f, r0
+	or	r0, r3
+34:	mov.w	84f, r0
+	bra	32b
+	 nop
+33:	mov.l	82f, r0
+	cmp/eq	r0, r1
+	bf	35f
+	mov.l	99f, r0
+	or	r0, r3
+35:	mov.w	83f, r0
+	bra	32b
+	 nop
+
+80:	.word	252			/* FLAG's offset in the file */
+83:	.word	0x7fff
+84:	.word	0x8000
+	.align	2
+81:	.long	0x80000000		/* ftrc saturated low */
+82:	.long	0x7fffffff		/* ftrc saturated high */
+91:	.long	0x81000000		/* limB1 */
+92:	.long	0x80800000		/* limB2 */
+93:	.long	0x00400000		/* limB3, no master bit */
+94:	.long	0x88000000		/* A1 negative: master | bit 27 */
+95:	.long	0x84000000		/* A2 negative: master | bit 26 */
+96:	.long	0x82000000		/* A3 negative: master | bit 25 */
+97:	.long	0x40000000		/* A1 positive: bit 30 */
+98:	.long	0x20000000		/* A2 positive: bit 29 */
+99:	.long	0x10000000		/* A3 positive: bit 28 */
+	.size	_gte_mvmva_asm, . - _gte_mvmva_asm
+
+/* The 3x3 of a control-file matrix as XMTRX columns 0-2, scaled by 1/4096.
+ *   r4  the five packed words (R11R12, R13R21, R22R23, R31R32, R33)
+ *   r5  twelve floats out, column-major: m[i + 4j] = R(j+1)(i+1) */
+	.balign	4
+	.global	_gte_rot_convert
+	.type	_gte_rot_convert, @function
+_gte_rot_convert:
+	fmov.s	fr12, @-r15
+	mova	1f, r0
+	fmov.s	@r0, fr12		/* 1/4096 */
+
+	mov.l	@(0, r4), r1		/* R11 | R12 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr0		/* m[0] = R11 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr4		/* m[4] = R12 */
+
+	mov.l	@(4, r4), r1		/* R13 | R21 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr8		/* m[8] = R13 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr1		/* m[1] = R21 */
+
+	mov.l	@(8, r4), r1		/* R22 | R23 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr5		/* m[5] = R22 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr9		/* m[9] = R23 */
+
+	mov.l	@(12, r4), r1		/* R31 | R32 << 16 */
+	exts.w	r1, r0
+	lds	r0, fpul
+	float	fpul, fr2		/* m[2] = R31 */
+	swap.w	r1, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr6		/* m[6] = R32 */
+
+	mov.w	@(16, r4), r0		/* R33 */
+	lds	r0, fpul
+	float	fpul, fr10		/* m[10] = R33 */
+
+	fmul	fr12, fr0
+	fmul	fr12, fr1
+	fmul	fr12, fr2
+	fldi0	fr3
+	fmul	fr12, fr4
+	fmul	fr12, fr5
+	fmul	fr12, fr6
+	fldi0	fr7
+	fmul	fr12, fr8
+	fmul	fr12, fr9
+	fmul	fr12, fr10
+	fldi0	fr11
+
+	fschg
+	fmov.d	dr0, @r5
+	add	#8, r5
+	fmov.d	dr2, @r5
+	add	#8, r5
+	fmov.d	dr4, @r5
+	add	#8, r5
+	fmov.d	dr6, @r5
+	add	#8, r5
+	fmov.d	dr8, @r5
+	add	#8, r5
+	fmov.d	dr10, @r5
+	fschg
+	rts
+	 fmov.s	@r15+, fr12
+
+	.align	2
+1:	.long	0x39800000
+	.size	_gte_rot_convert, . - _gte_rot_convert
+
+/* ------------------------------------------------------------------ */
+/* Entry points the generated code calls directly                      */
+/* ------------------------------------------------------------------ */
+
+/* Entry points that do the two-compare hot check themselves (gte_mtx_use's
+ * contract) and fall into the body, calling C only on a miss.
+ *   gte_hot:  flag @0, ofx @4, ofy @8, ofs_gen @12, xmtrx_key @16
+ *   gte_col:  32 bytes per (matrix, column) entry, gen @16 */
+
+/* RTPS/RTPT: matrix 0, column 0 (key 0), and the offsets must be current.
+ * Leaves r4 = file, r5 = &gte_hot for RTP_ENTER. */
+.macro RTP_CHECK
+	mov.l	10f, r1
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	11f, r0
+	mov.l	@(16, r0), r2		/* gte_col[0][0].gen */
+	cmp/eq	r1, r2
+	bf	8f
+	mov.l	12f, r5
+	mov.l	@(16, r5), r2		/* xmtrx_key */
+	tst	r2, r2
+	bf	8f
+	mov.l	@(12, r5), r2		/* ofs_gen */
+	cmp/eq	r1, r2
+	bt	9f
+8:	sts.l	pr, @-r15
+	mov.l	r4, @-r15
+	mov.l	13f, r1
+	jsr	@r1			/* gte_rtp_slow(file) */
+	 nop
+	mov.l	@r15+, r4
+	lds.l	@r15+, pr
+	mov.l	12f, r5
+	bra	9f
+	 nop
+	.align	2
+10:	.long	_psxCP2Gen		/* [0] is psxCP2CtrlGen */
+11:	.long	_gte_col
+12:	.long	_gte_hot
+13:	.long	_gte_rtp_slow
+9:
+.endm
+
+	.balign	4
+	.global	_gte_rtps_fast
+	.type	_gte_rtps_fast, @function
+_gte_rtps_fast:
+	RTP_CHECK
+	mov.l	1f, r0
+	jmp	@r0
+	 nop
+	.align	2
+1:	.long	_gte_rtps_asm
+	.size	_gte_rtps_fast, . - _gte_rtps_fast
+
+	.balign	4
+	.global	_gte_rtpt_fast
+	.type	_gte_rtpt_fast, @function
+_gte_rtpt_fast:
+	RTP_CHECK
+	mov.l	1f, r0
+	jmp	@r0
+	 nop
+	.align	2
+1:	.long	_gte_rtpt_asm
+	.size	_gte_rtpt_fast, . - _gte_rtpt_fast
+
+/* MVMVA: r4 = file, r5 = the op word.  sf=1, a real matrix and lm=0 go to
+ * the body above (r5 = vector, r6 = stride, r7 = &gte_hot); else C. */
+	.balign	4
+	.global	_gte_mvmva_fast
+	.type	_gte_mvmva_fast, @function
+_gte_mvmva_fast:
+	mov.l	20f, r0			/* sf */
+	tst	r0, r5
+	bt	8f
+	mov.w	21f, r0			/* lm */
+	tst	r0, r5
+	bf	8f
+	mov	r5, r0
+	shlr16	r0
+	shlr	r0
+	and	#3, r0			/* mx */
+	cmp/eq	#3, r0
+	bt	8f
+	mov	r0, r6
+	mov	r5, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0			/* cv */
+	mov	r0, r7
+	mov	r6, r1
+	shll2	r1
+	add	r0, r1			/* key */
+	mov.l	10f, r2
+	mov.l	@r2, r2			/* gen */
+	mov	r1, r0
+	shll2	r0
+	shll2	r0
+	shll	r0
+	mov.l	11f, r3
+	add	r3, r0
+	mov.l	@(16, r0), r3		/* gte_col[mx][cv].gen */
+	cmp/eq	r2, r3
+	bf	7f
+	mov.l	12f, r3
+	mov.l	@(16, r3), r2		/* xmtrx_key */
+	cmp/eq	r1, r2
+	bf	7f
+6:	mov	r5, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0			/* v */
+	cmp/eq	#3, r0
+	bt	5f
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	mov	r0, r5			/* V0..2: three halfwords in a row */
+	mov	#2, r6
+	mov.l	12f, r7
+	mov.l	13f, r0
+	jmp	@r0
+	 nop
+5:	mov	r4, r5
+	add	#36, r5			/* IR1..3: every four bytes */
+	mov	#4, r6
+	mov.l	12f, r7
+	mov.l	13f, r0
+	jmp	@r0
+	 nop
+7:	sts.l	pr, @-r15
+	mov.l	r5, @-r15
+	mov.l	r4, @-r15
+	mov	r6, r5
+	mov	r7, r6
+	mov	r1, r7
+	mov.l	14f, r1
+	jsr	@r1			/* gte_mtx_use_slow(file, mx, cv, key) */
+	 nop
+	mov.l	@r15+, r4
+	mov.l	@r15+, r5
+	lds.l	@r15+, pr
+	bra	6b
+	 nop
+8:	mov.l	15f, r1
+	jmp	@r1			/* gte_mvmva_slow(file, op) */
+	 nop
+	.align	2
+10:	.long	_psxCP2Gen		/* [0] is psxCP2CtrlGen */
+11:	.long	_gte_col
+12:	.long	_gte_hot
+13:	.long	_gte_mvmva_asm
+14:	.long	_gte_mtx_use_slow
+15:	.long	_gte_mvmva_slow
+20:	.long	0x80000
+21:	.word	0x400
+	.size	_gte_mvmva_fast, . - _gte_mvmva_fast
+
+/* ------------------------------------------------------------------ */
+/* DPCS / INTPL - the depth cue, which Spyro runs on every vertex       */
+/* ------------------------------------------------------------------ */
+
+/* DPCS / INTPL.  `subv` reports the 32-bit overflow and a shift that left
+ * 32 bits does not shift back; only the flags need the checks, so they
+ * live in the stubs.
+ *   r2  file + 32   IR0 @0, IR1..3 @4/8/12
+ *   r6  file + 64   RGB0..2 @16/20/24, MAC1..3 @36/40/44
+ *   r9  file + 212  RFC/GFC/BFC @0/4/8
+ *   r3  flags   r7  IR0   r12  the colour word being built
+ *   r5  DPCS: the extra shift (12 when sf=0, else 0), r14 = -r5
+ *       INTPL: the final shift (-12 when sf=1, else 0), r13 = lm's low bound
+ *   r8  DPCS: the RGB word */
+
+/* limC(mac >> 4) into byte \n of r12; r10 = mac */
+.macro RGB_BYTE n, fC
+	mov	r10, r0
+	mov	#-4, r11
+	shad	r11, r0
+	mov.w	80f, r11
+	cmp/hi	r11, r0
+	bt	49f
+50:
+.if \n == 0
+	mov	r0, r12
+.elseif \n == 1
+	shll8	r0
+	or	r0, r12
+.else
+	shll16	r0
+	or	r0, r12
+.endif
+	bra	99f
+	 nop
+49:	mov.l	\fC, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	54f
+	bra	50b
+	 mov	#0, r0
+54:	mov.w	80f, r0
+	bra	50b
+	 nop
+.endm
+
+/* One DPCS component: X = colour byte \n */
+.macro DPCS_COMP n, fcoff, macoff, iroff, fAneg, fApos, fB, fC
+	mov	r8, r1
+.if \n == 1
+	shlr8	r1
+.elseif \n == 2
+	shlr16	r1
+.endif
+	extu.b	r1, r1			/* X */
+	mov	r1, r10
+	shll2	r10
+	shll2	r10			/* X << 4 */
+	mov.l	@(\fcoff, r9), r0
+	subv	r10, r0			/* t = FC - (X << 4), T on overflow */
+	bt	41f
+42:	mov	r0, r10
+	shld	r5, r0			/* t << (12 - shift) */
+	mov	r0, r11
+	shad	r14, r11
+	cmp/eq	r10, r11		/* did it survive the shift? */
+	bf	43f
+44:	exts.w	r0, r11
+	cmp/eq	r0, r11
+	bf	45f			/* limB */
+46:	mul.l	r11, r7			/* IR0 * lim */
+	mov	r1, r0
+	shll16	r0			/* X << 16 */
+	sts	macl, r11
+	add	r11, r0
+	mov	#-12, r11
+	shad	r11, r0			/* MAC */
+	mov.l	r0, @(\macoff, r6)
+	mov	r0, r10
+	exts.w	r0, r11
+	cmp/eq	r0, r11
+	bf	47f			/* IR = limB(MAC) */
+48:	mov.w	r0, @(\iroff, r2)
+	RGB_BYTE \n, \fC
+
+	/* the subtraction overflowed: X<<4 >= 0, so it went negative */
+41:	mov.l	\fAneg, r11
+	or	r11, r3
+	bra	42b
+	 nop
+	/* the shift overflowed: the sign of t says which way */
+43:	cmp/pz	r10
+	bt	51f
+	mov.l	\fAneg, r11
+	or	r11, r3
+	bra	44b
+	 nop
+51:	mov.l	\fApos, r11
+	or	r11, r3
+	bra	44b
+	 nop
+	/* limB on the shifted t: bound into r11 */
+45:	mov.l	\fB, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	52f
+	mov.w	82f, r11
+	bra	46b
+	 nop
+52:	mov.w	81f, r11
+	bra	46b
+	 nop
+	/* limB on MAC for IR: bound into r0 */
+47:	mov.l	\fB, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	53f
+	mov.w	82f, r0
+	bra	48b
+	 nop
+53:	mov.w	81f, r0
+	bra	48b
+	 nop
+80:	.word	255
+81:	.word	0x7fff
+82:	.word	0x8000
+	.align	2
+99:
+.endm
+
+/* One INTPL component: X = IR\n+1 */
+.macro INTPL_COMP n, fcoff, macoff, iroff, fAneg, fApos, fB, fC
+	mov.w	@(\iroff, r2), r0
+	mov	r0, r1			/* X = IRn */
+	mov.l	@(\fcoff, r9), r0
+	subv	r1, r0			/* t = FC - IRn */
+	bt	41f
+42:	exts.w	r0, r11
+	cmp/eq	r0, r11
+	bf	45f			/* limB */
+46:	mul.l	r11, r7			/* IR0 * lim */
+	mov	r1, r0
+	mov	#12, r11
+	shld	r11, r0			/* IRn << 12 */
+	sts	macl, r11
+	add	r11, r0
+	shad	r5, r0			/* >> 12 when sf */
+	mov.l	r0, @(\macoff, r6)
+	mov	r0, r10
+	mov.w	81f, r11
+	cmp/gt	r11, r0
+	bt	47f
+	cmp/ge	r13, r0
+	bf	55f			/* IR = lim(MAC), lm's low bound */
+48:	mov.w	r0, @(\iroff, r2)
+	RGB_BYTE \n, \fC
+
+	/* FC - IRn overflowed: IRn > 0 means it went negative, and IRn < 0
+	 * would need FC near INT_MAX, which the positive check covers */
+41:	cmp/pz	r1
+	bf	56f
+	mov.l	\fAneg, r11
+	or	r11, r3
+	bra	42b
+	 nop
+56:	mov.l	\fApos, r11
+	or	r11, r3
+	bra	42b
+	 nop
+45:	mov.l	\fB, r11
+	or	r11, r3
+	cmp/pz	r0
+	bt	52f
+	mov.w	82f, r11
+	bra	46b
+	 nop
+52:	mov.w	81f, r11
+	bra	46b
+	 nop
+47:	mov.l	\fB, r11
+	or	r11, r3
+	mov.w	81f, r0
+	bra	48b
+	 nop
+55:	mov.l	\fB, r11
+	or	r11, r3
+	bra	48b
+	 mov	r13, r0
+80:	.word	255
+81:	.word	0x7fff
+82:	.word	0x8000
+	.align	2
+99:
+.endm
+
+/* The colour FIFO shift, RGB2 from r12 + the old CODE, FLAG out, return.
+ * Pops r8..r14. */
+.macro RGB_LEAVE
+	mov.l	@(20, r6), r0
+	mov.l	r0, @(16, r6)		/* RGB0 = RGB1 */
+	mov.l	@(24, r6), r0
+	mov.l	r0, @(20, r6)		/* RGB1 = RGB2 */
+	mov.l	@(24, r4), r0
+	shlr16	r0
+	shlr8	r0
+	shll16	r0
+	shll8	r0			/* CODE << 24 */
+	or	r12, r0
+	mov.l	r0, @(24, r6)		/* RGB2 */
+	mov.l	90f, r0
+	mov.l	r3, @r0			/* gte_hot.flag */
+	mov.w	91f, r0
+	mov.l	r3, @(r0, r4)		/* FLAG */
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	rts
+	 mov.l	@r15+, r8
+91:	.word	252
+	.align	2
+90:	.long	_gte_hot
+.endm
+
+.macro CUE_ENTER
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov.w	92f, r9
+	add	r4, r9
+	mov	#0, r3
+	mov.w	@r2, r7			/* IR0 */
+.endm
+
+	.balign	4
+	.global	_gte_dpcs_fast
+	.type	_gte_dpcs_fast, @function
+_gte_dpcs_fast:
+	CUE_ENTER
+	mov.l	93f, r0
+	tst	r0, r5			/* T = (sf == 0) */
+	movt	r5
+	shll2	r5
+	mov	r5, r0
+	add	r0, r5
+	add	r0, r5			/* 12 when sf == 0, else 0 */
+	neg	r5, r14
+	mov.l	@(24, r4), r8		/* RGB */
+	bra	1f
+	 nop
+92:	.word	212
+	.align	2
+93:	.long	0x80000
+1:
+	DPCS_COMP 0, 0, 36, 4,  60f, 61f, 62f, 63f
+	DPCS_COMP 1, 4, 40, 8,  64f, 65f, 66f, 67f
+	DPCS_COMP 2, 8, 44, 12, 68f, 69f, 70f, 71f
+	RGB_LEAVE
+	.align	2
+60:	.long	0x88000000		/* A1 negative */
+61:	.long	0x40000000		/* A1 positive */
+62:	.long	0x81000000		/* limB1 */
+63:	.long	0x00200000		/* limC1 */
+64:	.long	0x84000000
+65:	.long	0x20000000
+66:	.long	0x80800000
+67:	.long	0x00100000
+68:	.long	0x82000000
+69:	.long	0x10000000
+70:	.long	0x00400000
+71:	.long	0x00080000
+	.size	_gte_dpcs_fast, . - _gte_dpcs_fast
+
+	.balign	4
+	.global	_gte_intpl_fast
+	.type	_gte_intpl_fast, @function
+_gte_intpl_fast:
+	CUE_ENTER
+	mov.w	94f, r0
+	tst	r0, r5			/* T = (lm == 0) */
+	movt	r13
+	neg	r13, r13		/* -1 when lm == 0 */
+	mov.w	95f, r0
+	and	r0, r13			/* -0x8000 when lm == 0, else 0 */
+	mov.l	93f, r0
+	tst	r0, r5			/* T = (sf == 0) */
+	movt	r5
+	add	#-1, r5			/* -1 when sf, else 0 */
+	shll2	r5
+	mov	r5, r0
+	add	r0, r5
+	add	r0, r5			/* -12 when sf, else 0 */
+	bra	1f
+	 nop
+92:	.word	212
+94:	.word	0x400
+95:	.word	0x8000
+	.align	2
+93:	.long	0x80000
+1:
+	INTPL_COMP 0, 0, 36, 4,  60f, 61f, 62f, 63f
+	INTPL_COMP 1, 4, 40, 8,  64f, 65f, 66f, 67f
+	INTPL_COMP 2, 8, 44, 12, 68f, 69f, 70f, 71f
+	RGB_LEAVE
+	.align	2
+60:	.long	0x88000000
+61:	.long	0x40000000
+62:	.long	0x81000000
+63:	.long	0x00200000
+64:	.long	0x84000000
+65:	.long	0x20000000
+66:	.long	0x80800000
+67:	.long	0x00100000
+68:	.long	0x82000000
+69:	.long	0x10000000
+70:	.long	0x00400000
+71:	.long	0x00080000
+	.size	_gte_intpl_fast, . - _gte_intpl_fast
+
+/* MVMVA with sf == 0, in integers: the results reach 2^31, which float32
+ * cannot hold exactly.  Covers sf == 0, mx < 3, lm == 0; else C.
+ *   r4 = psxCP2Regs *r
+ *   r5 = const s16 *v   three contiguous halfwords
+ *   r6 = const s16 *m   nine contiguous halfwords, m11 m12 m13 m21 ... m33
+ *   r7 = const s32 *t   three words; the caller passes zeros for cv == 3
+ * Bit-exact with gte_mvmva_c.  MAC1..3 (r4+100..108) and IR1..3
+ * (r4+36..44) are out of displacement range, so the bases stay in
+ * registers.  No calls; PR untouched. */
+	.align	2
+	.global	_gte_mvmva_sf0_asm
+	.type	_gte_mvmva_sf0_asm, @function
+_gte_mvmva_sf0_asm:
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+
+	mov.w	@r5+, r8		/* vx, sign-extended */
+	mov.w	@r5+, r9		/* vy */
+	mov.w	@r5+, r10		/* vz */
+
+	mov.l	90f, r0
+	mov.l	@r0, r13		/* r13 = gte_hot.flag */
+	mov	r4, r14
+	add	#64, r14		/* MAC1..3 at @(36,r14)/40/44 */
+	mov	r4, r5
+	add	#32, r5			/* IR1..3  at @(4,r5)/8/12   */
+	mova	91f, r0
+	mov	r0, r1			/* r1 = flag table */
+	mov	#36, r2			/* r2 = MAC displacement */
+
+70:	/* ---- one component ---- */
+	mov.l	@r7+, r0		/* t[i] */
+	mov	r0, r11
+	mov	#12, r3
+	shld	r3, r11			/* lo = t << 12 */
+	mov	r0, r12
+	mov	#-20, r3
+	shad	r3, r12			/* hi = t >> 20, arithmetic */
+
+	mov.w	@r6+, r0
+	dmuls.l	r0, r8			/* m * vx, full signed 64 */
+	sts	macl, r0
+	sts	mach, r3
+	clrt
+	addc	r0, r11
+	addc	r3, r12
+
+	mov.w	@r6+, r0
+	dmuls.l	r0, r9			/* m * vy */
+	sts	macl, r0
+	sts	mach, r3
+	clrt
+	addc	r0, r11
+	addc	r3, r12
+
+	mov.w	@r6+, r0
+	dmuls.l	r0, r10			/* m * vz */
+	sts	macl, r0
+	sts	mach, r3
+	clrt
+	addc	r0, r11
+	addc	r3, r12
+
+	/* A1/A2/A3: fits s32 iff the high word is the sign extension of the low;
+	 * otherwise the high word's sign says which way.  MAC is the low word. */
+	mov	r11, r3
+	shal	r3			/* T = bit 31 of lo */
+	subc	r3, r3			/* r3 = -T: 0 or -1 */
+	cmp/eq	r3, r12
+	bt	72f
+	cmp/pz	r12
+	bf	71f
+	mov.l	@r1, r0			/* overflowed up */
+	bra	72f
+	 or	r0, r13
+71:	mov.l	@(4,r1), r0		/* overflowed down */
+	or	r0, r13
+
+72:	mov	r2, r0
+	mov.l	r11, @(r0,r14)		/* MAC */
+
+	/* limB1/2/3: clamp to s16.  exts.w round-trips iff it is in range. */
+	exts.w	r11, r3
+	cmp/eq	r3, r11
+	bt	75f
+	mov.l	@(8,r1), r0		/* the clamp raised a flag */
+	or	r0, r13
+	mov	#1, r3
+	shll8	r3
+	shll8	r3
+	shlr	r3			/* 0x8000 */
+	cmp/pz	r11
+	bf	73f
+	bra	74f
+	 add	#-1, r3			/* 0x7fff */
+73:	neg	r3, r3			/* -0x8000 */
+74:	mov	r3, r11
+
+75:	mov	r2, r0
+	add	#-32, r0
+	mov.w	r11, @(r0,r5)		/* IR */
+
+	add	#4, r2
+	add	#12, r1
+	mov	#48, r0
+	cmp/eq	r0, r2
+	bf	70b
+
+	mov.l	90f, r0
+	mov.l	r13, @r0		/* gte_hot.flag */
+
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	rts
+	 mov.l	@r15+, r8
+
+	.align	2
+90:	.long	_gte_hot
+	/* per component: A max, A min, limB */
+91:	.long	0x40000000, 0x88000000, 0x81000000
+	.long	0x20000000, 0x84000000, 0x80800000
+	.long	0x10000000, 0x82000000, 0x00400000
+	.size	_gte_mvmva_sf0_asm, . - _gte_mvmva_sf0_asm
+
+/* NCLIP as a leaf: entered by `jsr` from a block with GBR = the state
+ * block, no shim, no cycle reconcile.  May clobber r0-r6, PR, MACH, MACL
+ * and T (r3 comes back as GBR); preserves r7-r15 and GBR.  The file is at
+ * GBR + FGL_AT_CP2D * 4 (264).  Never calls C.
+ *
+ *   MAC0 = (SX1-SX0)*(SY2-SY0) - (SX2-SX0)*(SY1-SY0)
+ *
+ * FLAG is 0, or bit 31 with bit 16 (MAC0 > INT_MAX) or bit 15 (< INT_MIN).
+ * Differences are 17-bit, products 34-bit, so the sum needs dmuls.l's 64. */
+	.balign	4
+	.global	_gte_nclip_leaf_old
+	.type	_gte_nclip_leaf_old, @function
+_gte_nclip_leaf_old:
+	mov.w	3f, r0			/* FGL_AT_CP2D * 4 */
+	stc	gbr, r4
+	add	r0, r4			/* r4 = &cp2d */
+	mov.l	@(48, r4), r0		/* SXY0 */
+	mov.l	@(52, r4), r1		/* SXY1 */
+	mov.l	@(56, r4), r2		/* SXY2 */
+	mov	r0, r3
+	exts.w	r3, r3			/* SX0 */
+	shlr16	r0
+	exts.w	r0, r0			/* SY0 */
+	lds	r0, mach		/* parked: SY0 */
+	mov	r1, r0
+	exts.w	r0, r0
+	sub	r3, r0			/* a = SX1 - SX0 */
+	lds	r0, macl		/* parked: a */
+	shlr16	r1
+	exts.w	r1, r1			/* SY1 */
+	sts	mach, r5		/* SY0 */
+	sub	r5, r1			/* d = SY1 - SY0 */
+	mov	r2, r0
+	exts.w	r0, r0
+	sub	r3, r0			/* c = SX2 - SX0 */
+	shlr16	r2
+	exts.w	r2, r2
+	sub	r5, r2			/* b = SY2 - SY0 */
+	sts	macl, r3		/* a */
+	dmuls.l	r3, r2			/* a * b */
+	sts	macl, r3
+	sts	mach, r5		/* r5:r3 = a * b */
+	dmuls.l	r0, r1			/* c * d */
+	sts	macl, r0
+	sts	mach, r1		/* r1:r0 = c * d */
+	clrt
+	subc	r0, r3			/* low word of the difference */
+	subc	r1, r5			/* high word */
+	mov	r3, r0
+	shll	r0
+	subc	r0, r0			/* what the high word would be in range */
+	cmp/eq	r0, r5
+	mov	#0, r1			/* FLAG, in range */
+	bt	2f
+	mov.l	5f, r1			/* positive overflow */
+	cmp/pz	r5
+	bt	2f
+	mov.l	6f, r1			/* negative overflow */
+2:	mov	r4, r0
+	add	#96, r0
+	mov.l	r3, @r0			/* MAC0 */
+	mov.w	4f, r0
+	add	r4, r0
+	mov.l	r1, @r0			/* FLAG */
+	rts
+	 stc	gbr, r3			/* the guest-file base, see pins.h */
+3:	.word	264			/* FGL_AT_CP2D * 4 */
+4:	.word	252			/* cp2c[31]: 128 + 31 * 4 */
+	.align	2
+5:	.long	0x80010000
+6:	.long	0x80008000
+	.size	_gte_nclip_leaf_old, . - _gte_nclip_leaf_old
+
+/* C-callable form for the self-test: r4 = &file.  Sets GBR so the leaf
+ * finds the file, then restores it. */
+	.balign	4
+	.global	_gte_nclip_leaf_call
+	.type	_gte_nclip_leaf_call, @function
+_gte_nclip_leaf_call:
+	sts.l	pr, @-r15
+	stc.l	gbr, @-r15
+	mov.w	1f, r0
+	sub	r0, r4
+	ldc	r4, gbr
+	bsr	_gte_nclip_leaf_old
+	 nop
+	ldc.l	@r15+, gbr
+	lds.l	@r15+, pr
+	rts
+	 nop
+1:	.word	264
+	.size	_gte_nclip_leaf_call, . - _gte_nclip_leaf_call
+
+/* RTPS / RTPT as leaves: the matrix is read out of the GBR file and XMTRX
+ * rebuilt on a miss, no C, no shim.  The arithmetic after the load is
+ * RTP_VERTEX and the depth cue, so results stay bit-identical to the C.
+ *
+ * Entered by `jsr` with GBR = the state block, the file at GBR + 264.
+ * Clobbers r0, r1, PR, MACH, MACL, T, FR0-FR15 and XMTRX; preserves r2-r15
+ * and GBR.  C's matrix cache lives in the FPU, so the leaf writes -1 into
+ * gte_hot.xmtrx_key/xmtrx_mx on the way out and the next cached user
+ * reloads. */
+
+/* The rotation matrix and translation column of the file at r4 into XMTRX,
+ * scaled as gte_rot_convert / gte_col_rebuild would: m * 1/4096, TR as
+ * float, column 3 = (0,0,0,1).  fr0-fr15 and r0-r2 are scratch. */
+.macro RTP_XMTRX_LOAD
+	mov	r4, r1
+	add	#64, r1
+	add	#64, r1			/* r1 = &cp2c[0] */
+	mova	9f, r0
+	fmov.s	@r0, fr15		/* 1/4096 */
+
+	mov.l	@(0, r1), r2		/* R11 | R12 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr0
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr4
+
+	mov.l	@(4, r1), r2		/* R13 | R21 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr8
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr1
+
+	mov.l	@(8, r1), r2		/* R22 | R23 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr5
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr9
+
+	mov.l	@(12, r1), r2		/* R31 | R32 << 16 */
+	exts.w	r2, r0
+	lds	r0, fpul
+	float	fpul, fr2
+	swap.w	r2, r0
+	exts.w	r0, r0
+	lds	r0, fpul
+	float	fpul, fr6
+
+	mov.w	@(16, r1), r0		/* R33 */
+	lds	r0, fpul
+	float	fpul, fr10
+
+	fmul	fr15, fr0
+	fmul	fr15, fr1
+	fmul	fr15, fr2
+	fldi0	fr3
+	fmul	fr15, fr4
+	fmul	fr15, fr5
+	fmul	fr15, fr6
+	fldi0	fr7
+	fmul	fr15, fr8
+	fmul	fr15, fr9
+	fmul	fr15, fr10
+	fldi0	fr11
+
+	mov.l	@(20, r1), r0		/* TRX */
+	lds	r0, fpul
+	float	fpul, fr12
+	mov.l	@(24, r1), r0		/* TRY */
+	lds	r0, fpul
+	float	fpul, fr13
+	mov.l	@(28, r1), r0		/* TRZ */
+	lds	r0, fpul
+	float	fpul, fr14
+	fldi1	fr15
+
+	fschg
+	fmov	dr0, xd0
+	fmov	dr2, xd2
+	fmov	dr4, xd4
+	fmov	dr6, xd6
+	fmov	dr8, xd8
+	fmov	dr10, xd10
+	fmov	dr12, xd12
+	fmov	dr14, xd14
+	bra	1f
+	 fschg
+	.align	2
+9:	.long	0x39800000		/* 1/4096 */
+1:
+.endm
+
+/* The leaf prologue: save what the body uses beyond r0/r1, find the file,
+ * load XMTRX, then RTP_ENTER's bases and constants with ofx/ofy taken from
+ * the file instead of gte_hot. */
+.macro RTP_LEAF_CONST
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov.w	3f, r3
+	add	r4, r3			/* file + 232: H, DQA, DQB, FLAG */
+	mov	#0, r7
+	mova	4f, r0
+	fmov.s	@r0+, fr8
+	fmov.s	@r0+, fr9
+	fmov.s	@r0+, fr10
+	fmov.s	@r0+, fr11
+	fmov	fr11, fr5
+	fneg	fr5
+.endm
+
+/* Leaf prologue: save what the body uses beyond r0/r1, find the file, then
+ * take XMTRX and ofx/ofy as they stand or rebuild them.
+ *
+ * Cache protocol with gte_hot: xmtrx_key = -2 means "XMTRX holds rotation
+ * matrix 0 with its translation as the leaf loads it", xmtrx_serial = the
+ * psxCP2CtrlGen it was loaded at, ofx/ofy/ofs_gen as gte_offsets_rebuild
+ * writes them.  C never matches -2, so it reloads after a leaf; the leaf
+ * reloads after C (key >= 0), a reset (-1) or a CTC2 (generation moved).
+ * xmtrx_mx stays -1 so gte_mtx_use_slow's column reload never fires. */
+.macro RTP_ENTER_LEAF
+	mov.l	r7, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.w	2f, r0			/* FGL_AT_CP2D * 4 */
+	stc	gbr, r4
+	add	r0, r4			/* r4 = the file */
+	mov.l	6f, r1
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	7f, r0			/* &gte_hot */
+	mov.l	@(16, r0), r8		/* xmtrx_key */
+	mov	#-2, r9
+	cmp/eq	r9, r8
+	bf	8f
+	mov.l	@(24, r0), r8		/* xmtrx_serial */
+	cmp/eq	r1, r8
+	bf	8f
+	/* hit: XMTRX is ours at this generation, the offsets with it */
+	RTP_LEAF_CONST
+	mov.l	7f, r0
+	add	#4, r0
+	fmov.s	@r0+, fr6		/* ofx */
+	bra	1f
+	 fmov.s	@r0, fr7		/* ofy */
+8:	/* miss: rebuild from the file, then publish */
+	RTP_XMTRX_LOAD
+	RTP_LEAF_CONST
+	mov.w	5f, r0			/* cp2c[24]: OFX */
+	mov.l	@(r0, r4), r1
+	lds	r1, fpul
+	float	fpul, fr6
+	fmul	fr9, fr6		/* ofx = OFX / 65536 */
+	add	#4, r0
+	mov.l	@(r0, r4), r1
+	lds	r1, fpul
+	float	fpul, fr7
+	fmul	fr9, fr7		/* ofy */
+	mov.l	6f, r1
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	7f, r0			/* &gte_hot */
+	mov.l	r1, @(12, r0)		/* ofs_gen */
+	mov.l	r1, @(24, r0)		/* xmtrx_serial */
+	mov	#-2, r1
+	mov.l	r1, @(16, r0)		/* xmtrx_key: the leaf's */
+	mov	#-1, r1
+	mov.l	r1, @(20, r0)		/* xmtrx_mx */
+	add	#4, r0
+	fmov.s	fr6, @r0		/* ofx */
+	add	#4, r0
+	bra	1f
+	 fmov.s	fr7, @r0		/* ofy */
+2:	.word	264
+3:	.word	232
+5:	.word	224
+	.align	2
+4:	.long	0x47800000	/* 65536.0 */
+	.long	0x37800000	/* 1/65536 */
+	.long	0x3f000000	/* 0.5 */
+	.long	0x47000000	/* 32768.0 */
+6:	.long	_psxCP2Gen		/* [0] is psxCP2CtrlGen */
+7:	.long	_gte_hot
+1:
+.endm
+
+/* RTP_LEAVE for a leaf: the depth cue and FLAG as before, no gte_hot.flag,
+ * the XMTRX cache told it no longer holds what it thinks, and everything the
+ * prologue saved put back. */
+.macro RTP_LEAVE_LEAF
+	/* POC: MAC0 = ftrc(DQB + DQA * 65536 * q) in float */
+	mov.w	@(4, r3), r0		/* DQA */
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr8, fr0
+	fmul	fr4, fr0
+	mov.l	@(8, r3), r0		/* DQB */
+	lds	r0, fpul
+	float	fpul, fr1
+	fadd	fr1, fr0
+	ftrc	fr0, fpul
+	sts	fpul, r9
+	mov.l	r9, @(32, r6)		/* MAC0 */
+	mov	#-12, r0
+	shad	r0, r9
+	mov.w	4f, r0
+	cmp/gt	r0, r9
+	bt	1f
+	cmp/pz	r9
+	bf	2f
+	mov	r9, r0
+3:	mov.w	r0, @(0, r2)		/* IR0 */
+	mov.l	r7, @(20, r3)		/* FLAG */
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	mov.l	@r15+, r8
+	stc	gbr, r3			/* the guest-file base, see pins.h */
+	rts
+	 mov.l	@r15+, r7
+1:	mov.w	4f, r1
+	or	r1, r7
+	bra	3b
+	 nop
+2:	mov.w	4f, r1
+	or	r1, r7
+	bra	3b
+	 mov	#0, r0
+4:	.word	0x1000			/* limH bound, and its flag bit */
+.endm
+
+/* RTPS / RTPT leaves, second shape: everything addressed off GBR
+ * (file = GBR + 264), nothing pushed.  r0/r1 scratch, r2 SX, r5 FLAG,
+ * fr4 = q, fr6/fr7 = ofx/ofy, XMTRX the matrix.  SX/SY come from the float
+ * MACs, not the clamped IRs.  Cache protocol as RTP_ENTER_LEAF. */
+/* Hit path is based on &gte_hot+4 (73f): the post-increment ofx/ofy pair
+ * wants it, and xmtrx_key in r0 makes the -2 test `cmp/eq #imm, r0`.  The
+ * miss path keeps &gte_hot (77f).  Both halves of the test are needed:
+ * xmtrx_serial means psxCP2RtGen when the leaf owns XMTRX and rc->serial
+ * when the C cache does, so the key says whose serial is read. */
+.macro RTPL_ENTER
+	mov.l	73f, r1			/* &gte_hot + 4 */
+	mov.l	76f, r2
+	mov	#0, r5
+	mov.l	@(12, r1), r0		/* xmtrx_key */
+	mov.l	@(4, r2), r2		/* psxCP2RtGen: RT/TR/OFX/OFY only */
+	cmp/eq	#-2, r0
+	bf	78f
+	mov.l	@(20, r1), r0		/* xmtrx_serial */
+	fmov.s	@r1+, fr6		/* ofx */
+	cmp/eq	r2, r0
+	fmov.s	@r1, fr7		/* ofy */
+	bt	79f
+78:	stc	gbr, r4
+	mov.w	75f, r0
+	add	r0, r4			/* r4 = the file */
+	RTP_XMTRX_LOAD
+	mov.l	74f, r1
+	lds	r1, fpul
+	fsts	fpul, fr5		/* 1/65536 */
+	mov.l	@(488, gbr), r0		/* OFX */
+	lds	r0, fpul
+	float	fpul, fr6
+	fmul	fr5, fr6
+	mov.l	@(492, gbr), r0		/* OFY */
+	lds	r0, fpul
+	float	fpul, fr7
+	fmul	fr5, fr7
+	mov.l	76f, r1
+	mov.l	@(4, r1), r2		/* psxCP2RtGen */
+	mov.l	@r1, r1			/* psxCP2CtrlGen */
+	mov.l	77f, r0
+	mov.l	r2, @(24, r0)		/* xmtrx_serial */
+	mov.l	r1, @(12, r0)		/* ofs_gen */
+	mov	#-2, r1
+	mov.l	r1, @(16, r0)		/* xmtrx_key */
+	mov	#-1, r1
+	mov.l	r1, @(20, r0)		/* xmtrx_mx */
+	add	#4, r0
+	fmov.s	fr6, @r0
+	add	#4, r0
+	fmov.s	fr7, @r0
+	bra	79f
+	 mov	#0, r5
+75:	.word	264
+	.align	2
+74:	.long	0x37800000		/* 1/65536 */
+76:	.long	_psxCP2Gen		/* [0] is psxCP2CtrlGen */
+77:	.long	_gte_hot
+73:	.long	_gte_hot + 4		/* the hit path's base: ofx, ofy */
+79:
+.endm
+
+/* GBR displacements: V at voff (VX, VY, VZ), SZ at szoff, SXY at sxyoff.
+ * IR1..3 300/304/308, MAC1..3 364/368/372, H 496.  dq = 1 on the last
+ * vertex: MAC0's float comes out in r4 for RTPL_LEAVE, q in fr0.
+ *
+ * Scheduled for the SH7750 (sh4_pipe.c): the fdiv issues as soon as SZ
+ * exists; each ftrc is followed at once by its sts; a sts result is not
+ * touched for 3 instructions; V is read through a pointer.  r4 the V
+ * pointer, then file + 64 (MAC1 at +36), then MAC0; r6 H/2, then 0x3ff;
+ * r1 MAC3 then MAC2 then SY; r2 MAC1 then SX; r0 clamp scratch, then
+ * 0xfc00.  fr4 H, fr0 X then q, fr8 X, fr2 SX, fr11 SY, fr3 SZ, fr9/fr10
+ * the DQ terms. */
+.macro RTPL_VERTEX voff, szoff, sxyoff, dq, fifo
+	mov.w	87f, r6			/* voff */
+	stc	gbr, r4
+	fldi1	fr3
+	add	r6, r4			/* r4 = &V */
+	mov.w	@r4+, r1		/* VX */
+	mov.w	@r4+, r2		/* VY */
+	mov.w	@r4+, r6		/* VZ */
+	mov.w	@(496, gbr), r0		/* H */
+	lds	r1, fpul
+	float	fpul, fr0
+	lds	r2, fpul
+	extu.w	r0, r0
+	float	fpul, fr1
+	lds	r6, fpul
+	mov	r0, r6
+	float	fpul, fr2
+	lds	r0, fpul
+	shlr	r6			/* H/2 */
+	float	fpul, fr4		/* H */
+	add	#(312 - \voff - 6), r4	/* r4 = file + 48: SXY0, SZ0 at +16, MAC0..3 at +48 */
+	ftrv	xmtrx, fv0
+	\fifo				/* the SZ/SXY shift, in the ftrv's shadow */
+
+	ftrc	fr2, fpul		/* MAC3 */
+	sts	fpul, r1
+	ftrc	fr0, fpul		/* MAC1 */
+	sts	fpul, r2
+	fmov	fr0, fr8		/* X */
+	fmov	fr6, fr2		/* ofx, the SX accumulator */
+	fmov	fr4, fr0		/* H, to be q */
+	exts.w	r1, r0			/* limB3, on MAC3 before limD clamps it */
+	cmp/eq	r0, r1
+	fmov	fr7, fr11		/* ofy, the SY accumulator */
+	bf	31f
+32:	mov.w	r0, @(308, gbr)		/* IR3 */
+	mov.l	r1, @(60, r4)		/* MAC3 */
+	extu.w	r1, r0			/* limD */
+	cmp/eq	r0, r1
+	bf	41f
+42:	mov.w	r0, @(\szoff, gbr)	/* SZ */
+	lds	r1, fpul
+	float	fpul, fr3		/* SZ */
+	cmp/hi	r6, r1			/* SZ > H/2, else limE */
+	bf	52f
+	fdiv	fr3, fr0		/* q = H / SZ */
+53:
+.if \dq
+	mov.w	@(500, gbr), r0		/* DQA */
+	ftrc	fr1, fpul		/* MAC2 */
+	shll16	r0
+	sts	fpul, r1
+	lds	r0, fpul
+	mov.l	@(504, gbr), r0		/* DQB */
+	float	fpul, fr9		/* DQA << 16 */
+	mov.l	r2, @(52, r4)		/* MAC1 */
+	lds	r0, fpul
+	float	fpul, fr10		/* DQB */
+.else
+	ftrc	fr1, fpul		/* MAC2 */
+	sts	fpul, r1
+	mov.l	r2, @(52, r4)		/* MAC1 */
+.endif
+	exts.w	r2, r0			/* limB1 */
+	cmp/eq	r0, r2
+	bf	11f
+12:	mov.w	r0, @(300, gbr)		/* IR1 */
+	fmac	fr0, fr8, fr2		/* SX = ofx + X * q */
+	fmac	fr0, fr1, fr11		/* SY = ofy + Y * q */
+	mov.l	r1, @(56, r4)		/* MAC2 */
+.if \dq
+	fmul	fr0, fr9		/* (DQA << 16) * q */
+.endif
+	exts.w	r1, r0			/* limB2 */
+	ftrc	fr2, fpul		/* SX */
+	sts	fpul, r2
+	cmp/eq	r0, r1
+	bf	21f
+22:	mov.w	r0, @(304, gbr)		/* IR2 */
+	ftrc	fr11, fpul		/* SY */
+	sts	fpul, r1
+.if \dq
+	fadd	fr10, fr9		/* + DQB */
+.endif
+	mov.w	85f, r6			/* 0x3ff */
+	mov.w	86f, r0			/* 0xfc00 */
+.if \dq
+	ftrc	fr9, fpul		/* MAC0 */
+	sts	fpul, r4
+.endif
+	cmp/gt	r6, r2			/* limG1 on SX */
+	bt	64f
+	cmp/ge	r0, r2
+	bf	65f
+66:	cmp/gt	r6, r1			/* limG2 on SY */
+	bt	74f
+	cmp/ge	r0, r1
+	bf	75f
+76:	shll16	r1
+	extu.w	r2, r0
+	or	r1, r0
+	mov.l	r0, @(\sxyoff, gbr)	/* SXY */
+	bra	99f
+	 nop
+
+	/* --- stubs --- */
+11:	mov.l	91f, r0
+	or	r0, r5
+	cmp/pz	r2
+	bt	13f
+	mov.w	84f, r0
+	bra	12b
+	 nop
+13:	mov.w	83f, r0
+	bra	12b
+	 nop
+21:	mov.l	92f, r0
+	or	r0, r5
+	cmp/pz	r1
+	bt	23f
+	mov.w	84f, r0
+	bra	22b
+	 nop
+23:	mov.w	83f, r0
+	bra	22b
+	 nop
+31:	mov.l	93f, r0
+	or	r0, r5
+	cmp/pz	r1
+	bt	33f
+	mov.w	84f, r0
+	bra	32b
+	 nop
+33:	mov.w	83f, r0
+	bra	32b
+	 nop
+41:	mov.l	94f, r0
+	or	r0, r5
+	cmp/pz	r1
+	bt	43f
+	mov	#0, r1
+	bra	42b
+	 mov	#0, r0
+43:	mov.l	81f, r1
+	bra	42b
+	 mov	r1, r0
+52:	mov.l	95f, r6
+	or	r6, r5
+	mov.l	82f, r6
+	lds	r6, fpul
+	bra	53b
+	 fsts	fpul, fr0
+64:	mov.l	98f, r2
+	or	r2, r5
+	bra	66b
+	 mov	r6, r2
+65:	mov.l	98f, r2
+	or	r2, r5
+	bra	66b
+	 mov	r0, r2
+74:	mov.l	100f, r1
+	or	r1, r5
+	bra	76b
+	 mov	r6, r1
+75:	mov.l	100f, r1
+	or	r1, r5
+	bra	76b
+	 mov	r0, r1
+	.align	2
+81:	.long	0xffff
+82:	.long	0x3fffff80		/* 0x1ffff / 65536 */
+83:	.word	0x7fff
+84:	.word	0x8000
+85:	.word	0x3ff
+86:	.word	0xfc00
+87:	.word	\voff
+	.align	2
+91:	.long	0x81000000	/* limB1 */
+92:	.long	0x80800000	/* limB2 */
+93:	.long	0x00400000	/* limB3 */
+94:	.long	0x80040000	/* limD */
+95:	.long	0x80020000	/* limE */
+98:	.long	0x80004000	/* limG1 */
+100:	.long	0x80002000	/* limG2 */
+99:
+.endm
+
+/* What RTPL_VERTEX runs under its ftrv, r4 = file + 48 (SXY0): the FIFOs.
+ * SZ0 <- SZ1 <- SZ2 <- SZ3 and SXY0 <- SXY1 <- SXY2 for RTPS, SZ0 <- SZ3 for
+ * RTPT's first vertex.  The SZ slots are still written as words. */
+.macro RTPS_FIFO
+	mov.l	@(20, r4), r0		/* SZ1 */
+	mov.l	@(28, r4), r2		/* SZ3 */
+	mov.l	@(4, r4), r1		/* SXY1 */
+	mov.w	r0, @(16, r4)		/* SZ0 */
+	mov.l	@(24, r4), r0		/* SZ2 */
+	mov.l	r1, @(0, r4)		/* SXY0 */
+	mov.l	@(8, r4), r1		/* SXY2 */
+	mov.w	r0, @(20, r4)		/* SZ1 */
+	mov	r2, r0
+	mov.l	r1, @(4, r4)		/* SXY1 */
+	mov.w	r0, @(24, r4)		/* SZ2 */
+.endm
+.macro RTPT_FIFO
+	mov.l	@(28, r4), r0		/* SZ3 */
+	nop
+	mov.w	r0, @(16, r4)		/* SZ0 */
+.endm
+.macro RTPL_NOFIFO
+.endm
+
+/* MAC0 = ftrc(DQB + (DQA << 16) * q) came out of the last vertex in r4;
+ * IR0 = limH(MAC0 >> 12), FLAG. */
+.macro RTPL_LEAVE
+	mov	r4, r0
+	mov.w	4f, r1
+	mov.l	r0, @(360, gbr)		/* MAC0 */
+	mov	#-12, r2
+	shad	r2, r0
+	cmp/gt	r1, r0
+	bt	1f
+	cmp/pz	r0
+	bf	2f
+3:	mov.w	r0, @(296, gbr)		/* IR0 */
+	mov	r5, r0
+	rts
+	 mov.l	r0, @(516, gbr)		/* FLAG */
+1:	or	r1, r5
+	bra	3b
+	 mov	r1, r0
+2:	or	r1, r5
+	bra	3b
+	 mov	#0, r0
+4:	.word	0x1000
+.endm
+
+	.balign	4
+	.global	_gte_rtps_leaf
+	.type	_gte_rtps_leaf, @function
+_gte_rtps_leaf:
+	RTPL_ENTER
+	RTPL_VERTEX 264, 340, 320, 1, RTPS_FIFO
+	RTPL_LEAVE
+	.size	_gte_rtps_leaf, . - _gte_rtps_leaf
+
+	.balign	4
+	.global	_gte_rtpt_leaf
+	.type	_gte_rtpt_leaf, @function
+_gte_rtpt_leaf:
+	RTPL_ENTER
+	RTPL_VERTEX 264, 332, 312, 0, RTPT_FIFO
+	RTPL_VERTEX 272, 336, 316, 0, RTPL_NOFIFO
+	RTPL_VERTEX 280, 340, 320, 1, RTPL_NOFIFO
+	RTPL_LEAVE
+	.size	_gte_rtpt_leaf, . - _gte_rtpt_leaf
+
+/* C-callable forms for the self-test, as _gte_nclip_leaf_call. */
+.macro LEAF_CALL name, leaf
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	sts.l	pr, @-r15
+	stc.l	gbr, @-r15
+	mov.w	1f, r0
+	sub	r0, r4
+	ldc	r4, gbr
+	bsr	\leaf
+	 nop
+	ldc.l	@r15+, gbr
+	lds.l	@r15+, pr
+	rts
+	 nop
+1:	.word	264
+	.size	\name, . - \name
+.endm
+
+	LEAF_CALL _gte_rtps_leaf_call, _gte_rtps_leaf
+	LEAF_CALL _gte_rtpt_leaf_call, _gte_rtpt_leaf
+
+/* The rest of the GTE as integer leaves, exact to pcsx's gte.c (flags
+ * included: sequential 44-bit overflow per addend, clamps, master bit); the
+ * self-test asks for zero differences against gteDispatch().
+ *
+ * Leaf contract as above: jsr, GBR = state block, file at GBR + 264, r1 =
+ * the op word where one is taken.  Clobbers r0-r6, PR, MACH, MACL, T (r3
+ * comes back as GBR).  Preserves r7-r15 and GBR.
+ *
+ * Register plan (gl_*):
+ *   r4   the file                 r2   file + 32: IR0 @0, IR1..3 @4/8/12
+ *   r6   file + 64: SZ @0..12, RGB0..2 @16/20/24, MAC0 @32, MAC1..3 @36/40/44
+ *   r3   the flags, no master bit (gl_flagout adds it and writes FLAG)
+ *   r14  -shift (0 or -12)        r13  lm's low bound (0 or -0x8000)
+ *   r15  the op word is at @(0,r15) after ILEAF_ENTER
+ *
+ * The 44-bit accumulator is a 64-bit value scaled by 2^20 (hi:lo =
+ * r13:r12), so a signed overflow of the high word is the 44-bit overflow,
+ * addv/subv report it, and `>> (shift + 20)` is the high word or a 12-bit
+ * funnel shift. */
+
+/* ---- the small building blocks ---- */
+
+/* The flag bits, built with shifts so the cold stubs carry no literals. */
+.macro FLAG_A_POS n		/* 1 << (31 - n): 30, 29, 28 */
+	.if \n == 1
+	mov	#0x40, r0
+	.elseif \n == 2
+	mov	#0x20, r0
+	.else
+	mov	#0x10, r0
+	.endif
+	shll16	r0
+	shll8	r0
+.endm
+.macro FLAG_A_NEG n		/* 1 << (28 - n): 27, 26, 25 */
+	.if \n == 1
+	mov	#8, r0
+	.elseif \n == 2
+	mov	#4, r0
+	.else
+	mov	#2, r0
+	.endif
+	shll16	r0
+	shll8	r0
+.endm
+
+/* hi:lo (x 2^20) += p << 20, with the 44-bit overflow flags of component n.
+ * r1 = p on entry and is destroyed; r0 scratch. */
+.macro MACADD n, lo, hi
+	mov	r1, r0
+	shll16	r0
+	shll2	r0
+	shll2	r0			/* p << 20 */
+	clrt
+	addc	r0, \lo
+	mov	#-12, r0
+	shad	r0, r1			/* p >> 12 */
+	movt	r0
+	add	r0, r1			/* + carry */
+	addv	r1, \hi
+	bf	8f
+	cmp/pz	\hi
+	bt	1f
+	FLAG_A_POS \n			/* wrapped negative: overflowed up */
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:
+.endm
+
+/* r0 = (hi:lo x 2^20) >> (shift + 20).  r1 scratch. */
+.macro EXTR20 lo, hi
+	mov	\hi, r0
+	tst	r14, r14
+	bf	3f			/* shift 12: the high word */
+	shll8	r0
+	shll2	r0
+	shll2	r0
+	mov	\lo, r1
+	shlr16	r1
+	shlr2	r1
+	shlr2	r1
+	or	r1, r0
+3:
+.endm
+
+/* r0 = (hi:lo, plain 64-bit) >> shift.  r1 scratch. */
+.macro EXTR0 lo, hi
+	mov	\lo, r0
+	tst	r14, r14
+	bt	3f			/* shift 0: the low word */
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	mov	\hi, r1
+	shll16	r1
+	shll2	r1
+	shll2	r1
+	or	r1, r0
+3:
+.endm
+
+/* limB\n: clamp reg to [min, 0x7fff], flag bit 25 - n.  r0 scratch. */
+.macro LIMB reg, n, min
+	mov	#-1, r0
+	shlr16	r0
+	shlr	r0			/* 0x7fff */
+	cmp/gt	r0, \reg
+	bt	5f
+	cmp/ge	\min, \reg
+	bt	7f
+	mov	\min, \reg
+	bra	6f
+	 nop
+5:	mov	r0, \reg
+6:	mov	#0x40, r0
+	shll16	r0
+	.if \n == 1
+	shll2	r0
+	.elseif \n == 2
+	shll	r0
+	.endif
+	or	r0, r3
+7:
+.endm
+
+/* limC\n on reg >> 4 into byte n-1 of r12, flag bit 22 - n.  reg destroyed. */
+.macro LIMC reg, n
+	mov	#-4, r0
+	shad	r0, \reg
+	mov	#-1, r0
+	extu.b	r0, r0			/* 255 */
+	cmp/hi	r0, \reg
+	bf	2f
+	cmp/pz	\reg
+	bt	1f
+	mov	#0, \reg
+	bra	3f
+	 nop
+1:	mov	r0, \reg
+3:	.if \n == 1
+	mov	#0x20, r0
+	.elseif \n == 2
+	mov	#0x10, r0
+	.else
+	mov	#8, r0
+	.endif
+	shll16	r0
+	or	r0, r3
+2:	.if \n == 1
+	mov	\reg, r12
+	.elseif \n == 2
+	shll8	\reg
+	or	\reg, r12
+	.else
+	shll16	\reg
+	or	\reg, r12
+	.endif
+.endm
+
+/* r13 = lm's low bound from the op word at @(off, r15).  r0, r1 scratch. */
+.macro LMB off
+	mov.l	@(\off, r15), r0
+	mov	#4, r1
+	shll8	r1			/* 1 << 10 */
+	tst	r1, r0
+	movt	r13
+	neg	r13, r13		/* -1 when lm == 0 */
+	mov	#1, r0
+	shll16	r0
+	shlr	r0
+	neg	r0, r0			/* -0x8000 */
+	and	r0, r13
+.endm
+
+/* RGB0 = RGB1, RGB1 = RGB2 */
+.macro SHIFT_RGB
+	mov.l	@(20, r6), r0
+	mov.l	r0, @(16, r6)
+	mov.l	@(24, r6), r0
+	mov.l	r0, @(20, r6)
+.endm
+
+/* The colour word in r12 gets CODE and lands at file + 64 + (r8 & 0xff). */
+.macro RGB_OUT
+	mov.l	@(24, r4), r1
+	mov	#-1, r0
+	shll16	r0
+	shll8	r0
+	and	r0, r1
+	or	r1, r12
+	mov	r8, r0
+	and	#0xff, r0
+	mov.l	r12, @(r0, r6)
+.endm
+
+/* Prologue for every integer leaf: save everything the family uses, find
+ * the file, park the op word, decode sf and lm. */
+.macro ILEAF_ENTER
+	sts.l	pr, @-r15
+	mov.l	r7, @-r15
+	mov.l	r8, @-r15
+	mov.l	r9, @-r15
+	mov.l	r10, @-r15
+	mov.l	r11, @-r15
+	mov.l	r12, @-r15
+	mov.l	r13, @-r15
+	mov.l	r14, @-r15
+	mov.l	r1, @-r15		/* the op word, @(0, r15) */
+	mov	#66, r0
+	shll2	r0			/* 264 = FGL_AT_CP2D * 4 */
+	stc	gbr, r4
+	add	r0, r4
+	mov	r4, r2
+	add	#32, r2
+	mov	r4, r6
+	add	#64, r6
+	mov	#0, r3
+	mov	#8, r0
+	shll16	r0			/* sf, 1 << 19 */
+	tst	r0, r1
+	movt	r14
+	add	#-1, r14		/* -1 when sf, else 0 */
+	shll2	r14
+	mov	r14, r0
+	add	r0, r14
+	add	r0, r14			/* -12 or 0 */
+	LMB	0
+.endm
+
+.macro ILEAF_LEAVE
+	mov.l	98f, r0
+	tst	r0, r3
+	bt	99f
+	mov	#1, r0
+	rotr	r0
+	or	r0, r3			/* the master bit */
+99:	mov	#63, r0
+	shll2	r0			/* 252 */
+	mov.l	r3, @(r0, r4)		/* FLAG */
+	add	#4, r15
+	mov.l	@r15+, r14
+	mov.l	@r15+, r13
+	mov.l	@r15+, r12
+	mov.l	@r15+, r11
+	mov.l	@r15+, r10
+	mov.l	@r15+, r9
+	mov.l	@r15+, r8
+	mov.l	@r15+, r7
+	lds.l	@r15+, pr
+	rts
+	 stc	gbr, r3			/* the guest-file base, see pins.h */
+	.align	2
+98:	.long	0x7f87e000
+.endm
+
+/* Three colour bytes of the word in r0, each << 16, into MAC1..3. */
+.macro RGB_TO_MAC16
+	mov	r0, r1
+	extu.b	r1, r1
+	shll16	r1
+	mov.l	r1, @(36, r6)
+	mov	r0, r1
+	shlr8	r1
+	extu.b	r1, r1
+	shll16	r1
+	mov.l	r1, @(40, r6)
+	mov	r0, r1
+	shlr16	r1
+	extu.b	r1, r1
+	shll16	r1
+	mov.l	r1, @(44, r6)
+.endm
+
+/* ---- SQR, OP, GPF, GPL: the three-product commands ---- */
+
+	.balign	4
+	.global	_gte_sqr_leaf
+	.type	_gte_sqr_leaf, @function
+_gte_sqr_leaf:
+	ILEAF_ENTER
+.macro SQR_COMP n
+	mov.w	@(4 * \n, r2), r0
+	mul.l	r0, r0
+	sts	macl, r5
+	shad	r14, r5
+	mov.l	r5, @(32 + 4 * \n, r6)
+	LIMB	r5, \n, r13
+	mov	r5, r0
+	mov.w	r0, @(4 * \n, r2)
+.endm
+	SQR_COMP 1
+	SQR_COMP 2
+	SQR_COMP 3
+	ILEAF_LEAVE
+	.size	_gte_sqr_leaf, . - _gte_sqr_leaf
+
+	.balign	4
+	.global	_gte_op_leaf
+	.type	_gte_op_leaf, @function
+_gte_op_leaf:
+	ILEAF_ENTER
+	mov	r4, r9
+	add	#64, r9
+	add	#64, r9			/* the rotation matrix */
+	mov.w	@(0, r9), r0
+	mov	r0, r5			/* R11 */
+	mov.w	@(8, r9), r0
+	mov	r0, r7			/* R22 */
+	mov.w	@(16, r9), r0
+	mov	r0, r8			/* R33 */
+	mov.w	@(4, r2), r0
+	mov	r0, r10			/* IR1 */
+	mov.w	@(8, r2), r0
+	mov	r0, r11			/* IR2 */
+	mov.w	@(12, r2), r0
+	mov	r0, r12			/* IR3 */
+	/* MAC1 = (R22 * IR3 - R33 * IR2) >> shift */
+	mov	r7, r9
+	mul.l	r12, r9
+	sts	macl, r9
+	mov	r8, r0
+	mul.l	r11, r0
+	sts	macl, r0
+	sub	r0, r9
+	shad	r14, r9
+	mov.l	r9, @(36, r6)
+	LIMB	r9, 1, r13
+	mov	r9, r0
+	mov.w	r0, @(4, r2)
+	/* MAC2 = (R33 * IR1 - R11 * IR3) >> shift */
+	mov	r8, r9
+	mul.l	r10, r9
+	sts	macl, r9
+	mov	r5, r0
+	mul.l	r12, r0
+	sts	macl, r0
+	sub	r0, r9
+	shad	r14, r9
+	mov.l	r9, @(40, r6)
+	LIMB	r9, 2, r13
+	mov	r9, r0
+	mov.w	r0, @(8, r2)
+	/* MAC3 = (R11 * IR2 - R22 * IR1) >> shift */
+	mov	r5, r9
+	mul.l	r11, r9
+	sts	macl, r9
+	mov	r7, r0
+	mul.l	r10, r0
+	sts	macl, r0
+	sub	r0, r9
+	shad	r14, r9
+	mov.l	r9, @(44, r6)
+	LIMB	r9, 3, r13
+	mov	r9, r0
+	mov.w	r0, @(12, r2)
+	ILEAF_LEAVE
+	.size	_gte_op_leaf, . - _gte_op_leaf
+
+	.balign	4
+	.global	_gte_gpf_leaf_old
+	.type	_gte_gpf_leaf_old, @function
+_gte_gpf_leaf_old:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+.macro GPF_COMP n
+	mov.w	@(4 * \n, r2), r0
+	mul.l	r7, r0
+	sts	macl, r5
+	shad	r14, r5
+	mov.l	r5, @(32 + 4 * \n, r6)
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+	LIMC	r5, \n
+.endm
+	GPF_COMP 1
+	GPF_COMP 2
+	GPF_COMP 3
+	mov	#24, r8
+	RGB_OUT
+	ILEAF_LEAVE
+	.size	_gte_gpf_leaf_old, . - _gte_gpf_leaf_old
+
+	.balign	4
+	.global	_gte_gpl_leaf_old
+	.type	_gte_gpl_leaf_old, @function
+_gte_gpl_leaf_old:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+.macro GPL_COMP n
+	mov.w	@(4 * \n, r2), r0
+	mul.l	r7, r0
+	sts	macl, r1		/* IR0 * IRn */
+	mov.l	@(32 + 4 * \n, r6), r10	/* MACn */
+	tst	r14, r14
+	bt	20f
+	mov	#0, r11			/* sf: (MAC << 12) + p, 44-bit checked, >> 12 */
+	MACADD	\n, r11, r10
+	bra	21f
+	 mov	r10, r5
+20:	add	r1, r10			/* no shift: plain wrapping add */
+	mov	r10, r5
+21:	mov.l	r5, @(32 + 4 * \n, r6)
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+	LIMC	r5, \n
+.endm
+	GPL_COMP 1
+	GPL_COMP 2
+	GPL_COMP 3
+	mov	#24, r8
+	RGB_OUT
+	ILEAF_LEAVE
+	.size	_gte_gpl_leaf_old, . - _gte_gpl_leaf_old
+
+/* ---- AVSZ3 / AVSZ4 ---- */
+
+/* r0 = ZSF, r5 = the SZ sum: MAC0 with its 32-bit flags, OTZ = limD. */
+gl_avsz:
+	dmuls.l	r0, r5
+	sts	macl, r5
+	sts	mach, r7
+	mov.l	r5, @(32, r6)		/* MAC0 = the low word */
+	mov	r5, r0
+	shll	r0
+	subc	r0, r0			/* sign of the low word */
+	cmp/eq	r0, r7
+	bt	1f			/* it fit */
+	cmp/pz	r7
+	bt	2f
+	mov	#1, r0
+	shll16	r0
+	shlr	r0			/* bit 15: went under */
+	bra	1f
+	 or	r0, r3
+2:	mov	#1, r0
+	shll16	r0			/* bit 16: went over */
+	or	r0, r3
+1:	mov	r5, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shll16	r7
+	shll2	r7
+	shll2	r7
+	or	r7, r0			/* (s32)(r >> 12) */
+	mov	#-1, r1
+	extu.w	r1, r1			/* 0xffff */
+	cmp/hi	r1, r0
+	bf	3f
+	cmp/pz	r0
+	bt	4f
+	mov	#0, r0
+	bra	5f
+	 nop
+4:	mov	r1, r0
+5:	mov	#4, r1
+	shll16	r1			/* bit 18 */
+	or	r1, r3
+3:	rts
+	 mov.w	r0, @(28, r4)		/* OTZ */
+
+	.balign	4
+	.global	_gte_avsz3_leaf
+	.type	_gte_avsz3_leaf, @function
+_gte_avsz3_leaf:
+	ILEAF_ENTER
+	mov.w	@(4, r6), r0
+	extu.w	r0, r5
+	mov.w	@(8, r6), r0
+	extu.w	r0, r0
+	add	r0, r5
+	mov.w	@(12, r6), r0
+	extu.w	r0, r0
+	add	r0, r5			/* SZ1 + SZ2 + SZ3 */
+	mov	r4, r9
+	add	#116, r9
+	add	#116, r9
+	mov.w	@(12, r9), r0		/* ZSF3 @244 */
+	bsr	gl_avsz
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_avsz3_leaf, . - _gte_avsz3_leaf
+
+	.balign	4
+	.global	_gte_avsz4_leaf
+	.type	_gte_avsz4_leaf, @function
+_gte_avsz4_leaf:
+	ILEAF_ENTER
+	mov.w	@(0, r6), r0
+	extu.w	r0, r5
+	mov.w	@(4, r6), r0
+	extu.w	r0, r0
+	add	r0, r5
+	mov.w	@(8, r6), r0
+	extu.w	r0, r0
+	add	r0, r5
+	mov.w	@(12, r6), r0
+	extu.w	r0, r0
+	add	r0, r5			/* SZ0 + SZ1 + SZ2 + SZ3 */
+	mov	r4, r9
+	add	#116, r9
+	add	#116, r9
+	mov.w	@(16, r9), r0		/* ZSF4 @248 */
+	bsr	gl_avsz
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_avsz4_leaf, . - _gte_avsz4_leaf
+
+/* ---- the depth cue: DPCS, INTPL, DCPL, DPCT ---- */
+
+/* One component of pcsx's runColor2 on the value in r5:
+ *   ir  = limB((FC << 12 - mac) >> shift, lm = 0)
+ *   mac = (IR0 * ir + (s64)mac) >> shift
+ * r7 = IR0, r9 = file + 212 (RFC/GFC/BFC).  r0, r1, r10, r11 scratch. */
+.macro RC2_CORE n
+	mov.l	@(4 * (\n - 1), r9), r11	/* hi = FC */
+	mov	r5, r0
+	shll16	r0
+	shll2	r0
+	shll2	r0			/* mac << 20 */
+	mov	#0, r1
+	clrt
+	subc	r0, r1			/* lo = -(mac << 20), T = borrow */
+	mov	#-12, r0
+	mov	r5, r10
+	shad	r0, r10			/* mac >> 12 */
+	movt	r0
+	add	r0, r10			/* + borrow */
+	subv	r10, r11		/* hi -= ; T = 44-bit overflow */
+	bf	8f
+	cmp/pz	r11
+	bt	1f
+	FLAG_A_POS \n
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:	mov	r11, r10
+	tst	r14, r14
+	bf	3f			/* shift 12: the high word */
+	shll8	r10
+	shll2	r10
+	shll2	r10
+	shlr16	r1
+	shlr2	r1
+	shlr2	r1
+	or	r1, r10
+3:	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1			/* -0x8000: this clamp ignores lm */
+	LIMB	r10, \n, r1
+	mul.l	r7, r10
+	sts	macl, r0		/* IR0 * ir */
+	mov	r5, r11
+	shll	r11
+	subc	r11, r11		/* sign of mac */
+	mov	r0, r10
+	shll	r10
+	subc	r10, r10		/* sign of the product */
+	clrt
+	addc	r0, r5			/* lo */
+	addc	r10, r11		/* hi */
+	tst	r14, r14
+	bt	4f			/* shift 0: the low word */
+	shlr8	r5
+	shlr2	r5
+	shlr2	r5
+	shll16	r11
+	shll2	r11
+	shll2	r11
+	or	r11, r5
+4:
+.endm
+
+.macro RC2_COMP n
+	mov.l	@(32 + 4 * \n, r6), r5
+	RC2_CORE \n
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn, every pass */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	20f			/* IR only on the writeback pass */
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+20:	LIMC	r5, \n
+.endm
+
+/* runColor2 over MAC1..3 as they stand in the file.  r8 = dest | 0x400 for
+ * the writeback pass.  Preserves r13, r14. */
+/* The same component when sf = 1 (r14 = -12), in 32 bits:
+ *   ((FC << 12) - mac) >> 12 == FC + ((-mac) >> 12), and its 44-bit
+ *   overflow is the 32-bit signed overflow of the right side (addv's T).
+ *   (mac + IR0 * ir) >> 12 fits 32 bits: |IR0 * ir| <= 2^30 and every
+ *   caller's mac is <= 2^27.
+ * r1 = -0x8000 for the whole pass (r14 is DPCT's and must survive). */
+.macro RC2_CORE_SF n
+	mov.l	@(4 * (\n - 1), r9), r11	/* FC */
+	neg	r5, r10
+	mov	#-12, r0
+	shad	r0, r10			/* (-mac) >> 12 */
+	addv	r10, r11		/* FC + that, T = 44-bit overflow */
+	bf	8f
+	cmp/pz	r11
+	bt	1f
+	FLAG_A_POS \n
+	bra	2f
+	 or	r0, r3
+1:	FLAG_A_NEG \n
+	or	r0, r3
+2:
+8:	LIMB	r11, \n, r1		/* ir, lm ignored as above */
+	mul.l	r7, r11
+	sts	macl, r0		/* IR0 * ir */
+	add	r0, r5
+	mov	#-12, r0
+	shad	r0, r5			/* mac */
+.endm
+
+.macro RC2_COMP_SF n
+	mov.l	@(32 + 4 * \n, r6), r5
+	RC2_CORE_SF \n
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn, every pass */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	20f			/* IR only on the writeback pass */
+	mov	r10, r0
+	mov.w	r0, @(4 * \n, r2)
+20:	LIMC	r5, \n
+.endm
+
+gl_rc2:
+	mov	#106, r9
+	shll	r9
+	add	r4, r9			/* file + 212 */
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+	tst	r14, r14
+	bt	gl_rc2_sf0
+	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1			/* -0x8000 */
+	RC2_COMP_SF 1
+	RC2_COMP_SF 2
+	RC2_COMP_SF 3
+	RGB_OUT
+	rts
+	 nop
+gl_rc2_sf0:
+	RC2_COMP 1
+	RC2_COMP 2
+	RC2_COMP 3
+	RGB_OUT
+	rts
+	 nop
+
+/* DPCS and INTPL, float shape: one ftrc per MAC, no 44-bit overflow
+ * flags, sf=1 assumed, only the IR saturation flags (no master bit).
+ * Clobbers r0-r6 and fr0-fr13, keeps r7-r14, r3 rebuilt from gbr.
+ *   r4 file+16 (RGBC @8, IR0 @16, IRn @16+4n)   r2 file+64 (RGB0..2 @16/20/24,
+ *   MACn @32+4n)   r1 -> FC   r5 RGBC, a byte shifted out per component
+ *   r6 the colour word   r3 FLAG
+ *   fr8 IR0/4096  fr9 32767.0  fr10 -32768.0  fr11 IR min (lm)  fr12 255.0
+ *   fr13 1/16 */
+.macro FL_ENTER
+	mov	#70, r0
+	shll2	r0			/* 280 = file + 16 */
+	stc	gbr, r4
+	add	r0, r4
+	mov	r4, r2
+	add	#48, r2			/* file + 64 */
+	mov.l	@(20, r2), r0
+	mov.l	r0, @(16, r2)		/* RGB0 = RGB1 */
+	mov.l	@(24, r2), r0
+	mov.l	r0, @(20, r2)		/* RGB1 = RGB2 */
+	mov.l	@(8, r4), r5		/* RGBC */
+	mov.l	fl_c0, r0
+	lds	r0, fpul
+	fsts	fpul, fr8		/* 1/4096 */
+	mov.l	fl_c1, r0
+	lds	r0, fpul
+	fsts	fpul, fr9		/* 32767.0 */
+	mov.l	fl_c2, r0
+	lds	r0, fpul
+	fsts	fpul, fr10		/* -32768.0 */
+	mov.l	fl_c3, r0
+	lds	r0, fpul
+	fsts	fpul, fr12		/* 255.0 */
+	mov.l	fl_c4, r0
+	lds	r0, fpul
+	fsts	fpul, fr13		/* 1/16 */
+	fmov	fr10, fr11
+	mov	r1, r0
+	shlr8	r0
+	tst	#4, r0			/* lm */
+	bt	1f
+	fldi0	fr11
+1:	mov.w	@(16, r4), r0		/* IR0 */
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr0, fr8		/* IR0 / 4096 */
+	mov	#98, r1
+	shll	r1
+	add	r4, r1			/* FC */
+	mov	#0, r3
+	mov	#0, r6
+.endm
+
+/* fr1 = lim16(FCn - fr0), then fr1 = fr0 + IR0/4096 * fr1 = MACn. */
+.macro FL_MAC
+	mov.l	@r1+, r0
+	lds	r0, fpul
+	float	fpul, fr1		/* FCn */
+	fsub	fr0, fr1
+	fcmp/gt	fr9, fr1
+	bf	1f
+	fmov	fr9, fr1
+1:	fcmp/gt	fr1, fr10
+	bf	2f
+	fmov	fr10, fr1
+2:	fmul	fr8, fr1
+	fadd	fr0, fr1
+.endm
+
+/* fr1 = MACn: store it, IRn = lim(MACn) with flag bit 25-n, byte n-1 of r6. */
+.macro FL_OUT n
+	ftrc	fr1, fpul
+	sts	fpul, r0
+	mov.l	r0, @(32 + 4 * \n, r2)	/* MACn */
+	fmov	fr1, fr0
+	fcmp/gt	fr9, fr0
+	bt	3f
+	fcmp/gt	fr0, fr11
+	bf	4f
+	bra	5f
+	 fmov	fr11, fr0
+3:	fmov	fr9, fr0
+5:	mov	#0x40, r0
+	shll16	r0
+	.if \n == 1
+	shll2	r0
+	.elseif \n == 2
+	shll	r0
+	.endif
+	or	r0, r3
+4:	ftrc	fr0, fpul
+	sts	fpul, r0
+	mov.w	r0, @(16 + 4 * \n, r4)	/* IRn */
+	fmul	fr13, fr1		/* MAC / 16 */
+	fcmp/gt	fr12, fr1
+	bf	6f
+	fmov	fr12, fr1
+6:	fldi0	fr0
+	fcmp/gt	fr0, fr1
+	bt	7f
+	fmov	fr0, fr1
+7:	ftrc	fr1, fpul
+	sts	fpul, r0
+	.if \n == 2
+	shll8	r0
+	.elseif \n == 3
+	shll16	r0
+	.endif
+	or	r0, r6
+.endm
+
+/* r5 holds CODE in its low byte. */
+.macro FL_LEAVE
+	shll16	r5
+	shll8	r5
+	or	r5, r6
+	mov.l	r6, @(24, r2)		/* RGB2 */
+	mov	#59, r0
+	shll2	r0			/* 236 = FLAG - 16 */
+	mov.l	r3, @(r0, r4)
+	rts
+	 stc	gbr, r3
+.endm
+
+	.balign	4
+	.global	_gte_dpcs_leaf_old
+	.type	_gte_dpcs_leaf_old, @function
+_gte_dpcs_leaf_old:
+	FL_ENTER
+.macro FLD_COMP n
+	extu.b	r5, r0
+	shlr8	r5
+	shll2	r0
+	shll2	r0
+	lds	r0, fpul
+	float	fpul, fr0		/* 16 * Cn */
+	FL_MAC
+	FL_OUT \n
+.endm
+	FLD_COMP 1
+	FLD_COMP 2
+	FLD_COMP 3
+	FL_LEAVE
+	.size	_gte_dpcs_leaf_old, . - _gte_dpcs_leaf_old
+
+	.balign	4
+	.global	_gte_intpl_leaf_old
+	.type	_gte_intpl_leaf_old, @function
+_gte_intpl_leaf_old:
+	FL_ENTER
+	shlr16	r5
+	shlr8	r5			/* CODE */
+.macro FLI_COMP n
+	mov.w	@(16 + 4 * \n, r4), r0
+	lds	r0, fpul
+	float	fpul, fr0		/* IRn */
+	FL_MAC
+	FL_OUT \n
+.endm
+	FLI_COMP 1
+	FLI_COMP 2
+	FLI_COMP 3
+	FL_LEAVE
+	.size	_gte_intpl_leaf_old, . - _gte_intpl_leaf_old
+
+	.align	2
+fl_c0:	.long	0x39800000		/* 1/4096 */
+fl_c1:	.long	0x46fffe00		/* 32767.0 */
+fl_c2:	.long	0xc7000000		/* -32768.0 */
+fl_c3:	.long	0x437f0000		/* 255.0 */
+fl_c4:	.long	0x3d800000		/* 1/16 */
+
+
+	.balign	4
+	.global	_gte_dcpl_leaf
+	.type	_gte_dcpl_leaf, @function
+_gte_dcpl_leaf:
+	ILEAF_ENTER
+	SHIFT_RGB
+.macro DCPL_MAC n
+	mov.w	@(4 * \n, r2), r0
+	mov	r0, r5
+	mov.l	@(24, r4), r0
+	.if \n == 2
+	shlr8	r0
+	.elseif \n == 3
+	shlr16	r0
+	.endif
+	extu.b	r0, r0
+	mul.l	r5, r0
+	sts	macl, r0
+	shll2	r0
+	shll2	r0			/* (C * IRn) << 4 */
+	mov.l	r0, @(32 + 4 * \n, r6)
+.endm
+	DCPL_MAC 1
+	DCPL_MAC 2
+	DCPL_MAC 3
+	mov	#4, r8
+	shll8	r8
+	add	#24, r8
+	bsr	gl_rc2
+	 nop
+	ILEAF_LEAVE
+	.size	_gte_dcpl_leaf, . - _gte_dcpl_leaf
+
+	.balign	4
+	.global	_gte_dpct_leaf
+	.type	_gte_dpct_leaf, @function
+_gte_dpct_leaf:
+	ILEAF_ENTER
+.macro DPCT_PASS v, wb
+	mov.l	@(16 + 4 * \v, r6), r0	/* RGBv, as the previous pass left it */
+	RGB_TO_MAC16
+	mov	#16 + 4 * \v, r8
+	.if \wb
+	mov	#4, r0
+	shll8	r0
+	or	r0, r8
+	.endif
+	bsr	gl_rc2
+	 nop
+.endm
+	DPCT_PASS 0, 0
+	DPCT_PASS 1, 0
+	DPCT_PASS 2, 1
+	ILEAF_LEAVE
+	.size	_gte_dpct_leaf, . - _gte_dpct_leaf
+
+/* ---- the shared core and the flag write ---- */
+
+	.align	2
+gl_zeros:
+	.long	0, 0, 0
+
+/* pcsx's gteMAC123f: MAC1..3 = (t << 12 + m * v) >> shift, 44-bit overflow
+ * flags per addend, written to the file.
+ *   r5 = the vector (three s16), r1 = its stride (2: V0..2, 4: IR1..3)
+ *   r7 = the matrix, nine s16 in a row     r11 = the translation, 3 x s32
+ * Clobbers r0, r1, r5, r7, r9, r10, r11, r12, r13.  Preserves r8. */
+.macro MACROW n
+	mov.l	@r11+, r13		/* hi = t: t << 12 in x 2^20 form */
+	mov	#0, r12
+	mov.w	@r7+, r1
+	mul.l	r9, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	mov.w	@r7+, r1
+	mul.l	r10, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	mov.w	@r7+, r1
+	mul.l	r5, r1
+	sts	macl, r1
+	MACADD	\n, r12, r13
+	EXTR20	r12, r13
+	mov.l	r0, @(32 + 4 * \n, r6)
+.endm
+
+gl_mac123f:
+	mov.w	@r5, r9
+	add	r1, r5
+	mov.w	@r5, r10
+	add	r1, r5
+	mov.w	@r5, r5			/* vx r9, vy r10, vz r5 */
+	MACROW 1
+	MACROW 2
+	MACROW 3
+	rts
+	 nop
+
+/* ---- the lighting family ---- */
+
+/* One component of pcsx's runColor1 after the colour matrix.  r5 = MACn;
+ * r8 = dest | 0x100 (ncc: modulate) | 0x200 (ncd: modulate, then depth
+ * cue) | 0x400 (writeback: MAC, IR). */
+.macro RC1_COMP n
+	mov.l	@(32 + 4 * \n, r6), r5
+	mov	r8, r0
+	shlr8	r0
+	tst	#3, r0
+	bt	20f			/* NCS: the colour stage is the result */
+	mov	r5, r10
+	LIMB	r10, \n, r13		/* ir = limB(mac, lm) */
+	mov.l	@(24, r4), r0
+	.if \n == 2
+	shlr8	r0
+	.elseif \n == 3
+	shlr16	r0
+	.endif
+	extu.b	r0, r0
+	mul.l	r10, r0
+	sts	macl, r5
+	shll2	r5
+	shll2	r5			/* (C * ir) << 4 */
+	mov	r8, r0
+	shlr8	r0
+	tst	#2, r0
+	bf	21f
+	bra	20f
+	 shad	r14, r5			/* NCC: >> shift */
+21:	RC2_CORE \n			/* NCD: the depth cue */
+20:	mov	r8, r0
+	shlr8	r0
+	tst	#4, r0
+	bt	22f
+	mov.l	r5, @(32 + 4 * \n, r6)	/* MACn */
+	mov	r5, r10
+	LIMB	r10, \n, r13
+	mov	r10, r0
+	bra	23f
+	 mov.w	r0, @(4 * \n, r2)	/* IRn */
+22:	mov	r5, r10
+	LIMB	r10, \n, r13		/* flags only */
+23:	LIMC	r5, \n
+.endm
+
+/* CC / CDP enter here: the colour matrix on IR as it stands. */
+gl_rc3:
+	sts.l	pr, @-r15
+	bra	gl_rc1_c
+	 nop
+
+/* One vertex of NCS/NCT/NCCS/NCCT/NCDS/NCDT: r5 = the vertex, r1 = 2,
+ * r8 = dest | mode bits. */
+gl_rc1:
+	sts.l	pr, @-r15
+	mov	r4, r7
+	add	#80, r7
+	add	#80, r7			/* the light matrix @160 */
+	mov.l	92f, r11		/* no translation */
+	bsr	gl_mac123f
+	 nop
+	bra	93f
+	 nop
+	.align	2
+92:	.long	gl_zeros
+93:	LMB	4
+	mov.l	@(36, r6), r5
+	LIMB	r5, 1, r13
+	mov	r5, r0
+	mov.w	r0, @(4, r2)
+	mov.l	@(40, r6), r5
+	LIMB	r5, 2, r13
+	mov	r5, r0
+	mov.w	r0, @(8, r2)
+	mov.l	@(44, r6), r5
+	LIMB	r5, 3, r13
+	mov	r5, r0
+	mov.w	r0, @(12, r2)		/* IR = limB(light), the next vector */
+gl_rc1_c:
+	mov	r2, r5
+	add	#4, r5
+	mov	#4, r1
+	mov	r4, r7
+	add	#96, r7
+	add	#96, r7			/* the colour matrix @192 */
+	mov	r4, r11
+	add	#90, r11
+	add	#90, r11		/* the background colour @180 */
+	bsr	gl_mac123f
+	 nop
+	LMB	4
+	mov	#106, r9
+	shll	r9
+	add	r4, r9			/* the far colour @212 */
+	mov.w	@r2, r7			/* IR0 */
+	mov	#0, r12
+	RC1_COMP 1
+	RC1_COMP 2
+	RC1_COMP 3
+	RGB_OUT
+	lds.l	@r15+, pr
+	rts
+	 nop
+
+.macro LIGHT_LEAF name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov	r4, r5			/* V0 */
+	mov	#2, r1
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8			/* RGB2 */
+	bsr	gl_rc1
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+.macro LIGHT_LEAF_T name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	mov	r4, r5
+	mov	#2, r1
+	mov	#\mode - 4, r8
+	shll8	r8
+	add	#16, r8			/* RGB0, no writeback */
+	bsr	gl_rc1
+	 nop
+	mov	r4, r5
+	add	#8, r5
+	mov	#2, r1
+	mov	#\mode - 4, r8
+	shll8	r8
+	add	#20, r8			/* RGB1 */
+	bsr	gl_rc1
+	 nop
+	mov	r4, r5
+	add	#16, r5
+	mov	#2, r1
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8			/* RGB2, writeback */
+	bsr	gl_rc1
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+.macro COLOUR_LEAF name, mode
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	ILEAF_ENTER
+	SHIFT_RGB
+	mov	#\mode, r8
+	shll8	r8
+	add	#24, r8
+	bsr	gl_rc3
+	 nop
+	ILEAF_LEAVE
+	.size	\name, . - \name
+.endm
+
+	LIGHT_LEAF   _gte_ncs_leaf,  4		/* 0x400 */
+	LIGHT_LEAF_T _gte_nct_leaf,  4
+	LIGHT_LEAF   _gte_nccs_leaf, 5		/* 0x100 | 0x400 */
+	LIGHT_LEAF_T _gte_ncct_leaf, 5
+	LIGHT_LEAF   _gte_ncds_leaf, 6		/* 0x200 | 0x400 */
+	LIGHT_LEAF_T _gte_ncdt_leaf, 6
+	COLOUR_LEAF  _gte_cc_leaf_old,   5
+	COLOUR_LEAF  _gte_cdp_leaf,  6
+
+/* ---- MVMVA ---- */
+
+/* pcsx's bugged form for cv == 2 (far colour as translation): first column
+ * with translation and flags, the other two alone.  r5, r1, r7, r11 as
+ * gl_mac123f; r13 = lm's bound. */
+.macro BUGROW n
+	mov.l	@r11+, r8		/* hi = FC */
+	mov	#0, r12
+	mov.w	@r7+, r1
+	mul.l	r9, r1
+	sts	macl, r1
+	MACADD	\n, r12, r8
+	EXTR20	r12, r8
+	mov	r0, r12
+	mov	#1, r1
+	shll16	r1
+	shlr	r1
+	neg	r1, r1
+	LIMB	r12, \n, r1		/* flags only, lm = 0 */
+	mov.w	@r7+, r1
+	mul.l	r10, r1
+	sts	macl, r12		/* m * vy */
+	mov.w	@r7+, r1
+	mul.l	r5, r1
+	sts	macl, r1		/* m * vz */
+	mov	r12, r8
+	shll	r8
+	subc	r8, r8
+	mov	r1, r0
+	shll	r0
+	subc	r0, r0
+	clrt
+	addc	r1, r12
+	addc	r0, r8			/* the 64-bit sum */
+	EXTR0	r12, r8
+	mov.l	r0, @(32 + 4 * \n, r6)
+	mov	r0, r12
+	LIMB	r12, \n, r13
+	mov	r12, r0
+	mov.w	r0, @(4 * \n, r2)
+.endm
+
+gl_mvmva_bug:
+	mov.w	@r5, r9
+	add	r1, r5
+	mov.w	@r5, r10
+	add	r1, r5
+	mov.w	@r5, r5
+	BUGROW 1
+	BUGROW 2
+	BUGROW 3
+	rts
+	 nop
+
+	.balign	4
+	.global	_gte_mvmva_leaf_old
+	.type	_gte_mvmva_leaf_old, @function
+_gte_mvmva_leaf_old:
+	ILEAF_ENTER
+	add	#-20, r15		/* room for the bugged matrix; op @(20,r15) */
+	mov.l	@(20, r15), r8		/* the op word (r1 is scratch by now) */
+	/* the vector: V0..2 at file + 8v, or IR1..3 */
+	mov	r8, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0
+	cmp/eq	#3, r0
+	bt	1f
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	mov	r0, r5
+	bra	2f
+	 mov	#2, r1
+1:	mov	r2, r5
+	add	#4, r5
+	mov	#4, r1
+2:	/* the matrix: 32 bytes each from file + 128, or the bugged one */
+	mov	r8, r0
+	shlr16	r0
+	shlr	r0
+	and	#3, r0
+	cmp/eq	#3, r0
+	bt	3f
+	shll2	r0
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	add	#64, r0
+	add	#64, r0
+	bra	4f
+	 mov	r0, r7
+3:	mov.l	@(24, r4), r0
+	extu.b	r0, r0
+	shll2	r0
+	shll2	r0			/* R << 4 */
+	mov.w	r0, @(2, r15)
+	neg	r0, r0
+	mov.w	r0, @(0, r15)
+	mov.w	@r2, r0
+	mov.w	r0, @(4, r15)		/* IR0 */
+	mov	r4, r7
+	add	#64, r7
+	add	#64, r7
+	mov.w	@(4, r7), r0		/* R13 */
+	mov.w	r0, @(6, r15)
+	mov.w	r0, @(8, r15)
+	mov.w	r0, @(10, r15)
+	mov.w	@(8, r7), r0		/* R22 */
+	mov.w	r0, @(12, r15)
+	mov.w	r0, @(14, r15)
+	mov.w	r0, @(16, r15)
+	mov	r15, r7
+4:	/* the translation: 32 bytes each from file + 148, none, or bugged */
+	mov	r8, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	shlr	r0
+	and	#3, r0
+	cmp/eq	#3, r0
+	bt	35f
+	cmp/eq	#2, r0
+	bt	37f
+	shll2	r0
+	shll2	r0
+	shll	r0
+	add	r4, r0
+	add	#74, r0
+	add	#74, r0
+	bra	36f
+	 mov	r0, r11
+35:	mov.l	92f, r11
+36:	bsr	gl_mac123f
+	 nop
+	bra	93f
+	 nop
+	.align	2
+92:	.long	gl_zeros
+93:	LMB	20
+	mov.l	@(36, r6), r5
+	LIMB	r5, 1, r13
+	mov	r5, r0
+	mov.w	r0, @(4, r2)
+	mov.l	@(40, r6), r5
+	LIMB	r5, 2, r13
+	mov	r5, r0
+	mov.w	r0, @(8, r2)
+	mov.l	@(44, r6), r5
+	LIMB	r5, 3, r13
+	mov	r5, r0
+	bra	38f
+	 mov.w	r0, @(12, r2)
+37:	mov	#106, r11
+	shll	r11
+	add	r4, r11			/* the far colour */
+	bsr	gl_mvmva_bug
+	 nop
+38:	add	#20, r15
+	ILEAF_LEAVE
+	.size	_gte_mvmva_leaf_old, . - _gte_mvmva_leaf_old
+
+
+/* Float-shaped leaves: GBR-relative, one flag word in r6, IEEE single
+ * intermediates, no MAC overflow bits.  Each clobbers r0-r6, r3 == GBR out.
+ * file = GBR + 264: V0 264  RGBC 288  IR0 296  IR1..3 300/304/308
+ * SXY0..2 312/316/320  RGB0..2 344/348/352  MAC0 360  MAC1..3 364/368/372
+ * RT 392  TR 412  LLM 424  BK 444  LCM 456  FC 476/480/484  FLAG 516 */
+
+/* ---- NCLIP: one fipr (§9) ---- */
+	.balign	4
+	.global	_gte_nclip_leaf
+	.type	_gte_nclip_leaf, @function
+_gte_nclip_leaf:
+	mov.w	@(312, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr4		/* SX0 */
+	mov.w	@(314, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr10		/* SY0 */
+	mov.w	@(316, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr5		/* SX1 */
+	mov.w	@(318, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr8		/* SY1 */
+	mov.w	@(320, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr6		/* SX2 */
+	mov.w	@(322, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr9		/* SY2 */
+	fmov	fr8, fr1
+	fsub	fr9, fr8		/* SY1 - SY2 */
+	fsub	fr10, fr9		/* SY2 - SY0 */
+	fsub	fr1, fr10		/* SY0 - SY1 */
+	fldi0	fr7
+	fldi0	fr11
+	fipr	fv4, fv8
+	ftrc	fr11, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360, gbr)		/* MAC0 */
+	mov	#0, r0
+	rts
+	 mov.l	r0, @(516, gbr)
+	.size	_gte_nclip_leaf, . - _gte_nclip_leaf
+
+/* ---- DPCS / INTPL: dpq_stage + colour_tail (§13.1), integer ---- */
+
+/* r1 = the colour term (16*Cn or IRn), r3 = IR0, r2 -> RGB2, r6 = FLAG. */
+.macro DQ_COMP p, n
+	mov.l	@(472 + 4 * \n, gbr), r0	/* FCn */
+	sub	r1, r0
+	exts.w	r0, r4				/* limB: does it fit in int16? */
+	cmp/eq	r0, r4
+	bf	.L\p\()d\n
+.L\p\()dr\n:
+	mul.l	r3, r0
+	sts	macl, r0
+	mov	#-12, r4
+	shad	r4, r0
+	add	r1, r0				/* MACn */
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	exts.w	r0, r4
+	cmp/eq	r0, r4
+	bf	.L\p\()i\n
+.L\p\()ir\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)	/* IRn */
+	mov	#-4, r4
+	shad	r4, r0
+	/* limC into [0,255].  The unsigned compare catches the negative side
+	 * too -- a negative r0 is a huge unsigned, so it is > (r0 & 0xff). */
+	extu.b	r0, r4
+	cmp/hi	r4, r0
+	bt	.L\p\()c\n
+.L\p\()cr\n:
+	mov.b	r0, @(\n - 1, r2)
+.endm
+
+/* The fast path now tests "fits in int16" in one compare, so the bound is no
+ * longer sitting in r4 and each stub picks it from the sign instead.  mov.w
+ * leaves T alone, so it can be slotted between the cmp/pz and the branch. */
+.macro DQ_STUBS p, n
+.L\p\()d\n:
+	mov.l	.L\p\()f\n, r4
+	or	r4, r6
+	cmp/pz	r0
+	mov.w	.L\p\()k8000, r4
+	bf	.L\p\()dn\n
+	mov.w	.L\p\()k7fff, r4
+.L\p\()dn\n:
+	bra	.L\p\()dr\n
+	 mov	r4, r0
+.L\p\()i\n:
+	mov.l	.L\p\()f\n, r4
+	or	r4, r6
+	cmp/pz	r0
+	mov.w	.L\p\()k8000, r4
+	bf	.L\p\()in\n
+	mov.w	.L\p\()k7fff, r4
+.L\p\()in\n:
+	bra	.L\p\()ir\n
+	 mov	r4, r0
+.L\p\()c\n:
+	mov.l	.L\p\()g\n, r4
+	or	r4, r6
+	cmp/pz	r0			/* T decides 255 (positive) or 0 */
+	mov	#-31, r4
+	rotcr	r0
+	bra	.L\p\()cr\n
+	 shad	r4, r0
+.endm
+
+.macro DQ_POOL p
+.L\p\()k7fff:	.word	0x7fff
+.L\p\()k8000:	.word	0x8000
+.L\p\()k352:	.word	352
+	.align	2
+.L\p\()f1:	.long	0x81000000
+.L\p\()f2:	.long	0x80800000
+.L\p\()f3:	.long	0x00400000
+.L\p\()g1:	.long	0x00200000
+.L\p\()g2:	.long	0x00100000
+.L\p\()g3:	.long	0x00080000
+.endm
+
+/* RGB0 <- RGB1 <- RGB2 <- RGBC (whole word, CODE included), r2 -> RGB2. */
+.macro CT_FIFO p
+	stc	gbr, r2
+	mov.w	.L\p\()k352, r0
+	add	r0, r2
+	mov.l	@(348, gbr), r0
+	mov.l	r0, @(344, gbr)
+	mov.l	@(352, gbr), r0
+	mov.l	r0, @(348, gbr)
+	mov.l	@(288, gbr), r0
+	mov.l	r0, @(352, gbr)
+.endm
+
+	.balign	4
+	.global	_gte_dpcs_leaf
+	.type	_gte_dpcs_leaf, @function
+_gte_dpcs_leaf:
+	CT_FIFO	dp
+	mov	r0, r5				/* RGBC */
+	mov.w	@(296, gbr), r0
+	mov	r0, r3				/* IR0 */
+	mov	#0, r6
+	extu.b	r5, r1
+	shll2	r1
+	shll2	r1
+	DQ_COMP	dp, 1
+	shlr8	r5
+	extu.b	r5, r1
+	shll2	r1
+	shll2	r1
+	DQ_COMP	dp, 2
+	shlr8	r5
+	extu.b	r5, r1
+	shll2	r1
+	shll2	r1
+	DQ_COMP	dp, 3
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	DQ_STUBS dp, 1
+	DQ_STUBS dp, 2
+	DQ_STUBS dp, 3
+	DQ_POOL	dp
+	.size	_gte_dpcs_leaf, . - _gte_dpcs_leaf
+
+	.balign	4
+	.global	_gte_intpl_leaf
+	.type	_gte_intpl_leaf, @function
+_gte_intpl_leaf:
+	CT_FIFO	ip
+	mov.w	@(296, gbr), r0
+	mov	r0, r3				/* IR0 */
+	mov	#0, r6
+	mov.w	@(300, gbr), r0
+	mov	r0, r1
+	DQ_COMP	ip, 1
+	mov.w	@(304, gbr), r0
+	mov	r0, r1
+	DQ_COMP	ip, 2
+	mov.w	@(308, gbr), r0
+	mov	r0, r1
+	DQ_COMP	ip, 3
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	DQ_STUBS ip, 1
+	DQ_STUBS ip, 2
+	DQ_STUBS ip, 3
+	DQ_POOL	ip
+	.size	_gte_intpl_leaf, . - _gte_intpl_leaf
+
+/* ---- GPF / GPL (§11), integer ---- */
+
+/* r3 = IR0, r5 = -12 (sf) or 0, r2 -> RGB2, r6 = FLAG.  acc: GPL adds MACn. */
+.macro GP_COMP p, n, acc
+	mov.w	@(296 + 4 * \n, gbr), r0
+	mul.l	r3, r0
+	sts	macl, r0
+	shad	r5, r0
+	.if \acc
+	mov	r0, r4
+	mov.l	@(360 + 4 * \n, gbr), r0
+	add	r4, r0
+	.endif
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	exts.w	r0, r4				/* limB */
+	cmp/eq	r0, r4
+	bf	.L\p\()b\n
+.L\p\()ir\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)
+	mov	#-4, r4
+	shad	r4, r0				/* arithmetic, so limC sees the sign */
+	extu.b	r0, r4
+	cmp/hi	r4, r0
+	bt	.L\p\()c\n
+.L\p\()cr\n:
+	mov.b	r0, @(\n - 1, r2)
+.endm
+
+.macro GP_STUBS p, n
+.L\p\()b\n:
+	mov.l	.L\p\()f\n, r4
+	or	r4, r6
+	cmp/pz	r0
+	mov.w	.L\p\()k8000, r4
+	bf	.L\p\()bn\n
+	mov.w	.L\p\()k7fff, r4
+.L\p\()bn\n:
+	bra	.L\p\()ir\n
+	 mov	r4, r0
+.L\p\()c\n:
+	mov.l	.L\p\()g\n, r4
+	or	r4, r6
+	cmp/pz	r0			/* T decides 255 (positive) or 0 */
+	mov	#-31, r4
+	rotcr	r0
+	bra	.L\p\()cr\n
+	 shad	r4, r0
+.endm
+
+.macro GP_LEAF name, p, acc
+	.balign	4
+	.global	\name
+	.type	\name, @function
+\name:
+	CT_FIFO	\p
+	mov.w	@(296, gbr), r0
+	mov	r0, r3				/* IR0 */
+	mov	r1, r0
+	shlr16	r0
+	tst	#8, r0				/* sf */
+	mov	#0, r5
+	bt	1f
+	mov	#-12, r5
+1:	mov	#0, r6
+	GP_COMP	\p, 1, \acc
+	GP_COMP	\p, 2, \acc
+	GP_COMP	\p, 3, \acc
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	GP_STUBS \p, 1
+	GP_STUBS \p, 2
+	GP_STUBS \p, 3
+	DQ_POOL	\p
+	.size	\name, . - \name
+.endm
+
+	GP_LEAF	_gte_gpf_leaf, gf, 0
+	GP_LEAF	_gte_gpl_leaf, gl, 1
+
+/* ---- CC (§12): BK + LCM*IR/4096 by fmac, float clamp, x RGBC/256 ---- */
+
+/* one column j of LCM into fr4-6 and fmac with fr0 = IRj/4096 */
+.macro CC_COL a, b, c
+	mov.w	@(\a, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(\b, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(\c, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+.endm
+
+/* clamp fr(7+n) to [0, 32767] in float, flags */
+.macro CC_LIM n, f
+	ftrc	\f, fpul
+	sts	fpul, r0
+	cmp/pz	r0
+	bf	.Lcclo\n
+	cmp/hi	r1, r0
+	bt	.Lcchi\n
+.Lccb\n:
+.endm
+
+/* colour_tail, one component from fr(7+n) */
+.macro CC_OUT n, f
+	ftrc	\f, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	cmp/gt	r1, r0
+	bt	.Lcchi2\n
+	cmp/ge	r5, r0
+	bf	.Lcclo2\n
+.Lccir\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)
+	shad	r3, r0
+	cmp/pz	r0
+	bf	.Lccc\n
+	extu.b	r0, r4
+	cmp/hi	r4, r0
+	bt	.Lccc\n
+.Lcccr\n:
+	mov.b	r0, @(\n - 1, r2)
+.endm
+
+.macro CC_STUBS_LIM n, f
+.Lcclo\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	bra	.Lccb\n
+	 fldi0	\f
+.Lcchi\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	mov.l	.Lcc32767, r0
+	lds	r0, fpul
+	bra	.Lccb\n
+	 fsts	fpul, \f
+.endm
+
+.macro CC_STUBS n, f
+.Lcchi2\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	bra	.Lccir\n
+	 mov	r1, r0
+.Lcclo2\n:
+	mov.l	.Lccf\n, r0
+	or	r0, r6
+	bra	.Lccir\n
+	 mov	r5, r0
+.Lccc\n:
+	mov.l	.Lccg\n, r4
+	or	r4, r6
+	mov	#-31, r4
+	rotcr	r0
+	bra	.Lcccr\n
+	 shad	r4, r0
+.endm
+
+	.balign	4
+	.global	_gte_cc_leaf
+	.type	_gte_cc_leaf, @function
+_gte_cc_leaf:
+	mov.l	@(444, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr8		/* RBK */
+	mov.l	@(448, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr9
+	mov.l	@(452, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr10
+	mov.l	.Lcc4096, r0
+	lds	r0, fpul
+	fsts	fpul, fr3		/* 1/4096 */
+	mov.w	@(300, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr3, fr0		/* IR1/4096 */
+	CC_COL	456, 462, 468		/* L11 L21 L31 */
+	mov.w	@(304, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr3, fr0
+	CC_COL	458, 464, 470
+	mov.w	@(308, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	fmul	fr3, fr0
+	CC_COL	460, 466, 472
+	mov	#0, r6
+	mov.w	.Lcck7fff, r1
+	mov.l	.Lcc256, r0
+	lds	r0, fpul
+	fsts	fpul, fr3		/* 1/256 */
+	mov.l	@(288, gbr), r0
+	mov	r0, r5			/* RGBC */
+	extu.b	r5, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	fmul	fr3, fr4
+	fmul	fr4, fr8
+	shlr8	r5
+	extu.b	r5, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	fmul	fr3, fr4
+	fmul	fr4, fr9
+	shlr8	r5
+	extu.b	r5, r0
+	lds	r0, fpul
+	float	fpul, fr4
+	fmul	fr3, fr4
+	fmul	fr4, fr10
+	CT_FIFO	cc
+	mov.w	.Lcck8000, r5
+	mov	#-4, r3
+	CC_OUT	1, fr8
+	CC_OUT	2, fr9
+	CC_OUT	3, fr10
+	mov	r6, r0
+	mov.l	r0, @(516, gbr)
+	rts
+	 stc	gbr, r3
+	CC_STUBS 1, fr8
+	CC_STUBS 2, fr9
+	CC_STUBS 3, fr10
+	DQ_POOL	cc
+.Lcc4096:	.long	0x39800000
+.Lcc256:	.long	0x3b800000
+.Lcc32767:	.long	0x46fffe00
+	.size	_gte_cc_leaf, . - _gte_cc_leaf
+
+/* ---- MVMVA (§6), scalar fmac, matrix reloaded every call as bleem does ---- */
+	.balign	4
+	.global	_gte_mvmva_leaf
+	.type	_gte_mvmva_leaf, @function
+_gte_mvmva_leaf:
+	stc	gbr, r2
+	mov	r1, r0
+	shlr8	r0
+	shlr2	r0
+	shlr2	r0
+	mov	r0, r6			/* op >> 12: mx*32 in 0x60, vv*8 in 0x18, sf in 0x80 */
+	/* matrix: 3 -> RT */
+	and	#0x60, r0
+	cmp/eq	#0x60, r0
+	bf	1f
+	mov	#0, r0
+1:	mov.w	.Lmvk392, r4
+	add	r0, r4
+	add	r2, r4
+	/* translation: cv*32 = (op >> 8) & 0x60, 3 -> none */
+	mov	r1, r0
+	shlr8	r0
+	and	#0x60, r0
+	cmp/eq	#0x60, r0
+	bt	2f
+	mov.w	.Lmvk412, r5
+	add	r0, r5
+	add	r2, r5
+	mov.l	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr8
+	mov.l	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr9
+	mov.l	@r5, r0
+	lds	r0, fpul
+	bra	3f
+	 float	fpul, fr10
+2:	fldi0	fr8
+	fldi0	fr9
+	fldi0	fr10
+3:	/* vector: 3 -> IR */
+	mov	r6, r0
+	and	#0x18, r0
+	cmp/eq	#0x18, r0
+	bt	4f
+	mov.w	.Lmvk264, r5
+	add	r0, r5
+	add	r2, r5
+	mov.w	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr0
+	mov.w	@r5+, r0
+	lds	r0, fpul
+	float	fpul, fr1
+	mov.w	@r5, r0
+	lds	r0, fpul
+	bra	5f
+	 float	fpul, fr2
+4:	mov.w	@(300, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr0
+	mov.w	@(304, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr1
+	mov.w	@(308, gbr), r0
+	lds	r0, fpul
+	float	fpul, fr2
+5:	/* sf: prescale V by 1/4096, else TR by 4096 */
+	mov	r6, r0
+	tst	#0x80, r0
+	mov.l	.Lmv4096i, r0
+	bt	6f
+	lds	r0, fpul
+	fsts	fpul, fr3
+	fmul	fr3, fr0
+	fmul	fr3, fr1
+	bra	7f
+	 fmul	fr3, fr2
+6:	mov.l	.Lmv4096f, r0
+	lds	r0, fpul
+	fsts	fpul, fr3
+	fmul	fr3, fr8
+	fmul	fr3, fr9
+	fmul	fr3, fr10
+7:	/* MAC_i += M(i,j) V_j, column by column; fr0 is the multiplier */
+	mov.w	@(0, r4), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(6, r4), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(12, r4), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+	fmov	fr1, fr0
+	mov.w	@(2, r4), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(8, r4), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(14, r4), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+	fmov	fr2, fr0
+	mov.w	@(4, r4), r0
+	lds	r0, fpul
+	float	fpul, fr4
+	mov.w	@(10, r4), r0
+	lds	r0, fpul
+	float	fpul, fr5
+	mov.w	@(16, r4), r0
+	lds	r0, fpul
+	float	fpul, fr6
+	fmac	fr0, fr4, fr8
+	fmac	fr0, fr5, fr9
+	fmac	fr0, fr6, fr10
+	/* lm: lower bound 0 or -0x8000 */
+	mov	r1, r0
+	shlr8	r0
+	tst	#4, r0
+	mov.w	.Lmvk8000, r5
+	bt	8f
+	mov	#0, r5
+8:	mov.w	.Lmvk7fff, r4
+	mov	#0, r6
+.macro MV_OUT n, f
+	ftrc	\f, fpul
+	sts	fpul, r0
+	mov.l	r0, @(360 + 4 * \n, gbr)
+	cmp/gt	r4, r0
+	bt	.Lmvhi\n
+	cmp/ge	r5, r0
+	bf	.Lmvlo\n
+.Lmvb\n:
+	mov.w	r0, @(296 + 4 * \n, gbr)
+.endm
+	MV_OUT	1, fr8
+	MV_OUT	2, fr9
+	MV_OUT	3, fr10
+	mov	r6, r0
+	rts
+	 mov.l	r0, @(516, gbr)
+.macro MV_STUBS n
+.Lmvhi\n:
+	mov.l	.Lmvf\n, r0
+	or	r0, r6
+	bra	.Lmvb\n
+	 mov	r4, r0
+.Lmvlo\n:
+	mov.l	.Lmvf\n, r0
+	or	r0, r6
+	bra	.Lmvb\n
+	 mov	r5, r0
+.endm
+	MV_STUBS 1
+	MV_STUBS 2
+	MV_STUBS 3
+.Lmvk392:	.word	392
+.Lmvk412:	.word	412
+.Lmvk264:	.word	264
+.Lmvk7fff:	.word	0x7fff
+.Lmvk8000:	.word	0x8000
+	.align	2
+.Lmv4096i:	.long	0x39800000
+.Lmv4096f:	.long	0x45800000
+.Lmvf1:	.long	0x81000000
+.Lmvf2:	.long	0x80800000
+.Lmvf3:	.long	0x00400000
+	.size	_gte_mvmva_leaf, . - _gte_mvmva_leaf
+
+/* C-callable: gte_leaf_call(file, leaf, op) -- bloom's self-test. */
+	.balign	4
+	.global	_gte_leaf_call
+	.type	_gte_leaf_call, @function
+_gte_leaf_call:
+	sts.l	pr, @-r15
+	stc.l	gbr, @-r15
+	mov	#66, r0
+	shll2	r0
+	sub	r0, r4
+	ldc	r4, gbr
+	mov	r6, r1
+	jsr	@r5
+	 nop
+	ldc.l	@r15+, gbr
+	lds.l	@r15+, pr
+	rts
+	 nop
+	.size	_gte_leaf_call, . - _gte_leaf_call

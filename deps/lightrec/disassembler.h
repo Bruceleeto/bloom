@@ -29,6 +29,23 @@
 #define LIGHTREC_NO_INVALIDATE	BIT(5)
 #define LIGHTREC_NO_MASK	BIT(6)
 
+/* Set on the LOAD half of a pair `lightrec_swap_load_delays` exchanged.  That
+ * pass implements the load delay by swapping the two list entries and nothing
+ * else, so afterwards list order is execution order and the delay is spent.
+ * A back end that models the delay itself -- fgl rotates the load past its
+ * shadow in the IR -- would otherwise apply it a second time and hand the
+ * reader a value one instruction too old.  Ignored by lightrec's own
+ * emitter and interpreter, which read the list in order. */
+#define LIGHTREC_SWAPPED_LOAD	BIT(12)
+
+/* Byte offset within the 32-bit word for LWL/LWR/SWL/SWR, when constant
+ * propagation could work it out: 0 means unknown, otherwise n + 1. */
+#define LIGHTREC_ALIGN_LSB	9
+#define LIGHTREC_ALIGN(x)	((x) << LIGHTREC_ALIGN_LSB)
+#define LIGHTREC_ALIGN_MASK	LIGHTREC_ALIGN(0x7)
+#define LIGHTREC_FLAGS_GET_ALIGN(x) \
+	(((x) & LIGHTREC_ALIGN_MASK) >> LIGHTREC_ALIGN_LSB)
+
 /* I/O mode for load/store opcodes */
 #define LIGHTREC_IO_MODE_LSB	7
 #define LIGHTREC_IO_MODE(x)	((x) << LIGHTREC_IO_MODE_LSB)
@@ -340,6 +357,13 @@ static inline _Bool op_flag_no_mask(u32 flags)
 static inline _Bool op_flag_load_delay(u32 flags)
 {
 	return OPT_HANDLE_LOAD_DELAYS && (flags & LIGHTREC_LOAD_DELAY);
+}
+
+__cnst const char * lightrec_reg_name(u8 reg);
+
+static inline _Bool op_flag_swapped_load(u32 flags)
+{
+	return OPT_HANDLE_LOAD_DELAYS && (flags & LIGHTREC_SWAPPED_LOAD);
 }
 
 static inline _Bool op_flag_emulate_branch(u32 flags)

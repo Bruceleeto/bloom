@@ -11,6 +11,7 @@
 #include "recompiler.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -65,9 +66,98 @@ void remove_from_code_lut(struct blockcache *cache, struct block *block)
 	u32 offset = lut_offset(block->pc);
 
 	if (block->function) {
+		/* The slot is about to stop naming this block, and a backend
+		 * that patches direct links between blocks does not read the
+		 * slot -- so every link has to go back before the table does. */
+		if (state->backend_ops->unlink_range)
+			state->backend_ops->unlink_range(state, offset,
+							 block->nb_ops,
+							 LIGHTREC_UNLINK_LUT);
+
 		memset(lut_address(state, offset), 0,
 		       block->nb_ops * lut_elm_size(state));
 	}
+}
+
+/* Which block does this host code address belong to?
+ *
+ * A linear walk of the whole cache, which is exactly what it looks like and
+ * is fine: the only caller is the crash reporter, and by then the run is
+ * over.  It buys the one thing a register dump cannot give -- the guest PC
+ * behind a fault inside emitted code. */
+struct block * lightrec_find_block_from_code(struct blockcache *cache,
+					     uintptr_t addr)
+{
+	struct block *block;
+	unsigned int i;
+
+	for (i = 0; i < LUT_SIZE; i++) {
+		for (block = cache->lut[i]; block; block = block->next) {
+			uintptr_t fn = (uintptr_t) block->function;
+
+			if (fn && addr >= fn && addr < fn + block->code_size)
+				return block;
+		}
+	}
+
+	return NULL;
+}
+
+/* Every live block, once: host code size against guest op count, so this
+ * tree's per-block expansion can be diffed against the port's for the SAME
+ * guest pc.  Totals cannot do that -- two runs discover different blocks and
+ * the average moves for reasons that are not codegen. */
+void fgl_dump_blocks(struct lightrec_state *state, const char *path)
+{
+	struct blockcache *cache = state->block_cache;
+	struct block *block;
+	unsigned int i;
+	FILE *f = fopen(path, "w");
+
+	if (!f)
+		return;
+	for (i = 0; i < LUT_SIZE; i++) {
+		for (block = cache->lut[i]; block; block = block->next) {
+			if (!block->function || !block->code_size)
+				continue;
+			fprintf(f, "b %08x %u %08x %u\n",
+				(unsigned)(uintptr_t)block->function,
+				(unsigned)block->code_size,
+				(unsigned)block->pc, (unsigned)block->nb_ops);
+		}
+	}
+	fclose(f);
+}
+
+/* Walk every live block, once, handing each to `cb`.
+ *
+ * The profiler needs the whole host-code -> guest-pc map, not one lookup, and
+ * building it out of lightrec_find_block_from_code() would be a full cache
+ * walk per query.  One walk, every block, is the same information for the
+ * cost of one of those queries. */
+void lightrec_foreach_block(struct lightrec_state *state,
+			    void (*cb)(struct block *block, void *data),
+			    void *data)
+{
+	struct blockcache *cache = state->block_cache;
+	struct block *block;
+	unsigned int i;
+
+	for (i = 0; i < LUT_SIZE; i++)
+		for (block = cache->lut[i]; block; block = block->next)
+			cb(block, data);
+}
+
+/* The caller of the above gets an opaque block pointer; this is how it reads
+ * one without dragging lightrec's private headers into a translation unit
+ * that has its own OP_CP2_* enum and would collide with the disassembler. */
+void lightrec_block_info(const struct block *block, uintptr_t *fn,
+			 unsigned *code_size, unsigned *pc, unsigned *nb_ops)
+{
+	*fn = (uintptr_t)block->function;
+	*code_size = block->code_size;
+	*pc = block->pc;
+	*nb_ops = block->nb_ops;
 }
 
 void lightrec_register_block(struct blockcache *cache, struct block *block)

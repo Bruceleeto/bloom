@@ -376,7 +376,15 @@ void MTC2(struct psxCP2Regs *regs, u32 value, int reg) {
 	}
 }
 
+/* Bumped on every write to a control register, so a consumer that caches
+ * anything derived from them can tell in one compare whether it went stale. */
+u32 psxCP2Gen[2];
+
 void CTC2(struct psxCP2Regs *regs, u32 value, int reg) {
+	psxCP2CtrlGen++;
+	if (PSXCP2_RT_REG(reg))
+		psxCP2RtGen++;
+
 	switch (reg) {
 		case 4:
 		case 12:
@@ -1098,3 +1106,14 @@ void gteMACtoRGB(psxCP2Regs *regs) {
 	gteB2 = limC3(gteMAC3 >> 4);
 }
 
+
+#if defined(FGL) && !defined(FLAGLESS)
+/* fgl needs one entry point for CP2 ops; this core dispatches through
+ * psxCP2[] in the interpreter instead.  Same table, one wrapper. */
+extern void (*psxCP2[64])(struct psxCP2Regs *regs);
+
+void gteDispatch(psxCP2Regs *regs, u32 code)
+{
+	psxCP2[code & 0x3f](regs);
+}
+#endif

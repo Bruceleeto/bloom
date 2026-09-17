@@ -206,6 +206,8 @@ struct recompiler *lightrec_recompiler_init(struct lightrec_state *state)
 
 	nb_cpus = get_processors_count();
 	nb_recs = nb_cpus < 2 ? 1 : nb_cpus - 1;
+	/* bloom runs one worker (single-core SH4).  revert me. */
+	nb_recs = 1;
 
 	rec = lightrec_malloc(state, MEM_FOR_LIGHTREC, sizeof(*rec)
 			      + nb_recs * sizeof(*rec->thds));
@@ -470,6 +472,7 @@ void * lightrec_recompiler_run_first_pass(struct lightrec_state *state,
 	old_flags = block_set_flags(block, BLOCK_NO_OPCODE_LIST);
 
 	/* Block wasn't compiled yet - run the interpreter */
+	lr_interp_blocks++;
 	*pc = lightrec_emulate_block(state, block, *pc);
 
 	if (!(old_flags & BLOCK_NO_OPCODE_LIST))

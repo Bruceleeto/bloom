@@ -184,6 +184,18 @@ static const char * const lightrec_hack_db[] =
 {
 	/* Tomb Raider (Rev 2) - boot menu clears over itself */
 	"SLUS00152",
+	/* Speed hack: no per-store invalidation. Each ID hash-checked one
+	 * guest minute on fgl against per-store invalidation (2026-09-17). */
+	"SCUS94228", /* Spyro the Dragon (US) */
+	"SLES02605", /* Colin McRae Rally 2.0 */
+	"SCUS94900", /* Crash Bandicoot (US) */
+	"SLUS01436", /* Digimon World 3 */
+	"SCES03404", /* Formula One 2001 */
+	"SCUS94194", /* Gran Turismo (US) */
+	"SCES00893", /* Hercules */
+	"SLUS00005", /* Rayman (US) */
+	"SCUS94467", /* Spyro: Year of the Dragon (US) */
+	"slus00594", /* Metal Gear Solid (US), ID reads lowercase off the disc */
 };
 
 /* Function for automatic patching according to GameID. */

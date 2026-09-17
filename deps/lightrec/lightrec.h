@@ -143,6 +143,13 @@ __api u32 lightrec_execute(struct lightrec_state *state,
 __api u32 lightrec_run_interpreter(struct lightrec_state *state,
 				   u32 pc, u32 target_cycle);
 
+/* Ground truth: run every block down both paths and diff them.  Set from
+ * PCSX_LOCKSTEP in the environment -- 1 = registers and exit PC, 2 = adds all
+ * of RAM and the scratchpad.  Zero means lightrec_execute as usual. */
+extern u32 lightrec_lockstep_on;
+__api u32 lightrec_lockstep(struct lightrec_state *state,
+			    u32 pc, u32 target_cycle);
+
 __api void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len);
 __api void lightrec_invalidate_all(struct lightrec_state *state);
 
@@ -156,6 +163,12 @@ lightrec_get_registers(struct lightrec_state *state);
 
 __api u32 lightrec_current_cycle_count(const struct lightrec_state *state);
 __api void lightrec_reset_cycle_count(struct lightrec_state *state, u32 cycles);
+/* The guest PC the dispatcher is currently at.  A backend that services
+ * events in place needs to hand it to the frontend and take back whatever an
+ * exception moved it to; nothing else outside lightrec has any business with
+ * it. */
+__api u32 lightrec_get_curr_pc(struct lightrec_state *state);
+__api void lightrec_set_curr_pc(struct lightrec_state *state, u32 pc);
 __api void lightrec_set_target_cycle_count(struct lightrec_state *state,
 					   u32 cycles);
 __api void lightrec_set_cycles_per_opcode(struct lightrec_state *state, u32 cycles);

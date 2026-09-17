@@ -75,6 +75,29 @@ u32  MFC2(struct psxCP2Regs *regs, int reg);
 void MTC2(struct psxCP2Regs *regs, u32 value, int reg);
 void CTC2(struct psxCP2Regs *regs, u32 value, int reg);
 
+/* Incremented by every CTC2.  See gte.c.
+ *
+ * TWO COUNTERS, ADJACENT.  [0] bumps on every control write; [1] only on the
+ * rotation matrix and translation vector (cp2c 0..7) and the projection
+ * offsets OFX/OFY (24, 25), which between them are everything the RTPS leaf's
+ * XMTRX and offset caches are derived from.  A CTC2 to H, DQA, DQB or a light
+ * matrix therefore no longer forces the leaf to rebuild its matrix.  They sit
+ * in one array so the emitted code reaches both from a single address.
+ *
+ * [1] and PSXCP2_RT_REG are FGL's; stock never reads them, and the extra
+ * increment is the whole cost to it.  psxCP2CtrlGen keeps its name, so
+ * gte_fpu.c, gte_sh4.c and misc.c are untouched. */
+extern u32 psxCP2Gen[2];
+#define psxCP2CtrlGen psxCP2Gen[0]
+#define psxCP2RtGen   psxCP2Gen[1]
+#define PSXCP2_RT_REG(r) ((unsigned)(r) < 8u || (r) == 24 || (r) == 25)
+
+#ifdef FGL
+/* fgl needs one entry point for CP2 ops; this core dispatches through
+ * psxCP2[] in the interpreter instead.  Same table, one wrapper. */
+void gteDispatch(psxCP2Regs *regs, u32 code);
+#endif
+
 void gteRTPS(struct psxCP2Regs *regs);
 void gteOP(struct psxCP2Regs *regs);
 void gteNCLIP(struct psxCP2Regs *regs);

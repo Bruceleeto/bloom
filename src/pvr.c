@@ -6,6 +6,7 @@
  */
 
 #include <arch/cache.h>
+#include <dc/matrix.h>
 #include <dc/pvr.h>
 #include <dc/video.h>
 #include <gpulib/gpu.h>
@@ -71,6 +72,27 @@
 #define COORDS_V_OFFSET (1.0f / 32768.0f)
 
 #define __pvr __attribute__((section(".sub0")))
+
+/* UNTEXTURED-ONLY MODE -- A CACHE EXPERIMENT, NOT A FEATURE.
+ *
+ * `.sub0` is 8 KiB and aligned to the icache, which is also 8 KiB and direct
+ * mapped -- so while these functions run they occupy EVERY line of it and
+ * nothing else survives.  The profile shows the consequence in the wrong
+ * place: the renderer itself stalls least (istall index 0.45-0.81) precisely
+ * because it evicts everyone, and the bill lands on the emitted code that has
+ * to fault its working set back in afterwards (index 1.14, the worst group).
+ *
+ * This cuts the textured paths out of the five `__pvr` functions so the
+ * section spans a fraction of the cache instead of all of it.  The stream is
+ * still PARSED exactly as before -- `buf` advances over UV words whether or
+ * not they are used -- so the geometry stays correct and the comparison
+ * measures cache behaviour rather than a different workload.
+ *
+ * The output is wrong on purpose: every textured surface draws flat.  Set to
+ * 0 to get the renderer back. */
+#ifndef PVR_UNTEX_ONLY
+#define PVR_UNTEX_ONLY 0
+#endif
 
 typedef struct pvr_vertex_part2 {
 	float u1;
@@ -274,6 +296,8 @@ static void process_poly(struct poly *poly, bool scissor);
 static void poly_enqueue(pvr_list_t list, const struct poly *poly);
 
 static struct pvr_renderer pvr;
+
+alignas(32) static matrix_t matrix_bak;
 
 static struct poly polybuf[POLY_BUFFER_SIZE / sizeof(struct poly)];
 
@@ -642,8 +666,49 @@ static inline bool clut_is_outdated(const struct texture_clut *clut, bool bpp4)
 	return false;
 }
 
+/* CODEBOOK MEMO -- see PVR.md. find_texture_codebook() is a linear scan over
+ * nb_cluts whose every step calls clut_is_outdated(), which for 8bpp walks up
+ * to four texture pages. It runs once per textured polygon while the same
+ * (page, clut) repeats ~37 times in a row.
+ *
+ * Safe because a HIT writes nothing: clut_is_outdated() and clut_is_used() are
+ * pure functions of the inval counters, and only the palette-load path at the
+ * bottom stores. poly_get_texture_page() is deliberately NOT memoized -- its
+ * block_mask is UV-derived and maybe_update_texture() uploads missing blocks. */
+static struct texture_page *cb_memo_page;
+static uint16_t cb_memo_clut;
+static uint16_t cb_memo_gen;
+static unsigned int cb_memo_codebook;
+
+static inline void cb_memo_flush(void)
+{
+	cb_memo_page = NULL;
+}
+
 static unsigned int
+find_texture_codebook_slow(struct texture_page *page, uint16_t clut);
+
+static inline unsigned int
 find_texture_codebook(struct texture_page *page, uint16_t clut)
+{
+	unsigned int codebook;
+
+	if (likely(cb_memo_page == page && cb_memo_clut == clut
+		   && cb_memo_gen == pvr.inval_counter))
+		return cb_memo_codebook;
+
+	codebook = find_texture_codebook_slow(page, clut);
+
+	cb_memo_page = page;
+	cb_memo_clut = clut;
+	cb_memo_gen = pvr.inval_counter;
+	cb_memo_codebook = codebook;
+
+	return codebook;
+}
+
+static unsigned int
+find_texture_codebook_slow(struct texture_page *page, uint16_t clut)
 {
 	struct texture_page_4bpp *page4 = to_texture_page_4bpp(page);
 	bool bpp4 = page->settings.bpp == TEXTURE_4BPP;
@@ -919,6 +984,7 @@ static void discard_texture_page(struct texture_page *page)
 	pvr_reap_ptr(page->tex);
 	page->tex = NULL;
 	page->block_mask = 0;
+	cb_memo_flush();
 }
 
 static void invalidate_texture(struct texture_page *page, uint64_t block_mask)
@@ -1157,17 +1223,44 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 		      unsigned int nb, float z,
 		      uint32_t oargb, uint16_t flags)
 {
-	bool textured = flags & POLY_TEXTURED;
+	bool textured = !PVR_UNTEX_ONLY && (flags & POLY_TEXTURED);
 	bool modified = !(flags & POLY_NOCLIP);
 	pvr_poly_hdr_t *sq_hdr;
 	pvr_vertex_t *vert;
 	pvr_vertex_part2_t *vert2;
 	unsigned int i;
+	bool warm;
 
 	if (unlikely(hdr)) {
 		sq_hdr = pvr_dr_target();
 		copy32(sq_hdr, hdr);
 		pvr_dr_commit(sq_hdr);
+	}
+
+	/* Warm both store queues with the fields that do not vary over this
+	 * primitive.  pvr_dr_target() alternates between two SQ buffers and
+	 * their contents survive a commit, so z, oargb and the vertex
+	 * command only have to be written once per queue rather than once
+	 * per vertex - three stores of the eight in the loop below.
+	 *
+	 * Not done on the clip path: the second vertex goes through the same
+	 * two queues and writes its own argb/oargb over these offsets, so
+	 * there is nothing left to reuse. */
+	warm = !(WITH_CLIPPING && textured && modified);
+	if (likely(warm)) {
+		vert = pvr_dr_target();
+		vert->flags = PVR_CMD_VERTEX;
+		vert->z = z;
+		vert->oargb = oargb;
+		if (!textured)
+			vert->argb1 = 0;
+
+		vert = pvr_dr_target();
+		vert->flags = PVR_CMD_VERTEX;
+		vert->z = z;
+		vert->oargb = oargb;
+		if (!textured)
+			vert->argb1 = 0;
 	}
 
 	for (i = 0; i < nb; i++) {
@@ -1181,10 +1274,16 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 
 		vert = pvr_dr_target();
 
-		vert->flags = (i == nb - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-		vert->z = z;
+		if (unlikely(!warm)) {
+			vert->flags = (i == nb - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+			vert->z = z;
+			vert->oargb = oargb;
+		} else if (unlikely(i == nb - 1)) {
+			/* Only the last vertex differs from the warmed value. */
+			vert->flags = PVR_CMD_VERTEX_EOL;
+		}
+
 		vert->argb = color[i];
-		vert->oargb = oargb;
 		vert->x = fr0;
 		vert->y = fr1;
 		if (textured) {
@@ -1192,7 +1291,8 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 			vert->v = fr3 + COORDS_V_OFFSET;
 		} else {
 			vert->argb0 = color[i];
-			vert->argb1 = 0;
+			if (unlikely(!warm))
+				vert->argb1 = 0;
 		}
 
 		pvr_dr_commit(vert);
@@ -1298,6 +1398,7 @@ static void pvr_maybe_free_page(struct texture_page *page)
 	if (page->tex && !page->inuse_mask && !page->old_inuse_mask) {
 		pvr_mem_free(page->tex);
 		page->tex = NULL;
+		cb_memo_flush();
 	}
 }
 
@@ -1371,6 +1472,7 @@ poly_get_texture_page(const struct poly *poly)
 		page->block_mask = 0;
 		page->inuse_mask = 0;
 		page->old_inuse_mask = 0;
+		cb_memo_flush();
 	}
 
 	if (unlikely(poly->flags & POLY_FB))
@@ -1621,10 +1723,10 @@ static void poly_draw_now(const struct poly *poly)
 	const uint32_t *colors = poly->colors;
 	uint32_t colors_alt[4];
 	uint16_t flags = poly->flags;
-	bool textured = poly->flags & POLY_TEXTURED;
+	bool textured = !PVR_UNTEX_ONLY && (poly->flags & POLY_TEXTURED);
 	bool bright = poly->flags & POLY_BRIGHT;
-	bool set_mask = poly->flags & POLY_SET_MASK;
-	bool check_mask = poly->flags & POLY_CHECK_MASK;
+	bool set_mask = !PVR_UNTEX_ONLY && (poly->flags & POLY_SET_MASK);
+	bool check_mask = !PVR_UNTEX_ONLY && (poly->flags & POLY_CHECK_MASK);
 	uint16_t voffset = 0, zoffset = poly->zoffset;
 	pvr_poly_hdr_t hdr, *poly_hdr;
 	pvr_ptr_t tex = NULL;
@@ -1701,6 +1803,14 @@ static void poly_draw_now(const struct poly *poly)
 			else
 				hdr.m2.u_size = PVR_UV_SIZE_512;
 		}
+	}
+
+	/* Untextured-only mode draws everything opaque: the blending modes
+	 * below are four more code paths through this section and the point of
+	 * the exercise is to make the section small. */
+	if (PVR_UNTEX_ONLY) {
+		draw_prim(&hdr, coords, voffset, colors, nb, z, 0, flags);
+		return;
 	}
 
 	switch (poly->blending_mode) {
@@ -2191,7 +2301,7 @@ static void process_poly(struct poly *poly, bool scissor)
 	if (WITH_CLIPPING && !pvr.clip_test)
 		poly->flags |= POLY_NOCLIP;
 
-	if (poly->flags & POLY_TEXTURED) {
+	if (!PVR_UNTEX_ONLY && (poly->flags & POLY_TEXTURED)) {
 		if (scissor && unlikely(poly->bpp != TEXTURE_4BPP)) {
 			umin = poly_get_umin(poly);
 			umax = poly_get_umax(poly) - 1;
@@ -2231,15 +2341,19 @@ static void process_poly(struct poly *poly, bool scissor)
 		}
 	}
 
-	if (likely(!(poly->flags & POLY_IGN_MASK))) {
+	if (!PVR_UNTEX_ONLY && likely(!(poly->flags & POLY_IGN_MASK))) {
 		set_mask = pvr.set_mask;
 		check_mask = pvr.check_mask;
 	} else {
+		/* No VRAM mask emulation in untextured-only mode: it costs
+		 * four extra enqueue paths through this section. */
 		set_mask = false;
 		check_mask = false;
 	}
 
-	if (likely(poly->blending_mode == BLENDING_MODE_NONE)) {
+	/* blending_mode is forced to NONE upstream, so the blended branch
+	 * below is dead -- say so, or GCC still emits it. */
+	if (PVR_UNTEX_ONLY || likely(poly->blending_mode == BLENDING_MODE_NONE)) {
 		poly->zoffset = pvr.zoffset++;
 
 		if (unlikely(check_mask)) {
@@ -2262,7 +2376,9 @@ static void process_poly(struct poly *poly, bool scissor)
 			poly_enqueue(list, poly);
 		}
 
-		if (unlikely(poly->flags & POLY_BRIGHT)) {
+		/* POLY_BRIGHT is only ever set off a texture's vertex colours,
+		 * so in untextured-only mode it cannot be set. */
+		if (!PVR_UNTEX_ONLY && unlikely(poly->flags & POLY_BRIGHT)) {
 			/* Process a bright poly as a regular poly with additive
 			 * blending */
 			poly->flags &= ~POLY_BRIGHT;
@@ -2510,7 +2626,11 @@ static void process_gpu_commands(void)
 
 		dcache_pref_line(&cmdbuf[cmd_offt + 1 + len]);
 
-		blending_mode = semi_trans ? pvr.blending_mode : BLENDING_MODE_NONE;
+		/* Everything opaque in untextured-only mode.  This is the one
+		 * assignment keeping the whole blended branch of process_poly()
+		 * and the four modes in poly_draw_now() reachable. */
+		blending_mode = (semi_trans && !PVR_UNTEX_ONLY)
+			? pvr.blending_mode : BLENDING_MODE_NONE;
 
 		switch (cmd >> 5) {
 		case 0x0:
@@ -2626,7 +2746,7 @@ static void process_gpu_commands(void)
 				.colors = { 0xffffff },
 			};
 
-			if (textured)
+			if (textured && !PVR_UNTEX_ONLY)
 				poly.flags |= POLY_TEXTURED;
 			if (multiple)
 				poly.flags |= POLY_4VERTEX;
@@ -2641,7 +2761,7 @@ static void process_gpu_commands(void)
 					/* BGR->RGB swap */
 					poly.colors[i] = __builtin_bswap32(*buf++) >> 8;
 
-					if (textured) {
+					if (textured && !PVR_UNTEX_ONLY) {
 						bright |= (poly.colors[i] & 0xff) > 0x80
 							|| (poly.colors[i] & 0xff00) > 0x8000
 							|| (poly.colors[i] & 0xff0000) > 0x800000;
@@ -2670,9 +2790,15 @@ static void process_gpu_commands(void)
 				poly.coords[i].y = y_to_yoffset(y);
 
 				if (textured) {
+					/* Consumed either way: the packet is
+					 * this long regardless of whether we
+					 * intend to texture with it. */
 					texcoord[i] = *buf++;
-					poly.coords[i].u = (uint8_t)texcoord[i];
-					poly.coords[i].v = (uint8_t)(texcoord[i] >> 8);
+
+					if (!PVR_UNTEX_ONLY) {
+						poly.coords[i].u = (uint8_t)texcoord[i];
+						poly.coords[i].v = (uint8_t)(texcoord[i] >> 8);
+					}
 				}
 			}
 
@@ -2681,12 +2807,12 @@ static void process_gpu_commands(void)
 				break;
 			}
 
-			if (textured && !raw_tex && !bright) {
+			if (textured && !raw_tex && !bright && !PVR_UNTEX_ONLY) {
 				for (i = 0; i < nb; i++)
 					poly.colors[i] = get_tex_vertex_color(poly.colors[i]);
 			}
 
-			if (textured) {
+			if (textured && !PVR_UNTEX_ONLY) {
 				texpage = texcoord[1] >> 16;
 
 				poly.clut = (texcoord[0] >> 16) & 0x7fff;
@@ -2702,13 +2828,16 @@ static void process_gpu_commands(void)
 			if (bright)
 				poly.flags |= POLY_BRIGHT;
 
-			process_poly(&poly, textured);
+			process_poly(&poly, textured && !PVR_UNTEX_ONLY);
 			break;
 		}
 
 		case 0x2: {
 			/* Monochrome/shaded line */
 			const uint32_t *buf = pbuffer->U4;
+
+			if (PVR_UNTEX_ONLY)
+				break;
 			uint32_t oldcolor, color, val;
 			int16_t x, y, oldx, oldy;
 			unsigned int i;
@@ -2744,6 +2873,13 @@ static void process_gpu_commands(void)
 		case 0x3: {
 			/* Monochrome rectangle */
 			uint16_t w, h, x0, y0, x1, y1;
+
+			/* Sprites are overwhelmingly textured; in untextured
+			 * mode they would all be flat quads and they are not
+			 * what this measures. */
+			if (PVR_UNTEX_ONLY)
+				break;
+
 			bool bright = false;
 			uint32_t color;
 			uint16_t flags = POLY_4VERTEX;
@@ -2869,7 +3005,7 @@ int do_cmd_list(uint32_t *list, int list_len,
 		if (unlikely(pvr.cmdbuf_offt + len >= __array_size(cmdbuf))) {
 			/* No more space in command buffer?
 			 * Flush what we queued so far. */
-			process_gpu_commands();
+			renderer_flush_queues();
 		}
 
 		memcpy(&cmdbuf[pvr.cmdbuf_offt], list, (len + 1) * 4);
@@ -2896,7 +3032,7 @@ int do_cmd_list(uint32_t *list, int list_len,
 				 * that were already used for the current frame;
 				 * so we need to render everything we queued
 				 * until now. */
-				process_gpu_commands();
+				renderer_flush_queues();
 				break;
 			}
 			break;
@@ -3155,9 +3291,33 @@ static void pvr_render_modifier_volumes(void)
 	pvr_list_finish();
 }
 
+/* XMTRX IS SHARED WITH THE CODE GENERATOR.
+ *
+ * fgl keeps the GTE's rotation matrix in the FPU back bank and only reloads it
+ * when its generation counter moves (gte_rtp.S, `xmtrx_key`/`xmtrx_serial`),
+ * and Lightning does the same under OPT_SH4_USE_MATRIX.  Either way the
+ * renderer's own polygon matrix would overwrite a matrix the GTE still
+ * believes is loaded -- so it is loaded around the rendering and the guest's
+ * is put back afterwards, rather than left in place from `dc_vout_set_mode`. */
+static void matrix_save(void)
+{
+	if (OPT_SH4_USE_MATRIX) {
+		mat_store(&matrix_bak);
+		mat_load_default();
+	}
+}
+
+static void matrix_restore(void)
+{
+	if (OPT_SH4_USE_MATRIX)
+		mat_load(&matrix_bak);
+}
+
 void hw_render_stop(void)
 {
 	bool overpaint;
+
+	matrix_save();
 
 	process_gpu_commands();
 
@@ -3215,9 +3375,15 @@ void hw_render_stop(void)
 	pvr.start_y = pvr.view_y;
 	pvr.draw_offt_x = pvr.draw_dx - pvr.start_x + gpu.screen.x;
 	pvr.draw_offt_y = pvr.draw_dy - pvr.start_y + gpu.screen.y;
+
+	matrix_restore();
 }
 
 void renderer_flush_queues(void)
 {
+	matrix_save();
+
 	process_gpu_commands();
+
+	matrix_restore();
 }

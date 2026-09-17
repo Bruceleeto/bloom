@@ -14,6 +14,15 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+
+/*
+ * Bumped on every write to a COP2 control register, wherever the write comes
+ * from.  Defined by the core's GTE (libpcsxcore/gte.c); declared here because
+ * this library does not include the core's headers.
+ */
+extern uint32_t psxCP2Gen[2];
+#define psxCP2CtrlGen psxCP2Gen[0]
 
 #define LIGHTNING_UNALIGNED_32BIT 4
 
@@ -54,6 +63,17 @@ static void lightrec_jump_to_known_eob(struct lightrec_cstate *state,
 	/* Load the LUT entry address to JIT_V1 where the dispatcher expects it */
 	jit_movi(JIT_V1, (uintptr_t)lut_address(state->state, lut_offset(imm)));
 
+	/*
+	 * The fast entry point is past the dispatcher's sync_next_pc(), so on
+	 * an arch that keeps the next PC in memory rather than in JIT_V0
+	 * nothing has loaded it -- and the dispatcher stores JIT_V0 to
+	 * curr_pc and hands it to the slow path.  We know the target here, so
+	 * just put it there.  Where sync_next_pc() is a no-op JIT_V0 already
+	 * holds it and this is dead code.
+	 */
+	if (lightrec_store_next_pc())
+		jit_movi(JIT_V0, imm);
+
 	lightrec_jump_to_fn(_jit, state->state->fast_eob);
 }
 
@@ -71,6 +91,52 @@ static void update_ra_register(struct regcache *reg_cache, jit_state_t *_jit,
 	link_reg = lightrec_alloc_reg_out(reg_cache, _jit, ra_reg, 0);
 	lightrec_load_imm(reg_cache, _jit, link_reg, pc, link);
 	lightrec_free_reg(reg_cache, link_reg);
+}
+
+/* A load in a branch's delay slot must not be visible to the target's first
+ * opcode, which lightrec_check_load_delay() decides at runtime. With a constant
+ * target the target opcode is readable here, so decide now and keep only a
+ * guard: the conclusion is about another block's code, which invalidation can
+ * rewrite without dropping this block, so re-read that opcode and fall back if
+ * it changed. */
+static bool try_resolve_load_delay(struct lightrec_cstate *state,
+				   const struct block *block, u32 target_pc,
+				   u8 rt)
+{
+	jit_state_t *_jit = block->_jit;
+	const struct lightrec_mem_map *map;
+	jit_node_t *modified;
+	void *host = NULL;
+	union code first_op;
+	u8 tmp;
+
+	map = lightrec_get_map(state->state, &host, kunseg(target_pc));
+	if (!map || !host)
+		return false;
+
+	first_op = (union code) LE32TOH(*(u32 *)host);
+
+	if (opcode_reads_register(first_op, rt))
+		return false;
+
+	tmp = lightrec_alloc_reg_temp(state->reg_cache, _jit);
+
+	jit_movi(tmp, (uintptr_t)host);
+	jit_ldr_i(tmp, tmp);
+	modified = jit_bnei(tmp, (s32)first_op.opcode);
+
+	jit_ldxi_i(tmp, LIGHTREC_REG_STATE, lightrec_offset(temp_reg));
+	jit_stxi_i(lightrec_offset(regs.gpr[0]) + (rt << 2),
+		   LIGHTREC_REG_STATE, tmp);
+	lightrec_free_reg(state->reg_cache, tmp);
+
+	lightrec_jump_to_eob(state, _jit);
+
+	jit_patch(modified);
+	jit_movi(JIT_V1, rt);
+	lightrec_jump_to_ds_check(state, _jit);
+
+	return true;
 }
 
 static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
@@ -119,7 +185,9 @@ static void lightrec_emit_end_of_block(struct lightrec_cstate *state,
 	}
 
 	if (has_ds && op_flag_load_delay(ds->flags)
-	    && opcode_has_load_delay(ds->c) && !state->no_load_delay) {
+	    && opcode_has_load_delay(ds->c) && !state->no_load_delay
+	    && !(reg_new_pc < 0
+		 && try_resolve_load_delay(state, block, imm, ds->c.i.rt))) {
 		/* If the delay slot is a load opcode, its target register
 		 * will be written after the first opcode of the target is
 		 * executed. Handle this by jumping to a special section of
@@ -2609,6 +2677,19 @@ static void rec_cp2_basic_CTC2(struct lightrec_cstate *state,
 	}
 
 	lightrec_free_reg(reg_cache, rt);
+
+	/*
+	 * Announce the write.  A GTE that caches anything derived from the
+	 * control file tells whether it went stale by comparing this counter,
+	 * and generated code stores here without going through CTC2.
+	 */
+	tmp = lightrec_alloc_reg_temp(reg_cache, _jit);
+
+	jit_ldi_i(tmp, &psxCP2CtrlGen);
+	jit_addi(tmp, tmp, 1);
+	jit_sti_i(&psxCP2CtrlGen, tmp);
+
+	lightrec_free_reg(reg_cache, tmp);
 }
 
 static void rec_cp0_RFE(struct lightrec_cstate *state,

@@ -27,6 +27,16 @@
 #include "mem.h"
 #include "plugin.h"
 
+/* THE BACKEND SEAM.  One binary holds GNU Lightning and fgl and is asked for
+ * one of them by name before `lightrec_init`; everything below that differs
+ * between the two -- the GTE dispatch, the service door, GBR -- keys off that
+ * choice at run time rather than off an #ifdef. */
+#include "lightrec-backend.h"
+#ifdef LIGHTREC_WITH_FGL
+#include "bloom-config.h"
+#include "../../../../src/fgl/gte_fpu.h"
+#endif
+
 #if (defined(__arm__) || defined(__aarch64__)) && !defined(ALLOW_LIGHTREC_ON_ARM)
 #error "Lightrec should not be used on ARM (please specify DYNAREC=ari64 to make)"
 #endif
@@ -74,6 +84,20 @@ static struct lightrec_state *lightrec_state;
 
 static bool use_lightrec_interpreter;
 static bool block_stepping;
+
+/* WHICH CODE GENERATOR THIS BUILD HAS.
+ *
+ * -DWITH_FGL decides it and only one backend is compiled in, so this is a
+ * compile-time constant rather than a choice: `lightrec_select_backend` is
+ * still what installs it, because that is the only thing that knows how to,
+ * but there is nothing else for it to pick. */
+#ifdef LIGHTREC_WITH_FGL
+#define using_fgl 1
+static const char *requested_backend = "fgl";
+#else
+#define using_fgl 0
+static const char *requested_backend;
+#endif
 //static bool use_pcsx_interpreter;
 #define use_pcsx_interpreter 0
 static bool ram_disabled;
@@ -143,6 +167,25 @@ static void cop2_op(struct lightrec_state *state, u32 func)
 
 	psxRegs.code = func;
 
+#ifdef LIGHTREC_WITH_FGL
+	/* fgl's GTE is the SH-4 FPU one, and its emitted code calls the float
+	 * bodies directly; this wrapper is only the interpreter/first-pass
+	 * path, so it has to reach the SAME register file state the compiled
+	 * path would have left -- otherwise a block that was interpreted once
+	 * disagrees with the same block compiled. */
+	if (using_fgl) {
+		static bool announced;
+
+		if (unlikely(!announced)) {
+			announced = true;
+			printf("GTE: SH-4 FPU\n");
+		}
+
+		gte_fpu_cmd((psxCP2Regs *) regs->cp2d, func);
+		return;
+	}
+#endif
+
 	if (unlikely(!cp2_ops[func & 0x3f])) {
 		fprintf(stderr, "Invalid CP2 function %u\n", func);
 	} else {
@@ -166,6 +209,84 @@ static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 	psxRegs.cycle += lightrec_current_cycle_count(state) / 1024;
 	lightrec_reset_cycle_count(state, 0);
 }
+
+#ifdef LIGHTREC_WITH_FGL
+/*
+ * SERVICE A SLICE BOUNDARY WITHOUT LEAVING GENERATED CODE.
+ *
+ * When the cycle budget runs out, the work the outer loop does at that moment
+ * -- advance the pcsx clock, run the event scheduler, size the next slice --
+ * needs C, but it does not need the dispatcher torn down first.  r8-r15 are
+ * callee-saved by the SH-4 ABI, so the pinned guest registers, the guest
+ * address mask and the budget register all survive an ordinary call, and GBR
+ * survives because nothing in bloom's image uses TLS.  So a slice boundary can
+ * cost one call instead of a full exit through `_fgl_dispatch`'s epilogue and
+ * a re-entry through `lightrec_execute`.
+ *
+ * Called from `.Lservice` in dispatch.S with the cycle pair already reconciled
+ * by `.Lsync_out` and the pins already published.
+ *
+ * Returns nonzero to run another slice -- the dispatcher then re-reads the
+ * budget out of the state block -- and 0 to leave for real.  On 0 the cycle
+ * pair is left where `lightrec_execute`'s
+ * `current_cycle = target_cycle - delta` still reproduces it, which is why the
+ * spent delta comes in as an argument.
+ */
+volatile int fgl_service_inline = 1;
+
+u32 fgl_meter_cycles(const struct lightrec_state *state, s32 delta);
+
+s32 fgl_service_events(struct lightrec_state *state, s32 delta)
+{
+	struct lightrec_registers *regs;
+	s32 cycles_pcsx;
+
+	/* `fgl_service_inline = 0` reproduces the pre-inline behaviour exactly
+	 * -- the dispatcher exits, the outer loop does all of this itself --
+	 * and does it without changing a byte of .text, so the two states are
+	 * a matched pair. */
+	if (!fgl_service_inline || block_stepping)
+		return 0;
+
+	/* A block asked for C (syscall, break, an unknown op).  Only the outer
+	 * loop knows what to do with those. */
+	if (lightrec_exit_flags(state) != LIGHTREC_EXIT_NORMAL)
+		return 0;
+
+	psxRegs.pc = lightrec_get_curr_pc(state);
+	lightrec_tansition_to_pcsx(state);
+
+	regs = lightrec_get_registers(state);
+	gen_interupt((psxCP0Regs *)regs->cp0);
+
+	/* Software interrupts, exactly as the outer loop tests for them after
+	 * a run: `gen_interupt` is what can have raised one. */
+	if ((regs->cp0[13] & regs->cp0[12] & 0x300) && (regs->cp0[12] & 0x1)) {
+		regs->cp0[13] &= ~0x7c;
+		psxException(regs->cp0[13], 0, (psxCP0Regs *)regs->cp0);
+	}
+
+	/* An exception moves the PC, and that is where the next slice starts. */
+	lightrec_set_curr_pc(state, psxRegs.pc);
+
+	cycles_pcsx = psxRegs.next_interupt - psxRegs.cycle;
+
+	if (psxRegs.stop || cycles_pcsx <= 0) {
+		/* Leaving after all, and the transition above already moved
+		 * the clock.  `delta` is a guest-instruction budget, not
+		 * cycles; the caller settles the pair through
+		 * `fgl_cycles_settle` and does not read this back.  Keep the
+		 * target self-consistent all the same. */
+		lightrec_set_target_cycle_count(state,
+			lightrec_current_cycle_count(state) +
+			fgl_meter_cycles(state, delta));
+		return 0;
+	}
+
+	lightrec_set_target_cycle_count(state, (u32)cycles_pcsx * 1024);
+	return 1;
+}
+#endif /* LIGHTREC_WITH_FGL */
 
 static void lightrec_tansition_from_pcsx(struct lightrec_state *state)
 {
@@ -460,6 +581,22 @@ static const struct lightrec_ops lightrec_ops = {
 	.code_inv = LIGHTREC_CODE_INV ? lightrec_code_inv : NULL,
 };
 
+/* THE BACKEND IS CHOSEN HERE AND NOWHERE ELSE, because it is only ever read
+ * by `lightrec_init` and the state is built around whatever it answered.  An
+ * unknown name is not fatal -- lightrec falls back to a compiled-in one -- so
+ * the report is of what is running, not of what was asked for. */
+static void lightrec_make_state(void)
+{
+	const struct lightrec_backend *be =
+		lightrec_select_backend(requested_backend);
+
+	printf("lightrec: backend %s\n", be ? be->name : "none");
+
+	lightrec_state = lightrec_init(LIGHTREC_PROG_NAME,
+			lightrec_map, ARRAY_SIZE(lightrec_map),
+			&lightrec_ops);
+}
+
 static int lightrec_plugin_init(void)
 {
 	lightrec_map[PSX_MAP_KERNEL_USER_RAM].address = psxM;
@@ -502,9 +639,7 @@ static int lightrec_plugin_init(void)
 		lightrec_begin_cycles = (unsigned int) strtol(cycles, NULL, 0);
 #endif
 
-	lightrec_state = lightrec_init(LIGHTREC_PROG_NAME,
-			lightrec_map, ARRAY_SIZE(lightrec_map),
-			&lightrec_ops);
+	lightrec_make_state();
 
 	// fprintf(stderr, "M=0x%lx, P=0x%lx, R=0x%lx, H=0x%lx\n",
 	// 		(uintptr_t) psxM,
@@ -620,6 +755,7 @@ static void print_for_big_ass_debugger(void)
 static void lightrec_plugin_sync_regs_to_pcsx(bool need_cp2);
 static void lightrec_plugin_sync_regs_from_pcsx(bool need_cp2);
 
+
 static void lightrec_plugin_execute_internal(bool block_only)
 {
 	struct lightrec_registers *regs;
@@ -648,8 +784,19 @@ static void lightrec_plugin_execute_internal(bool block_only)
 							      psxRegs.pc,
 							      cycles_lightrec);
 		} else {
+#ifdef __sh__
+			/* Generated code may keep the state pointer in GBR
+			 * (fgl does, and so does Lightning's SH-4 backend with
+			 * OPT_SH4_USE_GBR); KOS keeps the thread's TLS base
+			 * there, so give it back to the C side. */
+			uint32_t saved_gbr;
+			__asm__ __volatile__("stc gbr, %0" : "=r"(saved_gbr));
+#endif
 			psxRegs.pc = lightrec_execute(lightrec_state,
 						      psxRegs.pc, cycles_lightrec);
+#ifdef __sh__
+			__asm__ __volatile__("ldc %0, gbr" : : "r"(saved_gbr));
+#endif
 		}
 
 		lightrec_tansition_to_pcsx(lightrec_state);
@@ -694,8 +841,9 @@ static void lightrec_plugin_execute_internal(bool block_only)
 
 static void lightrec_plugin_execute(psxRegisters *regs)
 {
-	while (!regs->stop)
+	while (!regs->stop) {
 		lightrec_plugin_execute_internal(lightrec_very_debug);
+	}
 }
 
 static void lightrec_plugin_execute_block(psxRegisters *regs,
@@ -706,8 +854,12 @@ static void lightrec_plugin_execute_block(psxRegisters *regs,
 
 static void lightrec_plugin_clear(u32 addr, u32 size)
 {
-	if ((addr == 0 && size == UINT32_MAX)
-	    || (lightrec_hacks & LIGHTREC_OPT_INV_DMA_ONLY))
+	/* Ranged even under LIGHTREC_OPT_INV_DMA_ONLY: a whole-cache flush
+	 * on every RAM DMA recompiles the game for the length of an area
+	 * load (3-4 fps between areas).  Blocks that straddle the range are
+	 * caught by lightrec's per-slot outdated check, which is all the
+	 * per-store path ever relied on. */
+	if (addr == 0 && size == UINT32_MAX)
 		lightrec_invalidate_all(lightrec_state);
 	else
 		/* size * 4: PCSX uses DMA units */
@@ -777,6 +929,13 @@ static void lightrec_plugin_reset(void)
 
 	/* Reset registers */
 	memset(regs, 0, sizeof(*regs));
+
+#ifdef LIGHTREC_WITH_FGL
+	/* The control file was just zeroed without a CTC2 to announce it, and
+	 * the float GTE keeps a shadow of it. */
+	if (using_fgl)
+		gte_fpu_reset();
+#endif
 
 	regs->cp0[12] = 0x10900000; // COP0 enabled | BEV = 1 | TS = 1
 	regs->cp0[15] = 0x00000002; // PRevID = Revision ID, same as R3000A

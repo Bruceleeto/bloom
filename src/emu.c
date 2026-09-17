@@ -27,6 +27,9 @@
 
 #include "bloom-config.h"
 #include "emu.h"
+#ifdef LIGHTREC_WITH_FGL
+#include "fgl/gte_fpu.h"
+#endif
 #include "pvr.h"
 
 int fs_fat_init(void);
@@ -179,6 +182,16 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Could not initialize PCSX core\n");
 		return 1;
 	}
+
+#ifdef LIGHTREC_WITH_FGL
+	/* WHICHEVER CPU CORE RUNS, THE COPROCESSOR IS THIS ONE.
+	 *
+	 * fgl's generated code calls the float GTE directly, while pcsx's
+	 * interpreter dispatches through `psxCP2[]`, which still points at the
+	 * integer one.  Without this a single run holds two GTEs and which one
+	 * a command gets depends on which path reached the coprocessor. */
+	gte_fpu_install();
+#endif
 
 	if (LoadPlugins() < 0) {
 		fprintf(stderr, "Could not load plugins\n");
