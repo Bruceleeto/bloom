@@ -1150,6 +1150,54 @@ static void pvr_add_clip(uint16_t zoffset)
 	}
 }
 
+/*
+ * The PSX samples UVs at the integer pixel position, the PVR at the pixel
+ * centre.  On a mirrored 1:1 sprite (U or V stepping back exactly one texel
+ * per pixel) that lands on the neighbouring texel and shows a garbage column
+ * or row, so the mirrored axis is pushed forward by just under one texel.
+ *
+ * Only exact 1:1 mirrors get this: on 3D geometry the same offset makes
+ * textures shimmer, and no global offset works since at 2x the two directions
+ * want different ones.
+ */
+static void uv_mirror_offset(const struct vertex_coords *coords,
+			     float *uoff, float *voff)
+{
+	int x10 = coords[1].x - coords[0].x, y10 = coords[1].y - coords[0].y;
+	int x20 = coords[2].x - coords[0].x, y20 = coords[2].y - coords[0].y;
+	int u10 = coords[1].u - coords[0].u, u20 = coords[2].u - coords[0].u;
+	int v10 = coords[1].v - coords[0].v, v20 = coords[2].v - coords[0].v;
+	int det = x10 * y20 - x20 * y10;
+	int n[4] = {
+		u10 * y20 - u20 * y10,	/* du/dx * det */
+		x10 * u20 - x20 * u10,	/* du/dy * det */
+		v10 * y20 - v20 * y10,	/* dv/dx * det */
+		x10 * v20 - x20 * v10,	/* dv/dy * det */
+	};
+	unsigned int i;
+
+	if (det < 0) {
+		det = -det;
+		for (i = 0; i < 4; i++)
+			n[i] = -n[i];
+	}
+
+	if (likely((n[0] | n[1] | n[2] | n[3]) >= 0 || det == 0))
+		return;
+
+	/* U reaches here shifted left by the texture depth (x1/x2/x4) */
+	if (n[1] == 0) {
+		if (n[0] == -det)
+			*uoff = 15.0f / 16.0f;
+		else if (n[0] == -2 * det)
+			*uoff = 30.0f / 16.0f;
+		else if (n[0] == -4 * det)
+			*uoff = 60.0f / 16.0f;
+	}
+	if (n[3] == -det && n[2] == 0)
+		*voff = 15.0f / 16.0f;
+}
+
 __pvr
 static void draw_prim(const pvr_poly_hdr_t *hdr,
 		      const struct vertex_coords *coords,
@@ -1163,6 +1211,10 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	pvr_vertex_t *vert;
 	pvr_vertex_part2_t *vert2;
 	unsigned int i;
+	float uoff = 0.0f, voff = 0.0f;
+
+	if (textured && nb >= 3)
+		uv_mirror_offset(coords, &uoff, &voff);
 
 	if (unlikely(hdr)) {
 		sq_hdr = pvr_dr_target();
@@ -1173,8 +1225,8 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	for (i = 0; i < nb; i++) {
 		register float fr0 asm("fr0") = (float)coords[i].x;
 		register float fr1 asm("fr1") = (float)coords[i].y;
-		register float fr2 asm("fr2") = (float)coords[i].u;
-		register float fr3 asm("fr3") = (float)(coords[i].v + voffset);
+		register float fr2 asm("fr2") = (float)coords[i].u + uoff;
+		register float fr3 asm("fr3") = (float)(coords[i].v + voffset) + voff;
 
 		asm inline("ftrv xmtrx, fv0\n"
 			   : "+f"(fr0), "+f"(fr1), "+f"(fr2), "+f"(fr3));
