@@ -77,6 +77,13 @@ static void printmatrixu8(u8 *m) {
 }
 #endif
 
+/* Dreamcast: float AAN IDCT on the SH4 FPU, the same scheme bleemcast
+ * uses.  Blocks are stored as ints in 1/8192 units (the integer path x8). */
+#if defined(_arch_dreamcast) && !defined(MDEC_FLOAT)
+#define MDEC_FLOAT 1
+#endif
+
+#ifndef MDEC_FLOAT
 static inline void fillcol(int *blk, int val) {
 	blk[0 * DSIZE] = blk[1 * DSIZE] = blk[2 * DSIZE] = blk[3 * DSIZE]
 		= blk[4 * DSIZE] = blk[5 * DSIZE] = blk[6 * DSIZE] = blk[7 * DSIZE] = val;
@@ -206,6 +213,7 @@ static void idct(int *block,int used_col) {
 		}
 	}
 }
+#endif /* !MDEC_FLOAT */
 
 // mdec0: command register
 #define MDEC0_STP			0x02000000
@@ -270,6 +278,248 @@ static void iqtab_init(int *iqtab, const unsigned char *iq_y) {
 
 #define	MDEC_END_OF_DATA	0xfe00
 
+#ifdef MDEC_FLOAT
+#define F_A4	1.414213562f
+#define F_A2	1.847759065f
+#define F_B2	2.613125930f
+#define F_B6	1.082392200f
+
+/* iq tables prescaled to output units (Y: pixels, Cr/Cb: 1/64 pixel), and
+ * the same scaled by the block quant scale; the scaled table is only
+ * rebuilt when the quant scale changes */
+struct iqf_tab {
+	float scaled[DSIZE2];
+	int q_scale;
+	float base[DSIZE2];
+};
+
+static struct iqf_tab iqf_y, iqf_uv;
+
+/* pixel clamps, indexed by (v + CLAMP_OFFSET) & CLAMP_MASK */
+#define CLAMP_OFFSET	896
+#define CLAMP_MASK		2047
+static u8 clamp8_lut[CLAMP_MASK + 1], clamp5_lut[CLAMP_MASK + 1];
+
+#define LUT8(v)	clamp8_lut[((v) + CLAMP_OFFSET) & CLAMP_MASK]
+#define LUT5(v)	clamp5_lut[((v) + CLAMP_OFFSET) & CLAMP_MASK]
+/* for offsets that already include CLAMP_OFFSET */
+#define LUT8_O(v)	clamp8_lut[(v) & CLAMP_MASK]
+#define LUT5_O(v)	clamp5_lut[(v) & CLAMP_MASK]
+
+static void iqf_init(void) {
+	int i, v;
+
+	for (i = 0; i < DSIZE2; i++) {
+		iqf_y.base[i] = iq_y[i] / 4194304.0f;
+		iqf_uv.base[i] = iq_uv[i] / 65536.0f;
+	}
+	iqf_y.q_scale = iqf_uv.q_scale = -1;
+
+	for (i = 0; i <= CLAMP_MASK; i++) {
+		v = i - CLAMP_OFFSET;
+		v = v < 0 ? 0 : (v > 255 ? 255 : v);
+		clamp8_lut[i] = v;
+		clamp5_lut[i] = v > 251 ? 31 : (v + 4) >> 3;
+	}
+}
+
+static inline const float *iqf_scaled(struct iqf_tab *t, int q_scale) {
+	int k;
+
+	if (q_scale != t->q_scale) {
+		t->q_scale = q_scale;
+		/* the DC term is not scaled by the quant scale */
+		t->scaled[0] = t->base[0] * 8.0f;
+		for (k = 1; k < DSIZE2; k++)
+			t->scaled[k] = t->base[k] * q_scale;
+	}
+	return t->scaled;
+}
+
+/* ac_cols: columns with a coefficient below row 0,
+ * cols: columns with any coefficient */
+#define IDCT_PUT(o, i, v)	do {						\
+	if (to_u8)							\
+		((u8 *)(o))[i] = LUT8((int)(v));			\
+	else								\
+		((int *)(o))[i] = (int)(v);				\
+} while (0)
+
+/* out is an int block, or with to_u8 a byte block clamped to 0-255 */
+static inline __attribute__((always_inline))
+void idct_f(void *out, const float *in, int ac_cols, int cols, float bias, int to_u8) {
+	float ws[DSIZE2];
+	float tmp0, tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
+	float z5, z10, z11, z12, z13;
+	const float *p;
+	float *w;
+	int i;
+
+	for (i = 0, p = in, w = ws; i < DSIZE; i++, p++, w++) {
+		if (!(ac_cols & (1 << i))) {
+			w[DSIZE * 0] = w[DSIZE * 1] = w[DSIZE * 2] = w[DSIZE * 3]
+				= w[DSIZE * 4] = w[DSIZE * 5] = w[DSIZE * 6] = w[DSIZE * 7] = p[0];
+			continue;
+		}
+
+		z10 = p[DSIZE * 0] + p[DSIZE * 4];
+		z11 = p[DSIZE * 0] - p[DSIZE * 4];
+		z13 = p[DSIZE * 2] + p[DSIZE * 6];
+		z12 = (p[DSIZE * 2] - p[DSIZE * 6]) * F_A4 - z13;
+
+		tmp0 = z10 + z13;
+		tmp3 = z10 - z13;
+		tmp1 = z11 + z12;
+		tmp2 = z11 - z12;
+
+		z13 = p[DSIZE * 3] + p[DSIZE * 5];
+		z10 = p[DSIZE * 3] - p[DSIZE * 5];
+		z11 = p[DSIZE * 1] + p[DSIZE * 7];
+		z12 = p[DSIZE * 1] - p[DSIZE * 7];
+
+		tmp7 = z11 + z13;
+		z5 = (z12 - z10) * F_A2;
+		tmp6 = z10 * F_B2 + z5 - tmp7;
+		tmp5 = (z11 - z13) * F_A4 - tmp6;
+		tmp4 = z12 * F_B6 - z5 + tmp5;
+
+		w[DSIZE * 0] = tmp0 + tmp7;
+		w[DSIZE * 7] = tmp0 - tmp7;
+		w[DSIZE * 1] = tmp1 + tmp6;
+		w[DSIZE * 6] = tmp1 - tmp6;
+		w[DSIZE * 2] = tmp2 + tmp5;
+		w[DSIZE * 5] = tmp2 - tmp5;
+		w[DSIZE * 4] = tmp3 + tmp4;
+		w[DSIZE * 3] = tmp3 - tmp4;
+	}
+
+	if (!(cols & 0xfe)) {
+		/* only column 0 is used: every row is flat */
+		for (i = 0, w = ws; i < DSIZE; i++, w += DSIZE, out = (char *)out + DSIZE * (to_u8 ? 1 : 4)) {
+			tmp0 = w[0] + bias;
+			IDCT_PUT(out, 0, tmp0); IDCT_PUT(out, 1, tmp0);
+			IDCT_PUT(out, 2, tmp0); IDCT_PUT(out, 3, tmp0);
+			IDCT_PUT(out, 4, tmp0); IDCT_PUT(out, 5, tmp0);
+			IDCT_PUT(out, 6, tmp0); IDCT_PUT(out, 7, tmp0);
+		}
+		return;
+	}
+
+	for (i = 0, w = ws; i < DSIZE; i++, w += DSIZE, out = (char *)out + DSIZE * (to_u8 ? 1 : 4)) {
+		z10 = w[0] + w[4];
+		z11 = w[0] - w[4];
+		z13 = w[2] + w[6];
+		z12 = (w[2] - w[6]) * F_A4 - z13;
+
+		tmp0 = z10 + z13;
+		tmp3 = z10 - z13;
+		tmp1 = z11 + z12;
+		tmp2 = z11 - z12;
+
+		z13 = w[3] + w[5];
+		z10 = w[3] - w[5];
+		z11 = w[1] + w[7];
+		z12 = w[1] - w[7];
+
+		tmp7 = z11 + z13;
+		z5 = (z12 - z10) * F_A2;
+		tmp6 = z10 * F_B2 + z5 - tmp7;
+		tmp5 = (z11 - z13) * F_A4 - tmp6;
+		tmp4 = z12 * F_B6 - z5 + tmp5;
+
+		tmp0 += bias;
+		tmp1 += bias;
+		tmp2 += bias;
+		tmp3 += bias;
+
+		IDCT_PUT(out, 0, tmp0 + tmp7);
+		IDCT_PUT(out, 7, tmp0 - tmp7);
+		IDCT_PUT(out, 1, tmp1 + tmp6);
+		IDCT_PUT(out, 6, tmp1 - tmp6);
+		IDCT_PUT(out, 2, tmp2 + tmp5);
+		IDCT_PUT(out, 5, tmp2 - tmp5);
+		IDCT_PUT(out, 4, tmp3 + tmp4);
+		IDCT_PUT(out, 3, tmp3 - tmp4);
+	}
+}
+
+/* kept zeroed between blocks: only the written entries are cleared */
+static float coef[DSIZE2];
+
+/* Cr, Cb gains matching the PVR YUV converter (11/8 instead of 1.402, 1.772),
+ * with Cr/Cb from 1/64 to pixel units */
+#define YUV_GAIN_CR	(1.01953125f / 64.0f)
+#define YUV_GAIN_CB	(1.03125f / 64.0f)
+
+/* to_yuv: decode straight to a PVR YUV converter macroblock (U, V, Y0-Y3
+ * as bytes) instead of int blocks */
+static inline __attribute__((always_inline))
+const unsigned short *rl2any(void *out, const unsigned short *mdec_rl, int to_yuv) {
+	unsigned char zlist[DSIZE2];
+	const float *iqtab;
+	float bias, gain;
+	void *blk;
+	int i, k, n, z, rl, ac_cols, cols;
+
+	for (i = 0; i < 6; i++) {
+		// decode blocks (Cr,Cb,Y1,Y2,Y3,Y4)
+		rl = SWAP16(*mdec_rl); mdec_rl++;
+		iqtab = iqf_scaled(i < 2 ? &iqf_uv : &iqf_y, RLE_RUN(rl));
+		if (to_yuv) {
+			/* every block is level shifted and rounded to bytes */
+			static const unsigned char yuv_pos[6] = { 1, 0, 2, 3, 4, 5 };
+			blk = (u8 *)out + yuv_pos[i] * DSIZE2;
+			bias = 128.5f;
+			gain = i == 0 ? YUV_GAIN_CR : i == 1 ? YUV_GAIN_CB : 1.0f;
+		} else {
+			/* Y is level shifted and rounded here, Cr/Cb stay signed */
+			blk = (int *)out + i * DSIZE2;
+			bias = i < 2 ? 0.0f : 128.5f;
+			gain = 1.0f;
+		}
+		coef[0] = iqtab[0] * RLE_VAL(rl) * gain;
+
+		for (k = 0, n = 0, ac_cols = 0, cols = 1;;) {
+			rl = SWAP16(*mdec_rl); mdec_rl++;
+			if (rl == MDEC_END_OF_DATA) break;
+			k += RLE_RUN(rl) + 1;	// skip zero-coefficients
+
+			if (k > 63)
+				break;
+
+			z = zscan[k];
+			coef[z] = iqtab[k] * RLE_VAL(rl) * gain;
+			zlist[n++] = z;
+			cols |= 1 << (z & 7);
+			if (z > 7)
+				ac_cols |= 1 << (z & 7);
+		}
+
+		if (k == 0) {
+			int v = (int)(coef[0] + bias);
+			if (to_yuv)
+				memset(blk, LUT8(v), DSIZE2);
+			else
+				for (k = 0; k < DSIZE2; k++) ((int *)blk)[k] = v;
+		} else {
+			idct_f(blk, coef, ac_cols, cols, bias, to_yuv);
+			while (n)
+				coef[zlist[--n]] = 0.0f;
+		}
+		coef[0] = 0.0f;
+	}
+	return mdec_rl;
+}
+
+static const unsigned short *rl2blk(int *blk, const unsigned short *mdec_rl) {
+	return rl2any(blk, mdec_rl, 0);
+}
+
+static __attribute__((unused))
+const unsigned short *rl2yuv(u8 *mb, const unsigned short *mdec_rl) {
+	return rl2any(mb, mdec_rl, 1);
+}
+#else
 static const unsigned short *rl2blk(int *blk, const unsigned short *mdec_rl) {
 	int i, k, q_scale, rl, used_col;
  	int *iqtab;
@@ -310,6 +560,7 @@ static const unsigned short *rl2blk(int *blk, const unsigned short *mdec_rl) {
 	}
 	return mdec_rl;
 }
+#endif /* MDEC_FLOAT */
 
 // full scale (JPEG)
 // Y/Cb/Cr[0...255] -> R/G/B[0...255]
@@ -342,6 +593,43 @@ static inline int clamp8(int v)
 #define CLAMP_SCALE8(a)   (clamp8(SCALE8(a)))
 #define CLAMP_SCALE5(a)   (clamp5(SCALE5(a)))
 
+#ifdef MDEC_FLOAT
+/* Y is in level shifted pixels, Cr/Cb in 1/64 pixel: R/G/B offsets are
+ * rounded to pixels, carry the clamp table offset, and a channel is one
+ * table lookup */
+#define	MULR_F(a)		(((1434 * (a) + 0x8000) >> 16) + CLAMP_OFFSET)
+#define	MULB_F(a)		(((1807 * (a) + 0x8000) >> 16) + CLAMP_OFFSET)
+#define	MULG2_F(a, b)	(((-351 * (a) - 728 * (b) + 0x8000) >> 16) + CLAMP_OFFSET)
+
+#define PIX5(c)	LUT5_O(c)
+#define PIX8(c)	LUT8_O(c)
+
+static inline void putlinebw15(u16 *image, int *Yblk) {
+	int i;
+	int A = (mdec.reg0 & MDEC0_STP) ? 0x8000 : 0;
+
+	for (i = 0; i < 8; i++, Yblk++)
+		image[i] = SWAP16((LUT5(*Yblk) * 0x421) | A);
+}
+
+static inline __attribute__((always_inline))
+void putquadrgb15(u16 *image, int *Yblk, int Cr, int Cb) {
+	int Y, R, G, B;
+	int A = (mdec.reg0 & MDEC0_STP) ? 0x8000 : 0;
+	R = MULR_F(Cr);
+	G = MULG2_F(Cb, Cr);
+	B = MULB_F(Cb);
+
+	Y = Yblk[0];
+	image[0] = MAKERGB15(PIX5(Y + R), PIX5(Y + G), PIX5(Y + B), A);
+	Y = Yblk[1];
+	image[1] = MAKERGB15(PIX5(Y + R), PIX5(Y + G), PIX5(Y + B), A);
+	Y = Yblk[8];
+	image[16] = MAKERGB15(PIX5(Y + R), PIX5(Y + G), PIX5(Y + B), A);
+	Y = Yblk[9];
+	image[17] = MAKERGB15(PIX5(Y + R), PIX5(Y + G), PIX5(Y + B), A);
+}
+#else
 static inline void putlinebw15(u16 *image, int *Yblk) {
 	int i;
 	int A = (mdec.reg0 & MDEC0_STP) ? 0x8000 : 0;
@@ -370,6 +658,7 @@ static inline void putquadrgb15(u16 *image, int *Yblk, int Cr, int Cb) {
 	Y = MULY(Yblk[9]);
 	image[17] = MAKERGB15(CLAMP_SCALE5(Y + R), CLAMP_SCALE5(Y + G), CLAMP_SCALE5(Y + B), A);
 }
+#endif /* MDEC_FLOAT */
 
 static inline void yuv2rgb15(int *blk, unsigned short *image) {
 	int x, y;
@@ -394,6 +683,64 @@ static inline void yuv2rgb15(int *blk, unsigned short *image) {
 	}
 }
 
+#ifdef MDEC_FLOAT
+static inline void putlinebw24(u8 * image, int *Yblk) {
+	int i;
+	unsigned char Y;
+	for (i = 0; i < 8 * 3; i += 3, Yblk++) {
+		Y = LUT8(*Yblk);
+		image[i + 0] = Y;
+		image[i + 1] = Y;
+		image[i + 2] = Y;
+	}
+}
+
+static inline __attribute__((always_inline))
+void putquadrgb24(u8 * image, int *Yblk, int Cr, int Cb) {
+	int Y, R, G, B;
+
+	R = MULR_F(Cr);
+	G = MULG2_F(Cb, Cr);
+	B = MULB_F(Cb);
+
+	Y = Yblk[0];
+	image[0 * 3 + 0] = PIX8(Y + R);
+	image[0 * 3 + 1] = PIX8(Y + G);
+	image[0 * 3 + 2] = PIX8(Y + B);
+	Y = Yblk[1];
+	image[1 * 3 + 0] = PIX8(Y + R);
+	image[1 * 3 + 1] = PIX8(Y + G);
+	image[1 * 3 + 2] = PIX8(Y + B);
+	Y = Yblk[8];
+	image[16 * 3 + 0] = PIX8(Y + R);
+	image[16 * 3 + 1] = PIX8(Y + G);
+	image[16 * 3 + 2] = PIX8(Y + B);
+	Y = Yblk[9];
+	image[17 * 3 + 0] = PIX8(Y + R);
+	image[17 * 3 + 1] = PIX8(Y + G);
+	image[17 * 3 + 2] = PIX8(Y + B);
+}
+
+#ifdef _arch_dreamcast
+#include <stdbool.h>
+uint8_t *mdec_yuv_mb(const uint8_t *out);
+extern bool mdec_yuv_skip_rgb;
+
+/* The macroblock as the PVR YUV converter wants it: U (Cb), V (Cr), then the
+ * four Y blocks.  The PVR's matrix uses 11/8 where the MDEC uses 1.402 for Cr
+ * and 1.772 for Cb, so chroma is scaled up to match. */
+static void blk2yuv(const int *blk, u8 *d) {
+	int i;
+
+	for (i = 0; i < DSIZE2; i++)
+		d[i] = LUT8(((blk[DSIZE2 + i] * 1056 + 0x8000) >> 16) + 128);
+	for (i = 0; i < DSIZE2; i++)
+		d[DSIZE2 + i] = LUT8(((blk[i] * 1044 + 0x8000) >> 16) + 128);
+	for (i = 0; i < DSIZE2 * 4; i++)
+		d[DSIZE2 * 2 + i] = LUT8(blk[DSIZE2 * 2 + i]);
+}
+#endif
+#else
 static inline void putlinebw24(u8 * image, int *Yblk) {
 	int i;
 	unsigned char Y;
@@ -429,6 +776,7 @@ static inline void putquadrgb24(u8 * image, int *Yblk, int Cr, int Cb) {
 	image[17 * 3 + 1] = CLAMP_SCALE8(Y + G);
 	image[17 * 3 + 2] = CLAMP_SCALE8(Y + B);
 }
+#endif /* MDEC_FLOAT */
 
 static void yuv2rgb24(int *blk, u8 *image) {
 	int x, y;
@@ -458,6 +806,9 @@ void mdecInit(void) {
 	memset(iq_y, 0, sizeof(iq_y));
 	memset(iq_uv, 0, sizeof(iq_uv));
 	mdec.rl = (u16 *)&psxM[0x100000];
+#ifdef MDEC_FLOAT
+	iqf_init();
+#endif
 }
 
 // command register
@@ -535,6 +886,9 @@ void psxDma0(u32 adr, u32 bcr, u32 chcr) {
 				// printmatrixu8(p + 64);
 				iqtab_init(iq_y, p);
 				iqtab_init(iq_uv, p + 64);
+#ifdef MDEC_FLOAT
+				iqf_init();
+#endif
 			}
 			break;
 
@@ -559,9 +913,29 @@ void mdec0Interrupt()
 	}
 }
 
+#ifdef _arch_dreamcast
+#include <kos/cache.h>
+#endif
+
+/* The whole macroblock is overwritten: claim its cache lines without the
+ * read a store miss would do first */
+static inline void alloc_out_lines(u8 *image, int size) {
+#ifdef _arch_dreamcast
+	u8 *end = image + size;
+
+	for (image = (u8 *)(((uintptr_t)image + 31) & ~31); image + 32 <= end; image += 32)
+		dcache_alloc_line(image);
+#endif
+}
+
 #define SIZE_OF_24B_BLOCK (16*16*3)
 #define SIZE_OF_16B_BLOCK (16*16*2)
 
+#ifdef _arch_dreamcast
+#include <arch/timer.h>
+#define psxDma1 mdec_dma1_timed
+static void psxDma1(u32 adr, u32 bcr, u32 chcr);
+#endif
 void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	u32 words, words_max = 0;
 	int blk[DSIZE2 * 6];
@@ -611,6 +985,7 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 
 		while(size >= SIZE_OF_16B_BLOCK) {
 			mdec.rl = rl2blk(blk, mdec.rl);
+			alloc_out_lines(image, SIZE_OF_16B_BLOCK);
 			yuv2rgb15(blk, (u16 *)image);
 			image += SIZE_OF_16B_BLOCK;
 			size -= SIZE_OF_16B_BLOCK;
@@ -639,7 +1014,26 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 		}
 
 		while(size >= SIZE_OF_24B_BLOCK) {
+#ifdef _arch_dreamcast
+			{
+				u8 *yuv = mdec_yuv_mb(image);
+
+				if (yuv && mdec_yuv_skip_rgb) {
+					/* the RGB isn't displayed: YUV only */
+					mdec.rl = rl2yuv(yuv, mdec.rl);
+					image += SIZE_OF_24B_BLOCK;
+					size -= SIZE_OF_24B_BLOCK;
+					continue;
+				}
+
+				mdec.rl = rl2blk(blk, mdec.rl);
+				if (yuv)
+					blk2yuv(blk, yuv);
+			}
+#else
 			mdec.rl = rl2blk(blk, mdec.rl);
+#endif
+			alloc_out_lines(image, SIZE_OF_24B_BLOCK);
 			yuv2rgb24(blk, image);
 			image += SIZE_OF_24B_BLOCK;
 			size -= SIZE_OF_24B_BLOCK;
@@ -704,6 +1098,17 @@ void mdec1Interrupt() {
 	}
 }
 
+#ifdef _arch_dreamcast
+/* DEBUG: time spent in MDEC decode, shown with the FPS */
+#undef psxDma1
+uint64_t mdec_us;
+void psxDma1(u32 adr, u32 bcr, u32 chcr) {
+	uint64_t t0 = timer_us_gettime64();
+	mdec_dma1_timed(adr, bcr, chcr);
+	mdec_us += timer_us_gettime64() - t0;
+}
+#endif
+
 int mdecFreeze(void *f, int Mode) {
 	u8 *base = (u8 *)psxM;
 	u32 v;
@@ -730,6 +1135,9 @@ int mdecFreeze(void *f, int Mode) {
 	gzfreeze(&mdec.pending_dma1, sizeof(mdec.pending_dma1));
 	gzfreeze(iq_y, sizeof(iq_y));
 	gzfreeze(iq_uv, sizeof(iq_uv));
+#ifdef MDEC_FLOAT
+	iqf_init();
+#endif
 
 	return 0;
 }

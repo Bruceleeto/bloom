@@ -196,7 +196,7 @@ int main(int argc, char **argv)
 		if (WITH_GAME_PATH[0]) {
 			emu_check_cd(WITH_GAME_PATH);
 			ClosePlugins();
-		} else {
+		} else if (!WITH_BIOS_ONLY) {
 			vid_set_mode(DM_640x480, PM_RGB888P);
 			pvr_init_defaults();
 
@@ -258,7 +258,7 @@ int main(int argc, char **argv)
 
 		pvr_shutdown();
 		mcd_fs_shutdown();
-	} while (!WITH_GAME_PATH[0]);
+	} while (!WITH_GAME_PATH[0] && !WITH_BIOS_ONLY);
 
 	printf("Exit...\n");
 	EmuShutdown();

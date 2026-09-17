@@ -23,6 +23,7 @@
 #include "bloom-config.h"
 #include "emu.h"
 #include "pvr.h"
+#include "mdec_yuv.h"
 
 #define MAX_LAG_FRAMES 3
 
@@ -46,6 +47,10 @@ static unsigned int screen_w, screen_h;
 unsigned int screen_bpp;
 
 static uint64_t last_cputime;
+
+/* DEBUG: MDEC decode and 24/15-bit frame copy time, shown with the FPS */
+extern uint64_t mdec_us;
+static uint64_t copy_us;
 static uint64_t last_idletime;
 
 static void dc_alloc_pvram(void)
@@ -196,9 +201,15 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	pvr_poly_hdr_t hdr;
 	pvr_vertex_t vert;
 	int copy_w;
+	uint64_t copy_t0;
+	unsigned int tex_w = TEX_WIDTH, tex_h = TEX_HEIGHT;
+	bool yuv = false;
 
 	if (!started || !vram)
 		return;
+
+	if (!bgr24)
+		mdec_yuv_stop();
 
 	if (HARDWARE_ACCELERATED && !frame_was_24bpp) {
 		/* Render the old frame */
@@ -225,10 +236,19 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		 * we're reading too far. */
 		copy_w = (w + 31) & ~31;
 
+		copy_t0 = timer_us_gettime64();
 		if (bgr24)
+			yuv = mdec_yuv_upload(pvram, offset, w, h, &tex_w, &tex_h);
+		else
+			mdec_yuv_stop();
+
+		if (yuv)
+			;
+		else if (bgr24)
 			copy24(vram, copy_w, h);
 		else
 			copy15(vram, copy_w, h);
+		copy_us += timer_us_gettime64() - copy_t0;
 
 		ymin = (float)y * (float)screen_fh;
 		ymax = (float)(y + h) * (float)screen_fh;
@@ -240,8 +260,9 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		pvr_list_begin(PVR_LIST_OP_POLY);
 
 		pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY,
-				 PVR_TXRFMT_NONTWIDDLED | (bgr24 ? PVR_TXRFMT_RGB565 : PVR_TXRFMT_ARGB1555),
-				 TEX_WIDTH, TEX_HEIGHT, pvram, PVR_FILTER_NONE);
+				 PVR_TXRFMT_NONTWIDDLED | (yuv ? PVR_TXRFMT_YUV422 :
+				 bgr24 ? PVR_TXRFMT_RGB565 : PVR_TXRFMT_ARGB1555),
+				 tex_w, tex_h, pvram, PVR_FILTER_NONE);
 
 		pvr_poly_compile(&hdr, &cxt);
 		pvr_prim(&hdr, sizeof(hdr));
@@ -260,7 +281,7 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		vert.x = xmax;
 		vert.y = ymin;
 		vert.z = 1.0f;
-		vert.u = (float)w / (float)TEX_WIDTH;
+		vert.u = (float)w / (float)tex_w;
 		vert.v = 0.0f;
 		pvr_prim(&vert, sizeof(vert));
 
@@ -268,14 +289,14 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 		vert.y = ymax;
 		vert.z = 1.0f;
 		vert.u = 0.0f;
-		vert.v = (float)h / (float)TEX_HEIGHT;
+		vert.v = (float)h / (float)tex_h;
 		pvr_prim(&vert, sizeof(vert));
 
 		vert.x = xmax;
 		vert.y = ymax;
 		vert.z = 1.0f;
-		vert.u = (float)w / (float)TEX_WIDTH;
-		vert.v = (float)h / (float)TEX_HEIGHT;
+		vert.u = (float)w / (float)tex_w;
+		vert.v = (float)h / (float)tex_h;
 		vert.flags = PVR_CMD_VERTEX_EOL;
 		pvr_prim(&vert, sizeof(vert));
 
@@ -307,6 +328,16 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 			   (float)frames, screen_w, screen_h, screen_bpp,
 			   (float)pvr_stats.rnd_last_time * 100.0f / 16666666.7f,
 			   100.0f - 100.0f * idle_diff / cpu_diff);
+
+		printf("yuv %u/%u  ", mdec_yuv_frames, mdec_yuv_misses);
+		mdec_yuv_frames = mdec_yuv_misses = 0;
+		printf("FPS %u  mdec %llu ms/s  copy %llu ms/s  bpp %u\n",
+		       frames, (unsigned long long)(mdec_us / 1000),
+		       (unsigned long long)(copy_us / 1000), screen_bpp);
+		vmu_printf(" FPS: %5.1f\n MDEC %llums\n COPY %llums",
+			   (float)frames, (unsigned long long)(mdec_us / 1000),
+			   (unsigned long long)(copy_us / 1000));
+		mdec_us = copy_us = 0;
 
 		timer_ms = new_timer;
 		frames = 0;

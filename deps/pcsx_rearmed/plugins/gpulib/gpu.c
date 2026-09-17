@@ -436,6 +436,11 @@ static inline void do_vram_line(uint16_t *vram_, int x, int y,
     memcpy(vram, mem, l * 2);
 }
 
+#ifdef _arch_dreamcast
+void mdec_yuv_vram_write(const uint16_t *data, int words16, int x, int y,
+			 int w, int h, int first_line);
+#endif
+
 static int do_vram_io(struct psx_gpu *gpu, uint32_t *data, int count, int is_read)
 {
   int count_initial = count;
@@ -467,6 +472,11 @@ static int do_vram_io(struct psx_gpu *gpu, uint32_t *data, int count, int is_rea
     sdata += l;
     count -= l;
   }
+
+#ifdef _arch_dreamcast
+  if (!is_read)
+    mdec_yuv_vram_write(sdata, count, x, y & 511, w, h, gpu->dma_start.y);
+#endif
 
   for (; h > 0 && count >= w; sdata += w, count -= w, y++, h--) {
     y &= 511;
