@@ -386,8 +386,8 @@ if (WITH_EMBEDDED_BIOS_PATH)
 endif()
 
 set(WITH_BIOS_PATH "" CACHE PATH "Runtime path to the (optional) BIOS file")
-set(WITH_GAME_PATH "" CACHE PATH "If set, auto-boot the CD image at the given path")
-set(WITH_BOOT_SSTATE "" CACHE PATH "If set, load this savestate at boot")
+set(WITH_GAME_PATH "/ide/bloom/game.bin" CACHE PATH "If set, auto-boot the CD image at the given path")
+set(WITH_BOOT_SSTATE "/rd/bench.sav.gz" CACHE PATH "If set, load this savestate at boot")
 
 set(WITH_MCD1_PATH "/dev/mcd0" CACHE PATH "Runtime path to the first memory card image")
 set(WITH_MCD2_PATH "/dev/mcd1" CACHE PATH "Runtime path to the second memory card image")
