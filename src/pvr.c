@@ -1082,6 +1082,11 @@ static void pvr_update_caches(int x, int y, int w, int h, bool invalidate_only)
 	unsigned int x2, y2, dx, dy, page_offset;
 	uint16_t xmin, xmax, ymin, ymax;
 
+#if WITH_SH4_SNAPSHOT
+	if (sh4snap_no_pvr)
+		return;
+#endif
+
 	if (screen_bpp == 24)
 		return;
 
@@ -2600,6 +2605,14 @@ static void process_gpu_commands(void)
 	uint32_t cmd, len;
 	uint16_t draw_x, draw_y;
 	bool draw_updated;
+
+#if WITH_SH4_SNAPSHOT
+	if (sh4snap_no_pvr) {
+		/* SH4-timing snapshot run: no PowerVR work */
+		pvr.cmdbuf_offt = 0;
+		return;
+	}
+#endif
 
 	for (cmd_offt = 0; cmd_offt < pvr.cmdbuf_offt; cmd_offt += 1 + len) {
 		pbuffer = (const union PacketBuffer *)&cmdbuf[cmd_offt];
