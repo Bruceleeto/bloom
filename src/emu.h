@@ -48,5 +48,9 @@ _Bool load_bios(int fd);
 /* Copy 32 bytes from src to dst. Both must be aligned to 32 bytes. */
 void copy32(void *dst, const void *src);
 
+/* SH4-timing snapshot hook (src/sh4snap.c, WITH_SH4_SNAPSHOT) */
+extern _Bool sh4snap_no_pvr;
+void sh4snap_frame(void);
+
 __END_DECLS
 #endif /* __BLOOM_EMU_H */

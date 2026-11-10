@@ -283,6 +283,13 @@ target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#${ZLIB_LIBRARIES} tsunami parallax
 )
 
+option(WITH_SH4_SNAPSHOT "SH4-timing lab snapshot at a fixed frame, then stop rendering and exit" OFF)
+set(WITH_SH4_SNAPSHOT_FRAME 600 CACHE STRING "PS1 frame (vout flip) at which the SH4-timing snapshot is taken")
+if (WITH_SH4_SNAPSHOT)
+	target_sources(bloom PRIVATE src/sh4snap.c src/sh4snap_capture.S)
+	target_include_directories(bloom PRIVATE ${PCSX_REAL_DIR}/plugins)
+endif()
+
 option(WITH_CDROM_DMA "Read CD-ROM sectors using DMA" ON)
 set(WITH_CDROM_CACHE_SIZE 16 CACHE STRING "CD-ROM cache size in sectors")
 

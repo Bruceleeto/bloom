@@ -200,6 +200,12 @@ static void dc_vout_flip(const void *vram, int offset, int bgr24,
 	if (!started || !vram)
 		return;
 
+#if WITH_SH4_SNAPSHOT
+	sh4snap_frame();
+	if (sh4snap_no_pvr)
+		return;
+#endif
+
 	if (HARDWARE_ACCELERATED && !frame_was_24bpp) {
 		/* Render the old frame */
 		hw_render_stop();
