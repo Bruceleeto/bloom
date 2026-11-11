@@ -3,3 +3,4 @@ romdisk.img
 build
 *.o
 build-sh4snap/
+build-fgl-snap/ 

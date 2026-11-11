@@ -1183,6 +1183,18 @@ static void emit_idle_clamp(fgl_emitter *e)
 	sh4_emit_mov_imm(&e->cg, 0, FGL_R_CYCLE);
 }
 
+/* THE EXIT PC IS LOADED ON THE COLD SIDE OF THE BUDGET TEST (bloom, SH4-timing lab).
+ *
+ * An arm's `bf out` is the only reader of r2: a link site carries its target in
+ * its own literal.  Loading r2 ahead of `cmp/pl` made every linked edge pay a
+ * pool load -- 42.9k per frame in the Spyro snapshot, ~5k of them D-cache misses
+ * (the pool shares lines with guest data) -- for a path taken once per slice.
+ * With this on, the arm records its PC and `bf out` lands on a two-word stub
+ * that loads it and goes to the dispatcher exit.  0 restores the old layout. */
+#ifndef FGL_COLD_EXIT_PC
+#define FGL_COLD_EXIT_PC 1
+#endif
+
 static int emit_local_edge(fgl_emitter *e, uint32_t pc, int idle)
 {
 	int l = region_find(e, pc);
@@ -1190,7 +1202,8 @@ static int emit_local_edge(fgl_emitter *e, uint32_t pc, int idle)
 	int out = -1, site;
 
 	if (backward || e->may_exit || (region_dbg() & 1)) {
-		emit_const(e, pc, FGL_R_EXIT);
+		if (!FGL_COLD_EXIT_PC)
+			emit_const(e, pc, FGL_R_EXIT);
 		if (idle)
 			emit_idle_clamp(e);
 		sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
@@ -3878,6 +3891,10 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 	uint32_t entry;
 	int i, f = 0, need_exit = 1;
 	int miss[3], n_miss = 0, seq_exit = 1, k2;
+	uint32_t miss_pc[3];            /* FGL_COLD_EXIT_PC: r2 for that miss */
+	int miss_pcv[3];                /* 1 = the stub must load miss_pc */
+	uint32_t pc1 = 0, pc2 = 0;
+	int pc1v = 0, pc2v = 0;
 
 	entry = e->base + fgl_size(e);
 	slot_barrier(e);
@@ -4304,12 +4321,20 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 				if (l >= 0) {
 					out1 = emit_local_edge(e, t->imm,
 							t->hint & FGL_H_IDLE);
+					pc1 = t->imm;
+					pc1v = FGL_COLD_EXIT_PC;
 					goto taken_done;
 				}
 			}
 
-			if (t->op == IR_COND && e->cond_arms && !FGL_ENTRY_HOOK)
-				emit_const(e, t->imm, FGL_R_EXIT);       /* taken */
+			if (t->op == IR_COND && e->cond_arms && !FGL_ENTRY_HOOK) {
+				if (FGL_COLD_EXIT_PC) {
+					pc1 = t->imm;            /* taken, loaded by the stub */
+					pc1v = 1;
+				} else {
+					emit_const(e, t->imm, FGL_R_EXIT);       /* taken */
+				}
+			}
 
 			if (t->hint & FGL_H_IDLE)
 				emit_idle_clamp(e);
@@ -4404,10 +4429,18 @@ taken_done:
 					patch_fwd8(e, fall);
 				if (region_find(e, t->imm2) >= 0) {
 					out2 = emit_local_edge(e, t->imm2, 0);
+					pc2 = t->imm2;
+					pc2v = FGL_COLD_EXIT_PC;
 					goto fall_done;
 				}
-				if (e->cond_arms && !FGL_ENTRY_HOOK)
-					emit_const(e, t->imm2, FGL_R_EXIT); /* fallthrough */
+				if (e->cond_arms && !FGL_ENTRY_HOOK) {
+					if (FGL_COLD_EXIT_PC) {
+						pc2 = t->imm2;   /* loaded by the stub */
+						pc2v = 1;
+					} else {
+						emit_const(e, t->imm2, FGL_R_EXIT); /* fallthrough */
+					}
+				}
 #if !FGL_ENTRY_HOOK
 				sh4_emit_cmppl(&e->cg, FGL_R_CYCLE);
 #endif
@@ -4422,10 +4455,14 @@ fall_done:
 			}
 
 			if (out1 >= 0) {
+				miss_pc[n_miss] = pc1;
+				miss_pcv[n_miss] = pc1v;
 				miss[n_miss++] = out1;
 				need_exit = 1;
 			}
 			if (out2 >= 0) {
+				miss_pc[n_miss] = pc2;
+				miss_pcv[n_miss] = pc2v;
 				miss[n_miss++] = out2;
 				need_exit = 1;
 			}
@@ -4434,6 +4471,7 @@ fall_done:
 			 * so its branch lands here, at the dispatcher, exactly
 			 * as it did before linking existed. */
 			if (fall >= 0 && FGL_LINK_COND != 2) {
+				miss_pcv[n_miss] = 0;
 				miss[n_miss++] = fall;
 				need_exit = 1;
 			}
@@ -4453,9 +4491,26 @@ fall_done:
 	 * transfer) may carry a lifted flush store in that slot and belongs
 	 * to its own basic block; it is never the shared one. */
 	if (need_exit || (region_dbg() & 2)) {
-		int shared = 0, k;
+		int shared = 0, k, n_all = n_miss;
+		int sb[3], n_sb = 0;    /* stub `bra`s to the exit */
 
-		if (!seq_exit && n_miss && e->exit_at1 && !layout_off(2) &&
+		/* FGL_COLD_EXIT_PC: each deferred miss lands on its own stub,
+		 * `mov.l =pc,r2; bra exit; nop`, and leaves the miss list. */
+		for (k = 0, k2 = 0; k < n_all; k++) {
+			if (!miss_pcv[k]) {
+				miss[k2++] = miss[k];
+				continue;
+			}
+			patch_fwd8(e, miss[k]);         /* barrier: no CSE across */
+			emit_const(e, miss_pc[k], FGL_R_EXIT);
+			sb[n_sb++] = here(e);
+			sh4_word(&e->cg, 0xa000u);      /* bra exit, patched below */
+			sh4_emit_nop(&e->cg);
+			slot_barrier(e);
+		}
+		n_miss = k2;
+
+		if (!seq_exit && n_all && e->exit_at1 && !layout_off(2) &&
 		    !(region_dbg() & 2)) {
 			int at = e->exit_at1 - 1;
 
@@ -4463,9 +4518,14 @@ fall_done:
 			for (k = 0; k < n_miss; k++)
 				if (!sh4_disp8_fits(at - miss[k] - 2))
 					shared = 0;
+			for (k = 0; k < n_sb; k++)
+				if (!sh4_disp12_fits(at - sb[k] - 2))
+					shared = 0;
 			if (shared) {
 				for (k = 0; k < n_miss; k++)
 					patch_cond8_to(e, miss[k], at);
+				for (k = 0; k < n_sb; k++)
+					patch_bra12(e, sb[k], at);
 				layout_share_n++;
 				slot_barrier(e);
 			}
@@ -4473,9 +4533,19 @@ fall_done:
 		if (!shared) {
 			int at;
 
+			/* The last stub's `bra` would jump to the next word. */
+			if (n_sb && sb[n_sb - 1] == here(e) - 2) {
+				e->cg.ptr -= 4;         /* two words */
+				if (e->cg.tagp)
+					e->cg.tagp -= 2;
+				n_sb--;
+				slot_barrier(e);
+			}
 			for (k = 0; k < n_miss; k++)
 				patch_fwd8(e, miss[k]);
 			at = here(e);
+			for (k = 0; k < n_sb; k++)
+				patch_bra12(e, sb[k], at);
 			e->cg.tag = FGL_TAG_EPILOGUE;
 			sh4_emit_mov_l_load_gbr(&e->cg, (int)FGL_AT_DISPATCH);
 			/* The slot: the last flush store when it went through
@@ -4483,7 +4553,7 @@ fall_done:
 			 * `nop` when nothing does. */
 			emit_delayed(e, SH4_N(0x402b, FGL_R_XFER),
 				     1u << FGL_R_XFER);
-			if (!seq_exit && n_miss && !(region_dbg() & 2))
+			if (!seq_exit && n_all && !(region_dbg() & 2))
 				e->exit_at1 = at + 1;
 		}
 	} else {

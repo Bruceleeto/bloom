@@ -500,6 +500,20 @@ int cdra_get_buf_cached_approx(void)
 
    return buf_use;
 }
+int cdimg_snap_preload(int before, int count);
+
+/* Bloom SH4-timing snapshot hook (see cdriso.c), under the reader lock */
+int cdra_snap_preload(int before, int count)
+{
+   int ret;
+   if (acdrom.read_lock)
+      slock_lock(acdrom.read_lock);
+   ret = cdimg_snap_preload(before, count);
+   if (acdrom.read_lock)
+      slock_unlock(acdrom.read_lock);
+   return ret;
+}
+
 #else
 
 // phys. CD-ROM without a cache is unusable so not implemented
@@ -576,6 +590,13 @@ void cdra_stop_thread(void) {}
 void cdra_set_buf_count(int newcount) {}
 int  cdra_get_buf_count(void) { return 0; }
 int  cdra_get_buf_cached_approx(void) { return 0; }
+
+int cdimg_snap_preload(int before, int count);
+
+int cdra_snap_preload(int before, int count)
+{
+   return cdimg_snap_preload(before, count);
+}
 
 #endif
 

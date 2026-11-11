@@ -435,7 +435,7 @@ _fgl_dispatch_ds_check:
  *  site+0  mov.l @(FGL_AT_LINK, gbr), r0
  *  site+2  jsr   @r0
  *  site+4  nop                         PR is site+6
- * and arrives with the target PC in r2.  fgl_link_resolve rewrites
+ * and reads the target PC from the site's literal.  fgl_link_resolve rewrites
  * site+0..3 into `bra target; nop` when it can.  The budget test lives in
  * the tail because a linked edge never passes the loop.  C clobbers r0-r7;
  * only r7 (a pin) holds anything at a block tail, so it is saved by hand.
@@ -445,6 +445,14 @@ _fgl_link_stub:
 	sts	pr, r0
 	add	#-6, r0				/* the call site */
 	mov.l	r0, @-r15
+	/* The target guest PC is the site's literal, at ((site + 4) & ~3) + 4
+	 * (emit_link_site), not r2: with FGL_COLD_EXIT_PC the arm loads r2
+	 * only on its budget-miss path.  r1 is free at a block tail. */
+	mov	r0, r2
+	add	#4, r2
+	mov	#-4, r1
+	and	r1, r2
+	mov.l	@(4, r2), r2
 	mov.l	r2, @-r15			/* the target guest PC */
 #if FGL_NUM_PINS > 3
 	PIN_CALLER_SAVE				/* pinned and caller-saved */

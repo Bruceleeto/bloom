@@ -19,6 +19,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _arch_dreamcast
+#include <arch/irq.h>
+#endif
+
 #include "lightrec-private.h"
 #include "blockcache.h"
 #include "fgl.h"
@@ -230,6 +234,11 @@ static void fgl_link_restore(struct lightrec_state *state, uint32_t site,
 			     uint32_t pc)
 {
 	uint32_t lit = fgl_link_lit(site);
+#ifdef _arch_dreamcast
+	/* The stub reads the target from the literal (dispatch.S), so no
+	 * thread may run this site between the two stores below. */
+	irq_mask_t irqs = irq_disable();
+#endif
 
 	/* One aligned store: the fetcher cannot see this half-done, which is
 	 * what SH4_LINK_SITE_ALIGN exists to guarantee (emit.c). */
@@ -243,6 +252,9 @@ static void fgl_link_restore(struct lightrec_state *state, uint32_t site,
 	 * nothing reads the literal until the stub runs. */
 	*(volatile uint32_t *)(uintptr_t)lit = pc;
 	fgl_site_inv(state, lit);
+#ifdef _arch_dreamcast
+	irq_restore(irqs);
+#endif
 }
 
 void fgl_unlink_all(struct lightrec_state *state, unsigned why)

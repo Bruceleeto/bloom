@@ -301,7 +301,7 @@ alignas(32) static matrix_t matrix_bak;
 
 static struct poly polybuf[POLY_BUFFER_SIZE / sizeof(struct poly)];
 
-static uint32_t cmdbuf[32768];
+static uint32_t cmdbuf[32768] __attribute__((aligned(32)));	/* whole cache lines: cmdbuf_append uses movca.l */
 
 alignas(4) static const uint16_t fake_tex_data[] = {
 	/* Alternating 0x8000 / 0x0000 but pre-twiddled */
@@ -2979,6 +2979,23 @@ static void process_gpu_commands(void)
 	pvr.cmdbuf_offt = 0;
 }
 
+/* Append n words to cmdbuf. cmdbuf is only ever filled forward, so a word that starts a
+ * cache line starts a line with no data yet: movca.l allocates it without reading it from RAM
+ * (memcpy's store would miss and fetch the line first). Inline: most commands are 4-13 words. */
+static inline void cmdbuf_append(uint32_t *dst, const uint32_t *src, unsigned int n)
+{
+	do {
+		uint32_t v = *src++;
+
+		if (!((uintptr_t)dst & 31))
+			__asm__ volatile("movca.l %1,@%0" : : "r"(dst), "z"(v) : "memory");
+		else
+			*dst = v;
+		dst++;
+	} while (--n);
+}
+
+__attribute__((section(".text.gpuchain")))
 int do_cmd_list(uint32_t *list, int list_len,
 		int *cycles_sum_out, int *cycles_last, int *last_cmd)
 {
@@ -3021,7 +3038,7 @@ int do_cmd_list(uint32_t *list, int list_len,
 			renderer_flush_queues();
 		}
 
-		memcpy(&cmdbuf[pvr.cmdbuf_offt], list, (len + 1) * 4);
+		cmdbuf_append(&cmdbuf[pvr.cmdbuf_offt], list, len + 1);
 		pvr.cmdbuf_offt += len + 1;
 
 		pbuffer = (const union PacketBuffer *)list;

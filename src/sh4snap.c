@@ -35,9 +35,17 @@ bool sh4snap_no_pvr;		/* read by the renderer and the vout flip */
 
 static uint32_t snap_state[204] __attribute__((aligned(32)));
 static unsigned int snap_frames;	/* flips seen so far */
+static unsigned int snap_at;		/* flip of the current capture, 0 = none yet */
+static unsigned int snap_tries;
+static unsigned int snap_reads0;	/* cdimg_reads at the capture */
 static int snap_resumed;
 static uint64_t snap_t0;
 static uint64_t snap_ns[SH4SNAP_RUN_FRAMES];
+
+/* Disc image reads by any thread (cdriso.c). The lab has no IDE/GD-ROM, so a measured run
+ * must not read the disc: if it did, capture again at the current frame and retry. */
+extern volatile unsigned int cdimg_reads;
+int cdra_snap_preload(int before, int count);	/* cdrom-async.c: disc sectors into RAM */
 
 static int snap_write(const char *path, const void *data, size_t n)
 {
@@ -89,6 +97,35 @@ uint32_t __attribute__((noinline)) sh4snap_hash(void)
 	return h;
 }
 
+static int __attribute__((noinline)) snap_capture(void)
+{
+	int pre;
+
+	snap_at = snap_frames;
+	/* The measured frames read the disc (XA streaming): serve the next sectors from RAM. */
+	pre = cdra_snap_preload(32, 192);
+	snap_resumed = sh4_snapshot_capture(snap_state);
+	sh4snap_no_pvr = true;
+
+	if (snap_resumed)
+		return 0;
+
+	snap_reads0 = cdimg_reads;
+	dcache_wback_range(0x8c000000, 16 * 1024 * 1024);
+	printf("SNAPSHOT capture frame=%u preload=%d pc=%08lx sr=%08lx sp=%08lx\n",
+	       snap_frames, pre, (unsigned long)snap_state[18],
+	       (unsigned long)snap_state[19], (unsigned long)snap_state[15]);
+
+	if (snap_write("/pc/bloom_state.bin", snap_state, sizeof(snap_state)) ||
+	    snap_write("/pc/bloom_ram.bin", (const void *)0x8c000000, 16 * 1024 * 1024))
+		return -1;
+
+	printf("SNAPSHOT files written\n");
+	snap_reads0 = cdimg_reads;	/* not the file writes themselves */
+	snap_t0 = timer_ns_gettime64();
+	return 0;
+}
+
 /* Called once per PS1 frame, at the vout flip (the lab's frame marker). */
 void __attribute__((noinline)) sh4snap_frame(void)
 {
@@ -101,35 +138,20 @@ void __attribute__((noinline)) sh4snap_frame(void)
 	if (snap_frames < WITH_SH4_SNAPSHOT_FRAME)
 		return;
 
-	if (snap_frames == WITH_SH4_SNAPSHOT_FRAME) {
-		snap_resumed = sh4_snapshot_capture(snap_state);
-		sh4snap_no_pvr = true;
-
-		if (!snap_resumed) {
-			dcache_wback_range(0x8c000000, 16 * 1024 * 1024);
-			printf("SNAPSHOT capture frame=%u pc=%08lx sr=%08lx sp=%08lx\n",
-			       snap_frames, (unsigned long)snap_state[18],
-			       (unsigned long)snap_state[19], (unsigned long)snap_state[15]);
-
-			if (snap_write("/pc/bloom_state.bin", snap_state, sizeof(snap_state)) ||
-			    snap_write("/pc/bloom_ram.bin", (const void *)0x8c000000, 16 * 1024 * 1024))
-				arch_exit();
-
-			printf("SNAPSHOT files written\n");
-			snap_t0 = timer_ns_gettime64();
-		}
-
+	if (!snap_at) {
+		if (snap_capture())
+			arch_exit();
 		return;
 	}
 
-	/* frames 1 .. SH4SNAP_RUN_FRAMES after the snapshot */
+	/* frames 1 .. SH4SNAP_RUN_FRAMES after the capture */
 	if (!snap_resumed) {
 		now = timer_ns_gettime64();
-		snap_ns[snap_frames - WITH_SH4_SNAPSHOT_FRAME - 1] = now - snap_t0;
+		snap_ns[snap_frames - snap_at - 1] = now - snap_t0;
 		snap_t0 = now;
 	}
 
-	if (snap_frames < WITH_SH4_SNAPSHOT_FRAME + SH4SNAP_RUN_FRAMES)
+	if (snap_frames < snap_at + SH4SNAP_RUN_FRAMES)
 		return;
 
 	h = sh4snap_hash();
@@ -140,10 +162,21 @@ void __attribute__((noinline)) sh4snap_frame(void)
 			;
 	}
 
-	snprintf(line, sizeof(line), "hash=%08lx frames=%u frame_ns=%llu,%llu,%llu\n",
+	if (cdimg_reads != snap_reads0) {
+		printf("SNAPSHOT retry: %u disc reads during the run\n", cdimg_reads - snap_reads0);
+		if (++snap_tries >= 30) {
+			printf("SNAPSHOT error: no 3-frame window without disc reads\n");
+			arch_exit();
+		}
+		if (snap_capture())
+			arch_exit();
+		return;
+	}
+
+	snprintf(line, sizeof(line), "hash=%08lx frames=%u frame_ns=%llu,%llu,%llu capture=%u\n",
 		 (unsigned long)h, snap_frames,
 		 (unsigned long long)snap_ns[0], (unsigned long long)snap_ns[1],
-		 (unsigned long long)snap_ns[2]);
+		 (unsigned long long)snap_ns[2], snap_at);
 	printf("SNAPSHOT result %s", line);
 	snap_write("/pc/bloom_result.txt", line, strlen(line));
 	printf("done\n");

@@ -206,8 +206,12 @@ static bool has_interrupt(void)
 
 static void lightrec_tansition_to_pcsx(struct lightrec_state *state)
 {
-	psxRegs.cycle += lightrec_current_cycle_count(state) / 1024;
-	lightrec_reset_cycle_count(state, 0);
+	u32 cycles = lightrec_current_cycle_count(state);
+
+	/* Keep the fraction of a PS1 cycle (cycles_per_op is 1792/1024): dropping
+	 * it made the PS1 clock depend on how often the JIT calls into C. */
+	psxRegs.cycle += cycles / 1024;
+	lightrec_reset_cycle_count(state, cycles % 1024);
 }
 
 #ifdef LIGHTREC_WITH_FGL
@@ -342,10 +346,21 @@ static u8 hw_read_byte(struct lightrec_state *state, u32 op, void *host, u32 mem
 	return val;
 }
 
+#include "../psxcounters.h"
+
 static u16 hw_read_half(struct lightrec_state *state,
 			u32 op, void *host, u32 mem)
 {
 	u16 val;
+
+	/* Root counter mode and target are plain fields: no clock sync needed.
+	 * (Spyro polls counter 2 hundreds of times per frame.) */
+	switch (mem) {
+	case 0x1f801104: case 0x1f801114: case 0x1f801124:
+		return psxRcntRmode((mem >> 4) & 3);
+	case 0x1f801108: case 0x1f801118: case 0x1f801128:
+		return psxRcntRtarget((mem >> 4) & 3);
+	}
 
 	lightrec_tansition_to_pcsx(state);
 

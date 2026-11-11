@@ -785,6 +785,7 @@ void GPUwriteData(uint32_t data)
     flush_cmd_buffer(&gpu);
 }
 
+__attribute__((section(".text.gpuchain")))
 long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
   uint32_t *progress_addr, int32_t *cycles_last_cmd)
 {
@@ -792,6 +793,7 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
   int len, left, count, ld_count = 32;
   int cpu_cycles_sum = 0;
   int cpu_cycles_last = 0;
+  int status_stale = 0;
 
   preload(rambase + (start_addr & 0x1fffff) / 4);
 
@@ -825,7 +827,26 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
     }
 
     if (len) {
-      left = do_cmd_buffer(&gpu, list + 1, len, &cpu_cycles_sum, &cpu_cycles_last);
+      uint32_t cmd0 = (LE32TOH(list[1]) >> 24) - 0x20;
+      int pos = 0;
+      left = len;
+      if (likely(cmd0 < 0x60 && !gpu.dma.h && !gpu.frameskip.active)) {
+        // Fast path: the node starts with a primitive (GP0 20-7f), which do_cmd_buffer
+        // would hand straight to do_cmd_list; skip its per-call setup. The status bits
+        // it sets depend only on ex_regs and are written once after the chain.
+        uint32_t old_e3 = gpu.ex_regs[3];
+        int cmd;
+        pos = do_cmd_list(list + 1, len, &cpu_cycles_sum, &cpu_cycles_last, &cmd);
+        gpu.state.fb_dirty = 1;
+        status_stale = 1;
+        if (old_e3 != gpu.ex_regs[3])
+          decide_frameskip_allow(&gpu);
+        left = len - pos;
+        if (cmd == -1)
+          pos = len;	// incomplete command: keep the rest, as do_cmd_buffer does
+      }
+      if (pos < len)
+        left = do_cmd_buffer(&gpu, list + 1 + pos, left, &cpu_cycles_sum, &cpu_cycles_last);
       if (left) {
         memcpy(gpu.cmd_buffer, list + 1 + len - left, left * 4);
         gpu.cmd_len = left;
@@ -848,6 +869,13 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
       ld_addr = addr;
       ld_count *= 2;
     }
+  }
+
+  if (status_stale) {
+    // as at the end of do_cmd_buffer
+    gpu.status &= ~0x1fff;
+    gpu.status |= gpu.ex_regs[1] & 0x7ff;
+    gpu.status |= (gpu.ex_regs[6] & 3) << 11;
   }
 
   //printf(" -> %d %d\n", cpu_cycles_sum, cpu_cycles_last);

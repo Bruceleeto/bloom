@@ -95,6 +95,9 @@ static struct {
 #define chd_img 0
 #endif
 
+/* Number of reads from the disc image, by any thread (Bloom SH4-timing snapshot hook). */
+volatile unsigned int cdimg_reads;
+
 static int (*cdimg_read_func)(FILE *f, unsigned int base, void *dest, int sector);
 static int (*cdimg_read_sub_func)(FILE *f, int sector, void *dest);
 
@@ -1635,6 +1638,55 @@ static void DecodeRawSubData(unsigned char *subbuffer) {
 	memcpy(&subbuffer[12], subQData, 12);
 }
 
+/* Bloom SH4-timing snapshot hook: a window of data sectors preloaded into RAM. While it is set,
+ * ISOreadTrack() serves those sectors from RAM (same bytes, same return value) and only other
+ * sectors reach the drive, counted in cdimg_reads. The SH4-timing lab has no IDE drive. */
+#define SNAP_PRE_MAX 192
+static unsigned char (*snap_pre_buf)[CD_FRAMESIZE_RAW];
+static int snap_pre_ret[SNAP_PRE_MAX];
+static int snap_pre_first, snap_pre_n, cdimg_last_sector;
+
+static int cdimg_read_main(void *buf, int sector)
+{
+	int i = sector - snap_pre_first, ret;
+
+	if (snap_pre_n && i >= 0 && i < snap_pre_n && snap_pre_ret[i] > 0) {
+		ret = snap_pre_ret[i];
+		memcpy(buf ? buf : (void *)cdbuffer, snap_pre_buf[i],
+		       ret < CD_FRAMESIZE_RAW ? ret : CD_FRAMESIZE_RAW);
+		return ret;
+	}
+
+	cdimg_reads++;
+	cdimg_last_sector = sector;
+	return cdimg_read_func(cdHandle, 0, buf, sector);
+}
+
+/* Caller holds the async reader's lock. Returns the number of sectors loaded. */
+int cdimg_snap_preload(int before, int count)
+{
+	int first, i;
+
+	if (!cdHandle || !cdimg_read_func)
+		return -1;
+	if (!snap_pre_buf)
+		snap_pre_buf = malloc(SNAP_PRE_MAX * CD_FRAMESIZE_RAW);
+	if (!snap_pre_buf)
+		return -1;
+	if (count > SNAP_PRE_MAX)
+		count = SNAP_PRE_MAX;
+
+	snap_pre_n = 0;
+	first = cdimg_last_sector - before;
+	if (first < 0)
+		first = 0;
+	for (i = 0; i < count; i++)
+		snap_pre_ret[i] = cdimg_read_func(cdHandle, 0, snap_pre_buf[i], first + i);
+	snap_pre_first = first;
+	snap_pre_n = count;
+	return count;
+}
+
 // read track
 // time: byte 0 - minute; byte 1 - second; byte 2 - frame (non-bcd)
 // buf: if NULL, data is kept in internal buffer accessible by ISOgetBuffer()
@@ -1653,7 +1705,7 @@ int ISOreadTrack(const unsigned char *time, void *buf)
 	if (pregapOffset && sector >= pregapOffset)
 		sector -= 2 * 75;
 
-	ret = cdimg_read_func(cdHandle, 0, buf, sector);
+	ret = cdimg_read_main(buf, sector);
 	if (ret < 12*2 + 2048) {
 		if (buf && multifile && sector >= msf2sec(ti[1].length)) {
 			// assume a gap not backed by a file
@@ -1678,6 +1730,7 @@ int ISOreadSub(const unsigned char *time, void *buffer)
 	}
 
 	if (cdimg_read_sub_func != NULL) {
+		cdimg_reads++;
 		if ((ret = cdimg_read_sub_func(cdHandle, sector, buffer)))
 			return ret;
 	}
@@ -1744,6 +1797,7 @@ int ISOreadCDDA(const unsigned char *time, void *buffer)
 	if (!handle && !chd_img)
 		goto clear_return;
 
+	cdimg_reads++;
 	ret = cdimg_read_func(handle, ti[track].start_offset,
 		buffer, cddaCurPos - track_start);
 	if (ret != CD_FRAMESIZE_RAW) {

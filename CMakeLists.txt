@@ -308,6 +308,10 @@ target_link_libraries(bloom PUBLIC libpcsxcore gpu spu tsunami
 	#lightning lightrec libpcsxcore gpu spu
 	#${ZLIB_LIBRARIES} tsunami parallax
 )
+# The GPU DMA-chain path (GPUdmaChain + do_cmd_list) runs once per PS1 primitive and must not
+# share I-cache lines: place its functions (section .text.gpuchain) next to each other.
+target_link_options(bloom PRIVATE
+	-Wl,--section-ordering-file=${CMAKE_CURRENT_SOURCE_DIR}/src/hot_text.ld)
 
 option(WITH_SH4_SNAPSHOT "SH4-timing lab snapshot at a fixed frame, then stop rendering and exit" OFF)
 set(WITH_SH4_SNAPSHOT_FRAME 600 CACHE STRING "PS1 frame (vout flip) at which the SH4-timing snapshot is taken")
