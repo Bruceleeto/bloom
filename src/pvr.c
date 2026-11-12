@@ -97,6 +97,13 @@ void sh4snap_pvr_idle(void);
 #ifndef DIRECT_GP0
 #define DIRECT_GP0 0
 #endif
+/* FLOOR_TEST: throwaway measurement. Every GP0 polygon goes from the PS1 command
+ * list straight to the TA: no copy to cmdbuf, no second parse, no texture, clip,
+ * blending or mask handling. The picture is wrong; only the time means anything. */
+#ifndef FLOOR_TEST
+#define FLOOR_TEST 0
+#endif
+#define DRAW_IN_LIST (DIRECT_GP0 || FLOOR_TEST)
 #if WITH_SH4_SNAPSHOT
 #define SNAP_NO_PVR sh4snap_no_pvr
 #else
@@ -3696,6 +3703,116 @@ process_gpu_command(const union PacketBuffer *pbuffer, uint32_t cmd,
 	}
 }
 
+/* FLOOR_TEST polygon: packet words to store-queue vertices and nothing else. */
+static __attribute__((always_inline)) inline void
+floor_poly_t(const uint32_t *buf, const uint32_t cmd)
+{
+	const bool multicolor = cmd & 0x10, textured = cmd & 0x04, raw_tex = cmd & 0x01;
+	const unsigned int nb = 3 + !!(cmd & 0x08);
+	const unsigned int stride = 1 + !!textured + !!multicolor;
+	const uint16_t flags = 0x4000 | (textured ? POLY_TEXTURED : 0);
+	const uint32_t *p;
+	uint32_t sq, c;
+	unsigned int i;
+	float z;
+
+	if (unlikely(pvr.new_frame))
+		pvr_start_scene(PVR_LIST_PT_POLY);
+
+	SNAPCNT(14, 1);
+	z = get_zvalue(pvr.zoffset++);
+
+	if (unlikely(!pvr.old_blending_is_none || pvr.old_flags != flags)) {
+		pvr_poly_hdr_t *sq_hdr;
+
+		pvr.old_blending_is_none = true;
+		pvr.old_flags = flags;
+		pvr.old_tex = NULL;
+
+		sq_hdr = pvr_dr_target();
+		copy32(sq_hdr, textured ? &poly_textured : &poly_nontextured);
+		pvr_dr_commit(sq_hdr);
+	}
+
+	sq = pvr_dr_addr;
+	for (i = 0; i < 2; i++) {
+		pvr_vertex_t *w = (pvr_vertex_t *)(sq ^= 32);
+
+		w->flags = PVR_CMD_VERTEX;
+		w->z = z;
+		w->oargb = 0;
+		if (!textured)
+			w->argb1 = 0;
+	}
+
+	c = 0xffffff;
+	for (i = 0, p = buf + 1; i < nb; i++, p += stride) {
+		register float fr0 asm("fr0") = (float)(int16_t)((int16_t)p[0] + pvr.draw_offt_x);
+		register float fr1 asm("fr1") = (float)(int16_t)((int16_t)(p[0] >> 16) + pvr.draw_offt_y);
+		register float fr2 asm("fr2") = 0.0f;
+		register float fr3 asm("fr3") = 0.0f;
+		pvr_vertex_t *vert;
+
+		if (textured) {
+			fr2 = (float)(uint8_t)p[1];
+			fr3 = (float)(uint8_t)(p[1] >> 8);
+		}
+		if (!(textured && raw_tex) && (i == 0 || multicolor)) {
+			c = __builtin_bswap32(p[-1 - (multicolor ? 0 : i * stride)]) >> 8;
+			if (textured)
+				c = get_tex_vertex_color(c);
+		}
+
+		asm inline("ftrv xmtrx, fv0\n"
+			   : "+f"(fr0), "+f"(fr1), "+f"(fr2), "+f"(fr3));
+
+		vert = (pvr_vertex_t *)(sq ^= 32);
+		if (i == nb - 1)
+			vert->flags = PVR_CMD_VERTEX_EOL;
+		vert->argb = c;
+		vert->x = fr0;
+		vert->y = fr1;
+		if (textured) {
+			vert->u = fr2 + COORDS_U_OFFSET;
+			vert->v = fr3 + COORDS_V_OFFSET;
+		} else {
+			vert->argb0 = c;
+		}
+		__asm__ __volatile__("pref @%0" : : "r"(vert) : "memory");
+	}
+	pvr_dr_addr = sq;
+}
+
+#define FLOOR_POLY_V(f) \
+	__noinline static void floor_poly_##f(const uint32_t *buf) \
+	{ floor_poly_t(buf, 0x20 | (f)); }
+FLOOR_POLY_V(0x00) FLOOR_POLY_V(0x01) FLOOR_POLY_V(0x04) FLOOR_POLY_V(0x05)
+FLOOR_POLY_V(0x08) FLOOR_POLY_V(0x09) FLOOR_POLY_V(0x0c) FLOOR_POLY_V(0x0d)
+FLOOR_POLY_V(0x10) FLOOR_POLY_V(0x11) FLOOR_POLY_V(0x14) FLOOR_POLY_V(0x15)
+FLOOR_POLY_V(0x18) FLOOR_POLY_V(0x19) FLOOR_POLY_V(0x1c) FLOOR_POLY_V(0x1d)
+
+static inline void floor_poly(const uint32_t *buf, uint32_t cmd)
+{
+	switch (cmd & 0x1d) {
+	case 0x00: floor_poly_0x00(buf); break;
+	case 0x01: floor_poly_0x01(buf); break;
+	case 0x04: floor_poly_0x04(buf); break;
+	case 0x05: floor_poly_0x05(buf); break;
+	case 0x08: floor_poly_0x08(buf); break;
+	case 0x09: floor_poly_0x09(buf); break;
+	case 0x0c: floor_poly_0x0c(buf); break;
+	case 0x0d: floor_poly_0x0d(buf); break;
+	case 0x10: floor_poly_0x10(buf); break;
+	case 0x11: floor_poly_0x11(buf); break;
+	case 0x14: floor_poly_0x14(buf); break;
+	case 0x15: floor_poly_0x15(buf); break;
+	case 0x18: floor_poly_0x18(buf); break;
+	case 0x19: floor_poly_0x19(buf); break;
+	case 0x1c: floor_poly_0x1c(buf); break;
+	default:   floor_poly_0x1d(buf); break;
+	}
+}
+
 __pvr
 static void process_gpu_commands(void)
 {
@@ -3777,12 +3894,27 @@ int do_cmd_list(uint32_t *list, int list_len,
 	const union PacketBuffer *pbuffer;
 	unsigned int i, len_polyline = 2;
 
-	if (DIRECT_GP0)
+	if (DRAW_IN_LIST)
 		matrix_save();
 
 	for (; list < list_end; list += 1 + len)
 	{
 		cmd = *list >> 24;
+
+		if (FLOOR_TEST && likely((cmd & 0xe0) == 0x20)) {
+			len = cmd_lengths[cmd];
+			if (unlikely(list + 1 + len > list_end)) {
+				cmd = -1;
+				break;
+			}
+			if (!SNAP_NO_PVR) {
+				if (unlikely(pvr.cmdbuf_offt))
+					process_gpu_commands();
+				floor_poly(list, cmd);
+			}
+			gput_sum(cpu_cycles_sum, cpu_cycles, poly_gput[(cmd >> 2) & 5]);
+			continue;
+		}
 
 		if (!DIRECT_GP0 && likely((cmd & 0xe0) == 0x20)) {
 			/* Polygon: copy it and charge its GPU time; nothing
@@ -3920,7 +4052,7 @@ int do_cmd_list(uint32_t *list, int list_len,
 	}
 
 out:
-	if (DIRECT_GP0)
+	if (DRAW_IN_LIST)
 		matrix_restore();
 
 	gpu.ex_regs[1] &= ~0x1ff;
@@ -4148,13 +4280,13 @@ static void matrix_restore(void)
 
 void renderer_batch_begin(void)
 {
-	if (DIRECT_GP0)
+	if (DRAW_IN_LIST)
 		matrix_save();
 }
 
 void renderer_batch_end(void)
 {
-	if (DIRECT_GP0)
+	if (DRAW_IN_LIST)
 		matrix_restore();
 }
 
