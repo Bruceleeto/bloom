@@ -219,6 +219,7 @@ if (GPU_PLUGIN STREQUAL Unai)
 elseif(GPU_PLUGIN STREQUAL PVR)
 	add_library(gpu STATIC
 		src/pvr.c
+		src/fast_tex.S
 	)
 	target_include_directories(gpu PRIVATE ${PCSX_REAL_DIR}/plugins)
 	set(HARDWARE_ACCELERATED ON)
@@ -318,6 +319,12 @@ set(WITH_SH4_SNAPSHOT_FRAME 600 CACHE STRING "PS1 frame (vout flip) at which the
 if (WITH_SH4_SNAPSHOT)
 	target_sources(bloom PRIVATE src/sh4snap.c src/sh4snap_capture.S)
 	target_include_directories(bloom PRIVATE ${PCSX_REAL_DIR}/plugins)
+	option(WITH_SH4_SNAPSHOT_RENDER "Keep PowerVR rendering on after the snapshot (lab: --pvr-sink)" OFF)
+	if (WITH_SH4_SNAPSHOT_RENDER)
+		target_compile_definitions(bloom PRIVATE SH4SNAP_RENDER=1)
+		# pvr_state (KOS internal) to clear the busy flags the lab has no interrupt for
+		set_source_files_properties(src/sh4snap.c PROPERTIES INCLUDE_DIRECTORIES $ENV{KOS_BASE}/kernel/arch/dreamcast/hardware/pvr)
+	endif()
 endif()
 
 option(WITH_CDROM_DMA "Read CD-ROM sectors using DMA" ON)

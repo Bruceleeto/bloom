@@ -32,6 +32,12 @@ enum {
 /* lightrec's exit flag for "this opcode is not mine": how an HLE BIOS call arrives. */
 #define FGL_EXIT_UNKNOWN_OP (1u << 5)
 
+/* A load in a branch delay slot (front.c, `slot_load_exit`): the value is parked in
+ * `temp_reg`, the block leaves with this flag and the register number in bits 8-12, and
+ * `lightrec_check_load_delay` decides whether the target's first instruction sees it. */
+#define FGL_EXIT_LOAD_DELAY (1u << 7)
+#define FGL_EXIT_LOAD_DELAY_REG(f) (((f) >> 8) & 31u)
+
 /* Lower one fgl block from lightrec's list.  Stops at the first control transfer,
  * so one call need not consume the whole list: `info->n_ops` says how far it got.
  * Returns the node count.

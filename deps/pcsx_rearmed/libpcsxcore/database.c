@@ -196,6 +196,7 @@ static const char * const lightrec_hack_db[] =
 	"SLUS00005", /* Rayman (US) */
 	"SCUS94467", /* Spyro: Year of the Dragon (US) */
 	"slus00594", /* Metal Gear Solid (US), ID reads lowercase off the disc */
+	"TEKKEN3SL", /* Tekken 3 (US), ID built from cdrom:\\TEKKEN3\\SLUS_004.02: 15k invalidation calls/frame, ~1.5 ms (SH4-timing lab) */
 };
 
 /* Function for automatic patching according to GameID. */

@@ -135,6 +135,8 @@ void renderer_finish(void);
 void renderer_sync_ecmds(uint32_t * ecmds);
 void renderer_update_caches(int x, int y, int w, int h, int state_changed);
 void renderer_flush_queues(void);
+void renderer_batch_begin(void);
+void renderer_batch_end(void);
 void renderer_set_interlace(int enable, int is_odd);
 void renderer_set_config(const struct rearmed_cbs *config);
 void renderer_notify_res_change(void);

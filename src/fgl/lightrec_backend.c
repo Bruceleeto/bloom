@@ -16,6 +16,7 @@
 #include "interpreter.h"
 #include "memmanager.h"
 #include "fgl_backend.h"
+#include "front.h"
 
 /* ----------------------------------------------------------------------
  * The backend's words in struct lightrec_state
@@ -427,6 +428,15 @@ static u32 fgl_backend_execute(struct lightrec_state *state, u32 pc,
 					    block_trace, cycles_delta);
 
 		fgl_cycles_settle(state, cycles_delta);
+
+		/* A load in a branch delay slot (front.c, slot_load_exit). */
+		if (unlikely(state->exit_flags & FGL_EXIT_LOAD_DELAY)) {
+			u32 reg = FGL_EXIT_LOAD_DELAY_REG(state->exit_flags);
+
+			state->exit_flags &= ~(FGL_EXIT_LOAD_DELAY | (31u << 8));
+			state->curr_pc = lightrec_check_load_delay(state,
+						state->curr_pc, (u8)reg);
+		}
 	}
 
 	return state->curr_pc;

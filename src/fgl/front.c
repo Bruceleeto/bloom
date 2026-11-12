@@ -133,6 +133,45 @@ static int ds_load_delay(const struct opcode *ds)
                            op == 0x26);
 }
 
+/* THE HOLE ABOVE, FILLED THE WAY LIGHTREC FILLS IT.
+ *
+ * Called after the slot has been lowered and its flags applied.  The slot's
+ * load is turned into a deferred one -- it reads now and parks the value in
+ * `temp_reg`, writing no register (ir.h, `defer`) -- and the block ends with
+ * an IR_EXIT that keeps the exit register the transfer computed and says
+ * FGL_EXIT_LOAD_DELAY with the register number.  C then runs
+ * `lightrec_check_load_delay` on the target, which either writes the register
+ * and resumes at the target, or interprets the target's first instruction
+ * with the old value first (lightrec.c).  The emitter does not link a block
+ * that ends in IR_EXIT, so the dispatcher always sees the flag.
+ *
+ * Returns 0 if the slot did not lower to one deferrable read of `rt` as its
+ * last node (a C-performed access, say): the caller refuses as before. */
+static int slot_load_exit(ir_ctx *c, int dmark, const struct opcode *ds, uint32_t at)
+{
+        unsigned rt = (ds->c.opcode >> 16) & 31;
+        ir_node *ld, *x;
+
+        if (rt == 0)
+                return 1;               /* no write to delay: nothing to do */
+        if (c->n <= dmark)
+                return 0;
+        ld = &c->out[c->n - 1];
+        if (ld->rd != rt || ld->defer ||
+            (ld->op != IR_LOAD && ld->op != IR_LOAD_UN &&
+             ld->op != IR_MFC0 && ld->op != IR_MFC2))
+                return 0;
+        ld->defer = 1;
+
+        x = ir_node_new(c, IR_EXIT, at);
+        if (!x)
+                return 0;
+        x->sub = 1;                     /* keep the exit register */
+        x->imm = FGL_EXIT_LOAD_DELAY | (rt << 8);
+        return 1;
+}
+
+
 /* DEBUG BISECT: pretend the optimiser proved nothing about any access, so
  * every load and store becomes IR_RW and is performed by C against the state
  * block -- lightrec's own memory path, the one the interpreter uses.
@@ -1098,13 +1137,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                  * branch is not to pay a dispatch -- so it is the first thing
                  * to revisit once blocks can chain. */
                 if (op_flag_local_branch(op->flags)) {
-                        if (!op_flag_no_ds(op->flags) && i + 1 < nb &&
-                            ds_load_delay(&ops[i + 1])) {
-                                note_unsupported(info, &ops[i + 1], at + 4);
-                                info->stop_reason = FGL_STOP_UNSUPPORTED;
-                                info->ended_early = 1;
-                                return c.n;
-                        }
+                        int ld_slot = !op_flag_no_ds(op->flags) && i + 1 < nb &&
+                                      ds_load_delay(&ops[i + 1]);
                         int slot = 0;
 
                         if (ir_decode_transfer(&c, word, branch_at)) {
@@ -1140,6 +1174,14 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                         if (!apply_flags(&c, dmark,
                                                          ops[i + 1].flags,
                                                          ops[i + 1].opcode)) {
+                                                note_unsupported(info, &ops[i + 1],
+                                                                 at + 4);
+                                                info->stop_reason = FGL_STOP_UNSUPPORTED;
+                                                info->ended_early = 1;
+                                                return c.n;
+                                        }
+                                        if (ld_slot && !slot_load_exit(&c, dmark,
+                                                                      &ops[i + 1], at + 4)) {
                                                 note_unsupported(info, &ops[i + 1],
                                                                  at + 4);
                                                 info->stop_reason = FGL_STOP_UNSUPPORTED;
@@ -1182,13 +1224,8 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                         return c.n;
                 }
 
-                if (!op_flag_no_ds(op->flags) && i + 1 < nb &&
-                    ds_load_delay(&ops[i + 1])) {
-                        note_unsupported(info, &ops[i + 1], at + 4);
-                        info->stop_reason = FGL_STOP_UNSUPPORTED;
-                        info->ended_early = 1;
-                        return c.n;
-                }
+                int ld_slot = !op_flag_no_ds(op->flags) && i + 1 < nb &&
+                              ds_load_delay(&ops[i + 1]);
 
                 if (ir_decode_transfer(&c, word, branch_at)) {
                         /* A load shadowed by the transfer settles BETWEEN the
@@ -1212,7 +1249,9 @@ int fgl_front(const struct opcode *ops, unsigned nb, uint32_t pc,
                                         return c.n;
                                 }
                                 if (!apply_flags(&c, dmark, ops[i + 1].flags,
-                                                 ops[i + 1].opcode)) {
+                                                 ops[i + 1].opcode) ||
+                                    (ld_slot && !slot_load_exit(&c, dmark, &ops[i + 1],
+                                                                at + 4))) {
                                         note_unsupported(info, &ops[i + 1], at + 4);
                                         info->stop_reason = FGL_STOP_UNSUPPORTED;
                                         info->ended_early = 1;

@@ -801,6 +801,7 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
     flush_cmd_buffer(&gpu);
 
   log_io(&gpu, "gpu_dma_chain\n");
+  renderer_batch_begin();
   addr = ld_addr = start_addr & 0xffffff;
   for (count = 0; (addr & 0x800000) == 0; count++)
   {
@@ -870,6 +871,8 @@ long GPUdmaChain(uint32_t *rambase, uint32_t start_addr,
       ld_count *= 2;
     }
   }
+
+  renderer_batch_end();
 
   if (status_stale) {
     // as at the end of do_cmd_buffer

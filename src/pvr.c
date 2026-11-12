@@ -21,6 +21,19 @@
 #include <kos/string.h>
 
 #include "bloom-config.h"
+#if WITH_SH4_SNAPSHOT
+#include <arch/timer.h>
+uint64_t sh4snap_wait_ns;	/* time blocked on the PowerVR (sh4snap.c) */
+uint32_t sh4snap_cnt[16];	/* renderer event counts (sh4snap.c names them) */
+#define SNAPCNT(i, n) (sh4snap_cnt[i] += (n))
+extern _Bool sh4snap_lab;
+void sh4snap_pvr_idle(void);
+#define SNAP_WAIT(call) do { if (sh4snap_lab) { sh4snap_pvr_idle(); call; break; } \
+	uint64_t t_ = timer_ns_gettime64(); call; sh4snap_wait_ns += timer_ns_gettime64() - t_; } while (0)
+#else
+#define SNAP_WAIT(call) call
+#define SNAPCNT(i, n) do { } while (0)
+#endif
 #include "emu.h"
 #include "pvr.h"
 
@@ -72,6 +85,34 @@
 #define COORDS_V_OFFSET (1.0f / 32768.0f)
 
 #define __pvr __attribute__((section(".sub0")))
+
+/* DIRECT_GP0: draw each GP0 command when do_cmd_list() receives it, instead
+ * of copying it to cmdbuf and parsing it again at the end of the frame. Same
+ * commands, same order, same TA stream. */
+/* STUB_TEX: experiment only. No texture/palette uploads, no codebook search,
+ * no VRAM-write invalidation: textures render wrong, to measure their cost. */
+#ifndef STUB_TEX
+#define STUB_TEX 0
+#endif
+#ifndef DIRECT_GP0
+#define DIRECT_GP0 0
+#endif
+#if WITH_SH4_SNAPSHOT
+#define SNAP_NO_PVR sh4snap_no_pvr
+#else
+#define SNAP_NO_PVR 0
+#endif
+static void matrix_save(void);
+static void matrix_restore(void);
+static void tex_col_lut_init(void);
+
+#ifndef FAST_TEX
+#define FAST_TEX 1
+#endif
+
+#ifndef FAST_POLY
+#define FAST_POLY 1
+#endif
 
 /* UNTEXTURED-ONLY MODE -- A CACHE EXPERIMENT, NOT A FEATURE.
  *
@@ -165,6 +206,9 @@ struct texture_page_16bpp {
 struct texture_clut {
 	uint16_t clut;
 	uint16_t inval_counter;
+	/* inval counter value up to which the CLUT's own VRAM words are known
+	 * unchanged (see clut_rect_changed()) */
+	uint16_t checked;
 };
 
 struct texture_page_8bpp {
@@ -426,6 +470,8 @@ void pvr_renderer_init(void)
 
 	pvr_printf("PVR renderer init\n");
 
+	tex_col_lut_init();
+
 	pvr_txr_set_stride(640);
 
 	if (WITH_MAGENTA_BG)
@@ -571,6 +617,10 @@ static void load_palette(struct texture_page *page, unsigned int offset,
 	unsigned int i, nb;
 	uint16_t *palette;
 	uint16_t pixel;
+
+	SNAPCNT(7, 1);
+	if (STUB_TEX)
+		return;
 	uint64_t color;
 	uint64_t *sq;
 
@@ -634,7 +684,50 @@ static inline unsigned int clut_get_texture_page(uint16_t clut)
 	return ((clut & 0x4000) >> 10) | ((clut & 0x3f) >> 2);
 }
 
-static inline bool clut_is_outdated(const struct texture_clut *clut, bool bpp4)
+/* VRAM WRITE LOG. A VRAM write marks its whole 64x256 page as changed, and
+ * every CLUT stored in that page looked outdated: Tekken 3 writes VRAM every
+ * frame and reloaded ~117 palettes per frame for it. The last INVAL_LOG write
+ * rectangles are kept (one per pvr.inval_counter value), so a CLUT is only
+ * outdated when a write since it was last checked covers its own words. */
+#define INVAL_LOG 32
+static struct inval_rect {
+	uint16_t x0, y0, x1, y1;
+} inval_log[INVAL_LOG];
+
+static inline void inval_log_add(int x, int y, int x2, int y2)
+{
+	struct inval_rect *r = &inval_log[pvr.inval_counter % INVAL_LOG];
+
+	if (x < 0 || y < 0 || x2 > 1024 || y2 > 512 || x2 <= x || y2 <= y) {
+		/* wraps or odd: everything */
+		x = 0; y = 0; x2 = 1024; y2 = 512;
+	}
+	*r = (struct inval_rect){ x, y, x2, y2 };
+}
+
+__noinline
+static bool clut_rect_changed(struct texture_clut *clut, bool bpp4)
+{
+	unsigned int n = (uint16_t)(pvr.inval_counter - clut->checked), k;
+	unsigned int cx = (clut->clut & 0x3f) * 16, cy = (clut->clut >> 6) & 0x1ff;
+	unsigned int cw = bpp4 ? 16 : 256;
+
+	if (n > INVAL_LOG || cx + cw > 1024)
+		return true;
+
+	for (k = 0; k < n; k++) {
+		const struct inval_rect *r =
+			&inval_log[(uint16_t)(pvr.inval_counter - k) % INVAL_LOG];
+
+		if (cy >= r->y0 && cy < r->y1 && cx < r->x1 && cx + cw > r->x0)
+			return true;
+	}
+
+	clut->checked = pvr.inval_counter;
+	return false;
+}
+
+static inline bool clut_is_outdated(struct texture_clut *clut, bool bpp4)
 {
 	const struct texture_page *page;
 	unsigned int page_offset, end;
@@ -643,8 +736,8 @@ static inline bool clut_is_outdated(const struct texture_clut *clut, bool bpp4)
 	page_offset = clut_get_texture_page(clut->clut);
 	page = &pvr.textures4[page_offset].base;
 
-	if (unlikely(counter_is_older(clut->inval_counter, page->inval_counter)))
-		return true;
+	if (unlikely(counter_is_older(clut->checked, page->inval_counter)))
+		return clut_rect_changed(clut, bpp4);
 
 	if (unlikely(!bpp4)) {
 		clut_tmp = clut->clut;
@@ -657,9 +750,9 @@ static inline bool clut_is_outdated(const struct texture_clut *clut, bool bpp4)
 			page_offset = clut_get_texture_page(clut_tmp);
 			page = &pvr.textures4[page_offset].base;
 
-			if (unlikely(counter_is_older(clut->inval_counter,
+			if (unlikely(counter_is_older(clut->checked,
 						      page->inval_counter)))
-				return true;
+				return clut_rect_changed(clut, bpp4);
 		} while (page_offset != end);
 	}
 
@@ -675,14 +768,39 @@ static inline bool clut_is_outdated(const struct texture_clut *clut, bool bpp4)
  * pure functions of the inval counters, and only the palette-load path at the
  * bottom stores. poly_get_texture_page() is deliberately NOT memoized -- its
  * block_mask is UV-derived and maybe_update_texture() uploads missing blocks. */
-static struct texture_page *cb_memo_page;
-static uint16_t cb_memo_clut;
-static uint16_t cb_memo_gen;
-static unsigned int cb_memo_codebook;
+/* 64 direct-mapped entries instead of one: Tekken 3 alternates CLUTs, so the
+ * single memo missed on 39% of textured polygons (250 cycles each, frame 3).
+ * An entry is valid for one pvr.inval_counter value and one cb_epoch. The slow
+ * path can hand a slot to another CLUT (reuse when full), so every slot
+ * (re)assignment drops the entries that point at that slot of that page. */
+struct cb_entry {
+	struct texture_page *page;
+	uint16_t clut;
+	uint16_t gen;
+	uint16_t epoch;
+	uint16_t codebook;
+};
+#define CB_CACHE_SIZE 256	/* fast_tex.S masks the hash with extu.b */
+static struct cb_entry cb_cache[CB_CACHE_SIZE];
+static uint16_t cb_epoch = 1;
 
 static inline void cb_memo_flush(void)
 {
-	cb_memo_page = NULL;
+	cb_epoch++;
+}
+
+static inline struct cb_entry *cb_slot(const struct texture_page *page, uint16_t clut)
+{
+	return &cb_cache[(clut ^ (clut >> 6) ^ ((uintptr_t)page >> 5)) & (CB_CACHE_SIZE - 1)];
+}
+
+static void cb_drop_slot(const struct texture_page *page, unsigned int codebook)
+{
+	unsigned int i;
+
+	for (i = 0; i < CB_CACHE_SIZE; i++)
+		if (cb_cache[i].page == page && cb_cache[i].codebook == codebook)
+			cb_cache[i].page = NULL;
 }
 
 static unsigned int
@@ -691,18 +809,23 @@ find_texture_codebook_slow(struct texture_page *page, uint16_t clut);
 static inline unsigned int
 find_texture_codebook(struct texture_page *page, uint16_t clut)
 {
+	struct cb_entry *e = cb_slot(page, clut);
 	unsigned int codebook;
 
-	if (likely(cb_memo_page == page && cb_memo_clut == clut
-		   && cb_memo_gen == pvr.inval_counter))
-		return cb_memo_codebook;
+	if (STUB_TEX)
+		return 0;
+
+	if (likely(e->page == page && e->clut == clut
+		   && e->gen == (uint16_t)pvr.inval_counter && e->epoch == cb_epoch))
+		return e->codebook;
 
 	codebook = find_texture_codebook_slow(page, clut);
 
-	cb_memo_page = page;
-	cb_memo_clut = clut;
-	cb_memo_gen = pvr.inval_counter;
-	cb_memo_codebook = codebook;
+	e->page = page;
+	e->clut = clut;
+	e->gen = pvr.inval_counter;
+	e->epoch = cb_epoch;
+	e->codebook = codebook;
 
 	return codebook;
 }
@@ -710,6 +833,7 @@ find_texture_codebook(struct texture_page *page, uint16_t clut)
 static unsigned int
 find_texture_codebook_slow(struct texture_page *page, uint16_t clut)
 {
+	SNAPCNT(9, 1);
 	struct texture_page_4bpp *page4 = to_texture_page_4bpp(page);
 	bool bpp4 = page->settings.bpp == TEXTURE_4BPP;
 	unsigned int codebooks = bpp4 ? NB_CODEBOOKS_4BPP : NB_CODEBOOKS_8BPP;
@@ -759,6 +883,8 @@ find_texture_codebook_slow(struct texture_page *page, uint16_t clut)
 	/* We didn't find the CLUT anywere - add it and load the palette */
 	page4->clut[i].clut = clut;
 	page4->clut[i].inval_counter = pvr.inval_counter;
+	page4->clut[i].checked = pvr.inval_counter;
+	cb_drop_slot(page, i);
 
 	pvr_printf("Load CLUT 0x%04hx at offset %u\n", clut, i);
 
@@ -876,6 +1002,11 @@ static void update_texture(struct texture_page *page,
 	uint32_t *sq;
 	pvr_ptr_t addr;
 
+	SNAPCNT(8, 1);
+	if (STUB_TEX) {
+		page->block_mask |= to_load;
+		return;
+	}
 	if (page->settings.bpp == TEXTURE_16BPP)
 		addr = page->tex;
 	else
@@ -1066,13 +1197,14 @@ void invalidate_all_textures(void)
 	unsigned int i;
 
 	pvr.inval_counter++;
+	inval_log_add(0, 0, 1024, 512);
 
 	for (i = 0; i < 32; i++)
 		invalidate_textures(i, UINT64_MAX);
 
 	pvr_reap_textures();
 
-	pvr_wait_render_done();
+	SNAP_WAIT(pvr_wait_render_done());
 	pvr_reap_textures();
 }
 
@@ -1087,7 +1219,7 @@ static void pvr_update_caches(int x, int y, int w, int h, bool invalidate_only)
 		return;
 #endif
 
-	if (screen_bpp == 24)
+	if (STUB_TEX || screen_bpp == 24)
 		return;
 
 	pvr.inval_counter++;
@@ -1095,6 +1227,7 @@ static void pvr_update_caches(int x, int y, int w, int h, bool invalidate_only)
 	/* Compute bottom-right point coordinates */
 	x2 = x + w;
 	y2 = y + h;
+	inval_log_add(x, y, x2, y2);
 
 	for (dy = y & -256; dy < y2; dy += 256) {
 		for (dx = x & -64; dx < x2; dx += 64) {
@@ -1180,6 +1313,7 @@ static void pvr_add_clip(uint16_t zoffset)
 	if (screen_bpp == 24)
 		return;
 
+	SNAPCNT(11, 1);
 	if (unlikely(pvr.nb_clips == ARRAY_SIZE(pvr.clips))) {
 		printf("Too many clip areas\n");
 	} else {
@@ -1236,7 +1370,10 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	unsigned int i;
 	bool warm;
 
+	SNAPCNT(3, 1);
+	SNAPCNT(5, nb);
 	if (unlikely(hdr)) {
+		SNAPCNT(4, 1);
 		sq_hdr = pvr_dr_target();
 		copy32(sq_hdr, hdr);
 		pvr_dr_commit(sq_hdr);
@@ -1252,6 +1389,8 @@ static void draw_prim(const pvr_poly_hdr_t *hdr,
 	 * two queues and writes its own argb/oargb over these offsets, so
 	 * there is nothing left to reuse. */
 	warm = !(WITH_CLIPPING && textured && modified);
+	if (!warm)
+		SNAPCNT(6, nb);
 	if (likely(warm)) {
 		vert = pvr_dr_target();
 		vert->flags = PVR_CMD_VERTEX;
@@ -1727,6 +1866,8 @@ static void poly_draw_now(const struct poly *poly)
 	const struct vertex_coords *coords = poly->coords;
 	const uint32_t *colors = poly->colors;
 	uint32_t colors_alt[4];
+
+	SNAPCNT(2, 1);
 	uint16_t flags = poly->flags;
 	bool textured = !PVR_UNTEX_ONLY && (poly->flags & POLY_TEXTURED);
 	bool bright = poly->flags & POLY_BRIGHT;
@@ -2056,7 +2197,7 @@ static void pvr_set_list(pvr_list_t list)
 __noinline
 static void pvr_start_scene(pvr_list_t list)
 {
-	pvr_wait_ready();
+	SNAP_WAIT(pvr_wait_ready());
 	pvr_reap_textures();
 
 	pvr_scene_begin();
@@ -2075,6 +2216,7 @@ static void pvr_start_scene(pvr_list_t list)
 __pvr
 static void poly_enqueue(pvr_list_t list, const struct poly *poly)
 {
+	SNAPCNT(list == PVR_LIST_PT_POLY ? 12 : 13, 1);
 	if (!WITH_HYBRID_RENDERING || likely(list == PVR_LIST_PT_POLY)) {
 		if (unlikely(pvr.new_frame))
 			pvr_start_scene(list);
@@ -2299,11 +2441,17 @@ static void process_poly(struct poly *poly, bool scissor)
 	unsigned int i, offt;
 	uint16_t umin, umax;
 	uint8_t codebook;
-	bool check_mask, set_mask;
+	bool check_mask, set_mask, no_clip;
 	pvr_list_t list;
 
-	/* If the clip area matches the screen area, we don't need to clip */
-	if (WITH_CLIPPING && !pvr.clip_test)
+	SNAPCNT(1, 1);
+	/* A poly entirely inside the draw area needs no clipping (and no
+	 * modifier volume: half the vertex bytes).  poly_should_clip() is false
+	 * when the draw area matches the screen.  Tekken 3's draw area is
+	 * y 20..468 on a 480-line screen, so testing only the area clipped
+	 * every poly: 89% of vertices went out in the 64-byte format. */
+	no_clip = !poly_should_clip(poly);
+	if (WITH_CLIPPING && no_clip)
 		poly->flags |= POLY_NOCLIP;
 
 	if (!PVR_UNTEX_ONLY && (poly->flags & POLY_TEXTURED)) {
@@ -2368,12 +2516,12 @@ static void process_poly(struct poly *poly, bool scissor)
 		} else if (WITH_BILINEAR) {
 			poly_enqueue(PVR_LIST_TR_POLY, poly);
 
-			if (WITH_HYBRID_RENDERING && !poly_should_clip(poly)) {
+			if (WITH_HYBRID_RENDERING && no_clip) {
 				poly->zoffset = pvr.zoffset++;
 				poly_enqueue(PVR_LIST_PT_POLY, poly);
 			}
 		} else {
-			if (WITH_HYBRID_RENDERING && !poly_should_clip(poly))
+			if (WITH_HYBRID_RENDERING && no_clip)
 				list = PVR_LIST_PT_POLY;
 			else
 				list = PVR_LIST_TR_POLY;
@@ -2594,17 +2742,967 @@ static inline bool pvr_clip_test(void)
 		|| pvr.draw_y2 != gpu.screen.vres;
 }
 
+/* FAST POLY PATH. The common polygon (opaque, no mask bits, fully inside the draw
+ * area, untextured or 4bpp) goes straight from the GP0 packet to store-queue vertices:
+ * no struct poly, no process_poly/poly_enqueue/poly_draw_now/draw_prim layers, the SQ
+ * address kept in a register instead of pvr_dr_addr. It must send the TA exactly what
+ * the general path sends (checked byte for byte in the SH4-timing lab). Anything else,
+ * or any texture-page state that needs work first, returns false before touching any
+ * state and the general path handles the packet. */
+static inline uint64_t block_mask_fast(unsigned int umin, unsigned int umax,
+				       unsigned int vmin, unsigned int vmax)
+{
+	/* get_block_mask() without the loops: columns of 64 u, rows of 16 v. */
+	unsigned int lo, hi, horiz;
+	uint64_t rows;
+
+	if (umax <= (umin & ~63u) || vmax <= (vmin & ~15u))
+		return 0;
+
+	lo = umin >> 6;
+	hi = (umax - 1) >> 6;
+	horiz = ((2u << hi) - 1) & ~((1u << lo) - 1);
+
+	lo = vmin >> 4;
+	hi = (vmax - 1) >> 4;
+	rows = (hi == 15 ? ~0ull : (1ull << (4 * (hi + 1))) - 1) & ~((1ull << (4 * lo)) - 1);
+
+	return rows & (horiz * 0x1111111111111111ull);
+}
+
+static __attribute__((always_inline)) inline bool
+fast_poly_t(const uint32_t *buf, const uint32_t cmd)
+{
+	/* Packet layout: vertex i's position word is at 1 + i * stride, its
+	 * texcoord right after it, its colour right before it (multicolor) or
+	 * at word 0. Two passes over the packet (bbox, then emit): no arrays,
+	 * everything in registers. Every check that can refuse the polygon
+	 * runs before the first state change, cheapest first. */
+	const bool multicolor = cmd & 0x10, multiple = cmd & 0x08;
+	const bool textured = cmd & 0x04, raw_tex = cmd & 0x01;
+	const unsigned int nb = 3 + !!multiple;
+	const unsigned int stride = 1 + !!textured + !!multicolor;
+	const uint32_t *p;
+	int x_min = INT16_MAX, x_max = INT16_MIN, y_min = INT16_MAX, y_max = INT16_MIN;
+	unsigned int umin = 0xff, umax = 0, vmin = 0xff, vmax = 0, i;
+	struct texture_page *page = NULL;
+	pvr_ptr_t tex = NULL;
+	uint16_t flags, voffset = 0, texpage = 0;
+	uint32_t sq, c;
+	bool bright = false;
+	float z;
+
+	if ((cmd & 0x02) | pvr.set_mask | pvr.check_mask | pvr.new_frame)
+		return false;
+
+	if (textured) {
+		texpage = buf[1 + stride + 1] >> 16;
+		if (((texpage >> 7) & 0x3) != TEXTURE_4BPP)
+			return false;
+		page = &pvr.textures4[texpage & 0x1f].base;
+		if (unlikely(!page->tex))
+			return false;
+		if (!raw_tex) {
+			/* bright: drawn now with the raw colours, plus a deferred
+			 * additive pass in polybuf (what process_poly does) */
+			for (i = 0; i < (multicolor ? nb : 1); i++) {
+				c = buf[multicolor ? i * stride : 0];
+				/* packet colour is BGR in bits 0..23: any byte > 0x80 */
+				bright |= (c & 0xff) > 0x80 || (c & 0xff00) > 0x8000
+					|| (c & 0xff0000) > 0x800000;
+			}
+			if (bright && (!WITH_HYBRID_RENDERING || WITH_BILINEAR
+				       || unlikely(pvr.polybuf_cnt_start == __array_size(polybuf))))
+				return false;
+		}
+	}
+
+	for (i = 0, p = buf + 1; i < nb; i++, p += stride) {
+		int x = (int16_t)p[0], y = (int16_t)(p[0] >> 16);
+
+		x_min = x < x_min ? x : x_min;
+		x_max = x > x_max ? x : x_max;
+		y_min = y < y_min ? y : y_min;
+		y_max = y > y_max ? y : y_max;
+		if (textured) {
+			unsigned int u = (uint8_t)p[1], v = (uint8_t)(p[1] >> 8);
+
+			umin = u < umin ? u : umin;
+			umax = u > umax ? u : umax;
+			vmin = v < vmin ? v : vmin;
+			vmax = v > vmax ? v : vmax;
+		}
+	}
+
+	if (x_max - x_min >= 1024 || y_max - y_min >= 512)
+		return true;	/* too big: the general path drops it too */
+
+	if (WITH_CLIPPING && pvr.clip_test) {
+		/* x_to_xoffset() truncates to int16: monotonic unless it wraps */
+		int x0 = x_min + pvr.draw_offt_x, x1 = x_max + pvr.draw_offt_x;
+		int y0 = y_min + pvr.draw_offt_y, y1 = y_max + pvr.draw_offt_y;
+
+		if (x0 < INT16_MIN || x1 > INT16_MAX || y0 < INT16_MIN || y1 > INT16_MAX
+		    || x0 < pvr.draw_x1 || x1 > pvr.draw_x2
+		    || y0 < pvr.draw_y1 || y1 > pvr.draw_y2)
+			return false;
+	}
+
+	if (textured) {
+		uint64_t bm, to_load;
+		unsigned int codebook;
+
+		bm = block_mask_fast(umin, umax, vmin, vmax);
+		if (unlikely((page->inuse_mask | page->old_inuse_mask) & ~page->block_mask & bm))
+			return false;	/* page must be discarded first */
+
+		/* --- committed: state changes from here on --- */
+		to_load = ~page->block_mask & bm;
+		page->inuse_mask |= bm;
+		if (unlikely(to_load))
+			update_texture(page, texpage & 0x1f, to_load);
+
+		codebook = find_texture_codebook(page, (buf[1 + 1] >> 16) & 0x7fff);
+		voffset = get_voffset(TEXTURE_4BPP, codebook);
+		tex = (pvr_ptr_t)&page->vq->codebook4[codebook];
+	}
+
+	SNAPCNT(14, 1);
+	flags = (textured ? POLY_TEXTURED : 0) | (multiple ? POLY_4VERTEX : 0)
+		| (WITH_CLIPPING ? POLY_NOCLIP : 0) | (bright ? POLY_BRIGHT : 0);
+	z = get_zvalue(pvr.zoffset++);
+
+	if (!(pvr.old_blending_is_none && pvr.old_flags == flags && tex == pvr.old_tex)) {
+		pvr_poly_hdr_t *sq_hdr;
+
+		if (WITH_CLIPPING && ((pvr.old_flags ^ flags) & POLY_NOCLIP))
+			pvr_avoid_tile_clip_glitch();
+
+		pvr.old_blending_is_none = true;
+		pvr.old_flags = flags;
+		pvr.old_tex = tex;
+
+		sq_hdr = pvr_dr_target();
+		copy32(sq_hdr, textured ? &poly_textured : &poly_nontextured);
+		if (textured) {
+			sq_hdr->m3 = (struct pvr_poly_hdr_mode3){
+				.txr_base = to_pvr_txr_ptr(tex),
+				.nontwiddled = true,
+				.vq_en = true,
+				.pixel_mode = PVR_PIXEL_MODE_ARGB1555,
+			};
+		}
+		pvr_dr_commit(sq_hdr);
+	}
+
+	/* Vertices: the SQ address lives in a register; both queues warmed once. */
+	sq = pvr_dr_addr;
+	for (i = 0; i < 2; i++) {
+		pvr_vertex_t *w = (pvr_vertex_t *)(sq ^= 32);
+
+		w->flags = PVR_CMD_VERTEX;
+		w->z = z;
+		w->oargb = 0;
+		if (!textured)
+			w->argb1 = 0;
+	}
+
+	c = 0xffffff;
+	for (i = 0, p = buf + 1; i < nb; i++, p += stride) {
+		register float fr0 asm("fr0") = (float)(int16_t)((int16_t)p[0] + pvr.draw_offt_x);
+		register float fr1 asm("fr1") = (float)(int16_t)((int16_t)(p[0] >> 16) + pvr.draw_offt_y);
+		register float fr2 asm("fr2") = 0.0f;
+		register float fr3 asm("fr3") = 0.0f;
+		pvr_vertex_t *vert;
+
+		if (textured) {
+			fr2 = (float)(uint8_t)p[1];
+			fr3 = (float)((uint8_t)(p[1] >> 8) + voffset);
+		}
+		if (!(textured && raw_tex) && (i == 0 || multicolor)) {
+			c = __builtin_bswap32(p[-1 - (multicolor ? 0 : i * stride)]) >> 8;
+			if (textured && !bright)
+				c = get_tex_vertex_color(c);
+		}
+
+		asm inline("ftrv xmtrx, fv0\n"
+			   : "+f"(fr0), "+f"(fr1), "+f"(fr2), "+f"(fr3));
+
+		vert = (pvr_vertex_t *)(sq ^= 32);
+		if (i == nb - 1)
+			vert->flags = PVR_CMD_VERTEX_EOL;
+		vert->argb = c;
+		vert->x = fr0;
+		vert->y = fr1;
+		if (textured) {
+			vert->u = fr2 + COORDS_U_OFFSET;
+			vert->v = fr3 + COORDS_V_OFFSET;
+		} else {
+			vert->argb0 = c;
+		}
+		__asm__ __volatile__("pref @%0" : : "r"(vert) : "memory");
+	}
+	pvr_dr_addr = sq;
+
+	if (textured && !raw_tex && unlikely(bright)) {
+		/* the additive pass process_poly() queues for the TR list */
+		struct poly *bp = &polybuf[pvr.polybuf_cnt_start++];
+		uint32_t col = 0xffffff;
+
+		poly_alloc_cache(bp);
+		bp->texpage_id = texpage & 0x1f;
+		bp->bpp = TEXTURE_4BPP;
+		bp->blending_mode = BLENDING_MODE_ADD;
+		bp->_pad = 0;
+		bp->flags = flags & ~POLY_BRIGHT;
+		bp->clut = (buf[1 + 1] >> 16) & 0x7fff;
+		bp->zoffset = pvr.zoffset++;
+		bp->voffset = voffset;
+		bp->tex = tex;
+		for (i = 0, p = buf + 1; i < 4; i++, p += stride) {
+			if (i >= nb) {
+				bp->colors[i] = 0;
+				bp->coords[i] = (struct vertex_coords){ 0 };
+				continue;
+			}
+			if (i == 0 || multicolor)
+				col = __builtin_bswap32(p[-1 - (multicolor ? 0 : i * stride)]) >> 8;
+			bp->colors[i] = col;
+			bp->coords[i] = (struct vertex_coords){
+				.x = x_to_xoffset((int16_t)p[0]),
+				.y = y_to_yoffset((int16_t)(p[0] >> 16)),
+				.u = (uint8_t)p[1],
+				.v = (uint8_t)(p[1] >> 8),
+			};
+		}
+	}
+
+	return true;
+}
+
+/* Textured colour table: tex_col_lut[x] = get_tex_vertex_color() of one
+ * channel (the function never carries between bytes), so a vertex colour is
+ * three table loads instead of a byteswap and the doubling arithmetic. */
+static uint8_t tex_col_lut[256];
+static pvr_poly_hdr_t poly_textured8 __attribute__((aligned(32)));
+
+/* What fast_tex.S (fast_tex_asm) needs from this file. The assembly also uses
+ * the pvr_renderer offsets asserted below and these bits of the word at 36:
+ * new_frame 0, set_mask 2, check_mask 3, clip_test 4. */
+struct ft_ctx {
+	struct pvr_renderer *pvr;	/*   0 */
+	void *old;			/*   4: &pvr.old_blending_is_none */
+	struct cb_entry *cb_cache;	/*   8 */
+	uint16_t *cb_epoch;		/*  12 */
+	const uint8_t *lut;		/*  16 */
+	const pvr_poly_hdr_t *tmpl;	/*  20 */
+	uint16_t *inval;		/*  24 */
+	struct texture_page *page4[32];	/*  28 */
+	struct texture_page *page8[32];	/* 156 */
+};
+struct ft_ctx ft_ctx __attribute__((used));
+bool fast_tex_asm(const uint32_t *buf, uint32_t cmd);
+bool fast_tex_c(const uint32_t *buf, const uint32_t cmd) __attribute__((used));
+
+_Static_assert(offsetof(struct pvr_renderer, zoffset) == 8, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, draw_x1) == 12, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, draw_y1) == 14, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, draw_x2) == 16, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, draw_y2) == 18, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, draw_offt_x) == 24, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, draw_offt_y) == 26, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, inval_counter) == 38, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, old_flags)
+	       == offsetof(struct pvr_renderer, old_blending_is_none) + 2, "fast_tex.S");
+_Static_assert(offsetof(struct pvr_renderer, old_tex)
+	       == offsetof(struct pvr_renderer, old_blending_is_none) + 4, "fast_tex.S");
+_Static_assert(offsetof(struct texture_page, tex) == 8, "fast_tex.S");
+_Static_assert(offsetof(struct texture_page, block_mask) == 12, "fast_tex.S");
+_Static_assert(offsetof(struct texture_page, inuse_mask) == 20, "fast_tex.S");
+_Static_assert(sizeof(struct cb_entry) == 12 && offsetof(struct cb_entry, clut) == 4
+	       && offsetof(struct cb_entry, gen) == 6 && offsetof(struct cb_entry, epoch) == 8
+	       && offsetof(struct cb_entry, codebook) == 10, "fast_tex.S");
+_Static_assert(offsetof(struct ft_ctx, page4) == 28 && offsetof(struct ft_ctx, page8) == 156,
+	       "fast_tex.S");
+_Static_assert(sizeof(struct pvr_vq_codebook_4bpp) == 256
+	       && sizeof(struct pvr_vq_codebook_8bpp) == 2048
+	       && NB_CODEBOOKS_4BPP == 249 && NB_CODEBOOKS_8BPP == 32, "fast_tex.S");
+_Static_assert(WITH_CLIPPING, "fast_tex.S sets POLY_NOCLIP and tests the draw area");
+
+static void tex_col_lut_init(void)
+{
+	unsigned int x;
+
+	ft_ctx.pvr = &pvr;
+	ft_ctx.old = &pvr.old_blending_is_none;
+	ft_ctx.cb_cache = cb_cache;
+	ft_ctx.cb_epoch = &cb_epoch;
+	ft_ctx.lut = tex_col_lut;
+	ft_ctx.tmpl = &poly_textured;
+	ft_ctx.inval = &pvr.inval_counter;
+	for (x = 0; x < 32; x++) {
+		ft_ctx.page4[x] = &pvr.textures4[x].base;
+		ft_ctx.page8[x] = &pvr.textures8[x].base;
+	}
+
+	for (x = 0; x < 256; x++)
+		tex_col_lut[x] = (uint8_t)get_tex_vertex_color(x);
+
+	poly_textured8 = poly_textured;
+	poly_textured8.m2.u_size = PVR_UV_SIZE_512;
+}
+
+/* One vertex into the store queue at sq: argb, v, u, (z kept), y, x written
+ * backwards with pre-decrement stores, then the burst. */
+static __attribute__((always_inline)) inline void
+sq_vertex(uint32_t sq, uint32_t argb, float x, float y, float u, float v)
+{
+	uint32_t p = sq + 28;
+
+	__asm__ __volatile__(
+		"mov.l	%1,@-%0\n\t"
+		"fmov.s	%2,@-%0\n\t"
+		"fmov.s	%3,@-%0\n\t"
+		"add	#-4,%0\n\t"
+		"fmov.s	%4,@-%0\n\t"
+		"fmov.s	%5,@-%0\n\t"
+		"pref	@%0"
+		: "+r"(p)
+		: "r"(argb), "f"(v), "f"(u), "f"(y), "f"(x)
+		: "memory");
+}
+
+__noinline
+static void fast_tex_hdr(uint16_t flags, pvr_ptr_t tex, unsigned int bpp)
+{
+	pvr_poly_hdr_t *sq_hdr;
+
+	if (WITH_CLIPPING && ((pvr.old_flags ^ flags) & POLY_NOCLIP))
+		pvr_avoid_tile_clip_glitch();
+
+	pvr.old_blending_is_none = true;
+	pvr.old_flags = flags;
+	pvr.old_tex = tex;
+
+	/* the store queue is write-only: no bitfield stores into it */
+	sq_hdr = pvr_dr_target();
+	copy32(sq_hdr, bpp == TEXTURE_8BPP ? &poly_textured8 : &poly_textured);
+	sq_hdr->m3 = (struct pvr_poly_hdr_mode3){
+		.txr_base = to_pvr_txr_ptr(tex),
+		.nontwiddled = true,
+		.vq_en = true,
+		.pixel_mode = PVR_PIXEL_MODE_ARGB1555,
+	};
+	pvr_dr_commit(sq_hdr);
+}
+
+/* the additive pass process_poly() queues for a bright polygon */
+__noinline
+static void fast_tex_bright(const uint32_t *buf, unsigned int nb, unsigned int stride,
+			    bool multicolor, uint16_t flags, unsigned int page_id,
+			    unsigned int bpp, uint16_t voffset, pvr_ptr_t tex,
+			    unsigned int usub, unsigned int ushift)
+{
+	struct poly *bp = &polybuf[pvr.polybuf_cnt_start++];
+	const uint32_t *p;
+	uint32_t col = 0xffffff;
+	unsigned int i;
+
+	poly_alloc_cache(bp);
+	bp->texpage_id = page_id;
+	bp->bpp = bpp;
+	bp->blending_mode = BLENDING_MODE_ADD;
+	bp->_pad = 0;
+	bp->flags = flags & ~POLY_BRIGHT;
+	bp->clut = (buf[1 + 1] >> 16) & 0x7fff;
+	bp->zoffset = pvr.zoffset++;
+	bp->voffset = voffset;
+	bp->tex = tex;
+	for (i = 0, p = buf + 1; i < 4; i++, p += stride) {
+		if (i >= nb) {
+			bp->colors[i] = 0;
+			bp->coords[i] = (struct vertex_coords){ 0 };
+			continue;
+		}
+		if (i == 0 || multicolor)
+			col = __builtin_bswap32(p[-1]) >> 8;
+		bp->colors[i] = col;
+		bp->coords[i] = (struct vertex_coords){
+			.x = x_to_xoffset((int16_t)p[0]),
+			.y = y_to_yoffset((int16_t)(p[0] >> 16)),
+			.u = ((uint8_t)p[1] - usub) << ushift,
+			.v = (uint8_t)(p[1] >> 8),
+		};
+	}
+}
+
+/* FAST TEXTURED POLYGON (GP0 24-3f, not semi-transparent, 4bpp): one routine
+ * for flat/gouraud/raw and 3/4 vertices so it stays in the I-cache. Same
+ * checks, same state changes and the same TA bytes as fast_poly_t(). */
+__noinline
+bool fast_tex_c(const uint32_t *buf, const uint32_t cmd)
+{
+	const bool multicolor = cmd & 0x10, raw_tex = cmd & 0x01;
+	const unsigned int nb = 3 + !!(cmd & 0x08);
+	const unsigned int stride = 2 + multicolor;
+	const uint32_t *p, *end = buf + 1 + nb * stride;
+	int x_min, x_max, y_min, y_max;
+	unsigned int umin, umax, vmin, vmax, i;
+	struct texture_page *page;
+	uint64_t bm, to_load;
+	unsigned int codebook;
+	pvr_ptr_t tex;
+	uint16_t flags, voffset, texpage;
+	uint32_t sq, c;
+	unsigned int bpp, ushift = 0, usub = 0, page_id;
+	bool bright = false;
+	float z;
+
+	if ((cmd & 0x02) | pvr.set_mask | pvr.check_mask | pvr.new_frame)
+		return false;
+
+	texpage = buf[1 + stride + 1] >> 16;
+	bpp = (texpage >> 7) & 0x3;
+	if (bpp > TEXTURE_8BPP)
+		return false;
+	page_id = texpage & 0x1f;
+
+	if (!raw_tex) {
+		for (i = 0; i < (multicolor ? nb : 1); i++) {
+			c = buf[i * stride];
+			bright |= (c & 0xff) > 0x80 || (c & 0xff00) > 0x8000
+				|| (c & 0xff0000) > 0x800000;
+		}
+		if (bright && (!WITH_HYBRID_RENDERING || WITH_BILINEAR
+			       || unlikely(pvr.polybuf_cnt_start == __array_size(polybuf))))
+			return false;
+	}
+
+	p = buf + 1;
+	x_min = x_max = (int16_t)p[0];
+	y_min = y_max = (int16_t)(p[0] >> 16);
+	umin = umax = (uint8_t)p[1];
+	vmin = vmax = (uint8_t)(p[1] >> 8);
+	for (p += stride; p < end; p += stride) {
+		int x = (int16_t)p[0], y = (int16_t)(p[0] >> 16);
+		unsigned int u = (uint8_t)p[1], v = (uint8_t)(p[1] >> 8);
+
+		x_min = x < x_min ? x : x_min;
+		x_max = x > x_max ? x : x_max;
+		y_min = y < y_min ? y : y_min;
+		y_max = y > y_max ? y : y_max;
+		umin = u < umin ? u : umin;
+		umax = u > umax ? u : umax;
+		vmin = v < vmin ? v : vmin;
+		vmax = v > vmax ? v : vmax;
+	}
+
+	if (x_max - x_min >= 1024 || y_max - y_min >= 512)
+		return true;	/* too big: the general path drops it too */
+
+	if (bpp == TEXTURE_8BPP) {
+		/* process_poly(): a page holds 128 8bpp texels across. Use
+		 * the next page when every u is past it; a polygon across
+		 * the boundary is cut by the general path. */
+		unsigned int offt = umin >> 7;
+
+		if (offt != ((uint16_t)(umax - 1) >> 7))
+			return false;
+		usub = offt << 7;
+		page_id = (page_id + offt) % 32;
+		ushift = 1;
+		umin = (umin - usub) << 1;
+		umax = (umax - usub) << 1;
+		page = &pvr.textures8[page_id].base;
+	} else {
+		page = &pvr.textures4[page_id].base;
+	}
+	if (unlikely(!page->tex))
+		return false;
+
+	if (WITH_CLIPPING && pvr.clip_test) {
+		int x0 = x_min + pvr.draw_offt_x, x1 = x_max + pvr.draw_offt_x;
+		int y0 = y_min + pvr.draw_offt_y, y1 = y_max + pvr.draw_offt_y;
+
+		if (x0 < INT16_MIN || x1 > INT16_MAX || y0 < INT16_MIN || y1 > INT16_MAX
+		    || x0 < pvr.draw_x1 || x1 > pvr.draw_x2
+		    || y0 < pvr.draw_y1 || y1 > pvr.draw_y2)
+			return false;
+	}
+
+	/* umin..umax+1 / vmin..vmax+1 as fast_poly_t() passes them */
+	bm = block_mask_fast(umin, umax, vmin, vmax);
+	if (unlikely((page->inuse_mask | page->old_inuse_mask) & ~page->block_mask & bm))
+		return false;	/* page must be discarded first */
+
+	/* --- committed --- */
+	to_load = ~page->block_mask & bm;
+	page->inuse_mask |= bm;
+	if (unlikely(to_load))
+		update_texture(page, page_id, to_load);
+
+	codebook = find_texture_codebook(page, (buf[1 + 1] >> 16) & 0x7fff);
+	if (bpp == TEXTURE_4BPP) {
+		voffset = NB_CODEBOOKS_4BPP - 1 - codebook;
+		tex = (pvr_ptr_t)&page->vq->codebook4[codebook];
+	} else {
+		voffset = (NB_CODEBOOKS_8BPP - 1 - codebook) * 16;
+		tex = (pvr_ptr_t)&page->vq->codebook8[codebook];
+	}
+
+	SNAPCNT(14, 1);
+	flags = POLY_TEXTURED | ((cmd & 0x08) ? POLY_4VERTEX : 0)
+		| (WITH_CLIPPING ? POLY_NOCLIP : 0) | (bright ? POLY_BRIGHT : 0);
+	z = get_zvalue(pvr.zoffset++);
+
+	if (!(pvr.old_blending_is_none && pvr.old_flags == flags && tex == pvr.old_tex)) {
+		fast_tex_hdr(flags, tex, bpp);
+	}
+
+	sq = pvr_dr_addr;
+	for (i = 0; i < 2; i++) {
+		pvr_vertex_t *w = (pvr_vertex_t *)(sq ^= 32);
+
+		w->flags = PVR_CMD_VERTEX;
+		w->z = z;
+		w->oargb = 0;
+	}
+
+	c = 0xffffff;
+	const int16_t ox = pvr.draw_offt_x, oy = pvr.draw_offt_y;
+	for (i = 0, p = buf + 1; i < nb; i++, p += stride) {
+		register float fr0 asm("fr0") = (float)(int16_t)((int16_t)p[0] + ox);
+		register float fr1 asm("fr1") = (float)(int16_t)((int16_t)(p[0] >> 16) + oy);
+		register float fr2 asm("fr2") = (float)(int)(((uint8_t)p[1] - usub) << ushift);
+		register float fr3 asm("fr3") = (float)(int)((uint8_t)(p[1] >> 8) + voffset);
+
+		if (!raw_tex && (i == 0 || multicolor)) {
+			uint32_t w = p[-1];
+
+			if (bright)
+				c = __builtin_bswap32(w) >> 8;
+			else
+				c = ((uint32_t)tex_col_lut[w & 0xff] << 16)
+					| ((uint32_t)tex_col_lut[(w >> 8) & 0xff] << 8)
+					| tex_col_lut[(w >> 16) & 0xff];
+		}
+
+		asm inline("ftrv xmtrx, fv0\n"
+			   : "+f"(fr0), "+f"(fr1), "+f"(fr2), "+f"(fr3));
+
+		sq ^= 32;
+		if (i == nb - 1)
+			((pvr_vertex_t *)sq)->flags = PVR_CMD_VERTEX_EOL;
+		sq_vertex(sq, c, fr0, fr1, fr2 + COORDS_U_OFFSET, fr3 + COORDS_V_OFFSET);
+	}
+	pvr_dr_addr = sq;
+
+	if (!raw_tex && unlikely(bright))
+		fast_tex_bright(buf, nb, stride, multicolor, flags, page_id, bpp,
+				voffset, tex, usub, ushift);
+
+	return true;
+}
+
+/* One specialisation per flag combination (multicolor 0x10, 4 vertices 0x08,
+ * textured 0x04, raw 0x01; semi-transparent 0x02 never takes the fast path):
+ * with the flags constant GCC keeps the whole polygon in registers. */
+#define FAST_POLY_V(f) \
+	__noinline static bool fast_poly_##f(const uint32_t *buf) \
+	{ return fast_poly_t(buf, 0x20 | (f)); }
+FAST_POLY_V(0x00) FAST_POLY_V(0x01) FAST_POLY_V(0x04) FAST_POLY_V(0x05)
+FAST_POLY_V(0x08) FAST_POLY_V(0x09) FAST_POLY_V(0x0c) FAST_POLY_V(0x0d)
+FAST_POLY_V(0x10) FAST_POLY_V(0x11) FAST_POLY_V(0x14) FAST_POLY_V(0x15)
+FAST_POLY_V(0x18) FAST_POLY_V(0x19) FAST_POLY_V(0x1c) FAST_POLY_V(0x1d)
+
+static inline bool fast_poly(const uint32_t *buf, uint32_t cmd)
+{
+	if (FAST_TEX && (cmd & 0x04))
+		return fast_tex_asm(buf, cmd);
+
+	switch (cmd & 0x1f) {
+	case 0x00: return fast_poly_0x00(buf);
+	case 0x01: return fast_poly_0x01(buf);
+	case 0x04: return fast_poly_0x04(buf);
+	case 0x05: return fast_poly_0x05(buf);
+	case 0x08: return fast_poly_0x08(buf);
+	case 0x09: return fast_poly_0x09(buf);
+	case 0x0c: return fast_poly_0x0c(buf);
+	case 0x0d: return fast_poly_0x0d(buf);
+	case 0x10: return fast_poly_0x10(buf);
+	case 0x11: return fast_poly_0x11(buf);
+	case 0x14: return fast_poly_0x14(buf);
+	case 0x15: return fast_poly_0x15(buf);
+	case 0x18: return fast_poly_0x18(buf);
+	case 0x19: return fast_poly_0x19(buf);
+	case 0x1c: return fast_poly_0x1c(buf);
+	case 0x1d: return fast_poly_0x1d(buf);
+	default: return false;	/* semi-transparent */
+	}
+}
+
+__pvr
+/* One GP0 command, in list order. Called from process_gpu_commands() for
+ * anything queued in cmdbuf, and straight from do_cmd_list() (DIRECT_GP0). */
+static __attribute__((always_inline)) inline void
+process_gpu_command(const union PacketBuffer *pbuffer, uint32_t cmd,
+		    unsigned int len_polyline, bool fast_tried)
+{
+	bool multicolor = cmd & 0x10, multiple = cmd & 0x08;
+	bool textured = cmd & 0x04, semi_trans = cmd & 0x02, raw_tex = cmd & 0x01;
+	enum blending_mode blending_mode;
+	struct poly poly;
+	uint16_t draw_x, draw_y;
+	bool draw_updated;
+
+	(void)multiple;
+
+	/* Everything opaque in untextured-only mode.  This is the one
+	 * assignment keeping the whole blended branch of process_poly()
+	 * and the four modes in poly_draw_now() reachable. */
+	blending_mode = (semi_trans && !PVR_UNTEX_ONLY)
+		? pvr.blending_mode : BLENDING_MODE_NONE;
+
+	switch (cmd >> 5) {
+	case 0x0:
+		switch (cmd) {
+		case 0x02:
+			cmd_clear_image(pbuffer);
+			break;
+
+		default:
+			/* VRAM access commands, or NOP */
+			break;
+		}
+		break;
+
+	case 0x7:
+		switch (cmd) {
+		case 0xe1:
+			/* Set texture page */
+			pvr.gp1 = (pvr.gp1 & ~0x7ff) | (pbuffer->U4[0] & 0x7ff);
+
+			pvr.settings.bpp = (enum texture_bpp)((pvr.gp1 >> 7) & 0x3);
+			pvr.blending_mode = (enum blending_mode)((pvr.gp1 >> 5) & 0x3);
+			pvr.page_x = pvr.gp1 & 0xf;
+			pvr.page_y = pvr.gp1 >> 4;
+			break;
+
+		case 0xe2:
+			/* TODO: Set texture window */
+			pvr.settings.mask_x = pbuffer->U4[0];
+			pvr.settings.mask_y = pbuffer->U4[0] >> 5;
+			pvr.settings.offt_x = pbuffer->U4[0] >> 10;
+			pvr.settings.offt_y = pbuffer->U4[0] >> 15;
+			break;
+
+		case 0xe3:
+			/* Set top-left corner of drawing area */
+			draw_x = pbuffer->U4[0] & 0x3ff;
+			draw_y = (pbuffer->U4[0] >> 10) & 0x1ff;
+			draw_updated = draw_x - pvr.start_x != pvr.draw_x1
+				|| draw_y - pvr.start_y != pvr.draw_y1;
+
+			pvr.draw_x1 = draw_x - pvr.start_x;
+			pvr.draw_y1 = draw_y - pvr.start_y;
+
+			if (WITH_CLIPPING) {
+				pvr.clip_test = pvr_clip_test();
+
+				if (!pvr.new_frame && draw_updated)
+					pvr_add_clip(pvr.zoffset++);
+			}
+			break;
+
+		case 0xe4:
+			/* Set bottom-right corner of drawing area */
+			draw_x = (pbuffer->U4[0] & 0x3ff) + 1;
+			draw_y = ((pbuffer->U4[0] >> 10) & 0x1ff) + 1;
+			draw_updated = draw_x - pvr.start_x != pvr.draw_x2
+				|| draw_y - pvr.start_y != pvr.draw_y2;
+
+			pvr.draw_x2 = draw_x - pvr.start_x;
+			pvr.draw_y2 = draw_y - pvr.start_y;
+
+			if (WITH_CLIPPING) {
+				pvr.clip_test = pvr_clip_test();
+
+				if (!pvr.new_frame && draw_updated)
+					pvr_add_clip(pvr.zoffset++);
+			}
+			break;
+
+		case 0xe5:
+			/* Set drawing offsets */
+			pvr.draw_dx = ((int32_t)pbuffer->U4[0] << 21) >> 21;
+			pvr.draw_dy = ((int32_t)pbuffer->U4[0] << 10) >> 21;
+			pvr.draw_offt_x = pvr.draw_dx - pvr.start_x + gpu.screen.x;
+			pvr.draw_offt_y = pvr.draw_dy - pvr.start_y + gpu.screen.y;
+			if (0)
+				pvr_printf("Set drawing offsets to %dx%d\n",
+					   pvr.draw_dx, pvr.draw_dy);
+			break;
+
+		case 0xe6:
+			/* VRAM mask settings */
+			pvr.set_mask = !!(pbuffer->U4[0] & 0x1);
+			pvr.check_mask = !!(pbuffer->U4[0] & 0x2);
+			break;
+
+		default:
+			break;
+		}
+		break;
+
+	case 4:
+	case 5:
+	case 6:
+		/* VRAM access commands */
+		break;
+
+	case 0x1: {
+		/* Monochrome/shaded non-textured polygon */
+		if (FAST_POLY && !fast_tried && fast_poly(pbuffer->U4, cmd))
+			break;
+		int16_t x, x_min = INT16_MAX, x_max = INT16_MIN;
+		int16_t y, y_min = INT16_MAX, y_max = INT16_MIN;
+		unsigned int i, nb = 3 + !!multiple;
+		const uint32_t *buf = pbuffer->U4;
+		uint32_t texcoord[4];
+		uint16_t texpage;
+		bool bright = false;
+		uint32_t val;
+
+		poly_alloc_cache(&poly);
+
+		poly = (struct poly){
+			.colors = { 0xffffff },
+		};
+
+		if (textured && !PVR_UNTEX_ONLY)
+			poly.flags |= POLY_TEXTURED;
+		if (multiple)
+			poly.flags |= POLY_4VERTEX;
+
+		if (textured && raw_tex && !multicolor) {
+			/* Skip color */
+			buf++;
+		}
+
+		for (i = 0; i < nb; i++) {
+			if (!(textured && raw_tex) && (i == 0 || multicolor)) {
+				/* BGR->RGB swap */
+				poly.colors[i] = __builtin_bswap32(*buf++) >> 8;
+
+				if (textured && !PVR_UNTEX_ONLY) {
+					bright |= (poly.colors[i] & 0xff) > 0x80
+						|| (poly.colors[i] & 0xff00) > 0x8000
+						|| (poly.colors[i] & 0xff0000) > 0x800000;
+				}
+			} else {
+				if (textured && raw_tex && multicolor)
+					buf++;
+
+				poly.colors[i] = poly.colors[0];
+			}
+
+			val = *buf++;
+			x = val;
+			y = val >> 16;
+
+			if (x < x_min)
+				x_min = x;
+			if (x > x_max)
+				x_max = x;
+			if (y < y_min)
+				y_min = y;
+			if (y > y_max)
+				y_max = y;
+
+			poly.coords[i].x = x_to_xoffset(x);
+			poly.coords[i].y = y_to_yoffset(y);
+
+			if (textured) {
+				/* Consumed either way: the packet is
+				 * this long regardless of whether we
+				 * intend to texture with it. */
+				texcoord[i] = *buf++;
+
+				if (!PVR_UNTEX_ONLY) {
+					poly.coords[i].u = (uint8_t)texcoord[i];
+					poly.coords[i].v = (uint8_t)(texcoord[i] >> 8);
+				}
+			}
+		}
+
+		if (x_max - x_min >= 1024 || y_max - y_min >= 512) {
+			/* Poly is too big */
+			break;
+		}
+
+		if (textured && !raw_tex && !bright && !PVR_UNTEX_ONLY) {
+			for (i = 0; i < nb; i++)
+				poly.colors[i] = get_tex_vertex_color(poly.colors[i]);
+		}
+
+		if (textured && !PVR_UNTEX_ONLY) {
+			texpage = texcoord[1] >> 16;
+
+			poly.clut = (texcoord[0] >> 16) & 0x7fff;
+			poly.bpp = (texpage >> 7) & 0x3;
+			poly.texpage_id = texpage & 0x1f;
+
+			if (semi_trans)
+				blending_mode = (enum blending_mode)((texpage >> 5) & 0x3);
+		}
+
+		poly.blending_mode = blending_mode;
+
+		if (bright)
+			poly.flags |= POLY_BRIGHT;
+
+		process_poly(&poly, textured && !PVR_UNTEX_ONLY);
+		break;
+	}
+
+	case 0x2: {
+		/* Monochrome/shaded line */
+		const uint32_t *buf = pbuffer->U4;
+
+		if (PVR_UNTEX_ONLY)
+			break;
+		uint32_t oldcolor, color, val;
+		int16_t x, y, oldx, oldy;
+		unsigned int i;
+
+		/* BGR->RGB swap */
+		color = __builtin_bswap32(*buf++) >> 8;
+		oldcolor = color;
+
+		val = *buf++;
+		oldx = x_to_xoffset((int16_t)val);
+		oldy = y_to_yoffset((int16_t)(val >> 16));
+
+		for (i = 0; i < len_polyline - 1; i++) {
+			if (multicolor)
+				color = __builtin_bswap32(*buf++) >> 8;
+
+			val = *buf++;
+			x = x_to_xoffset((int16_t)val);
+			y = y_to_yoffset((int16_t)(val >> 16));
+
+			if (oldx > x)
+				draw_line(x, y, color, oldx, oldy, oldcolor, blending_mode);
+			else
+				draw_line(oldx, oldy, oldcolor, x, y, color, blending_mode);
+
+			oldx = x;
+			oldy = y;
+			oldcolor = color;
+		}
+		break;
+	}
+
+	case 0x3: {
+		/* Monochrome rectangle */
+		uint16_t w, h, x0, y0, x1, y1;
+
+		/* Sprites are overwhelmingly textured; in untextured
+		 * mode they would all be flat quads and they are not
+		 * what this measures. */
+		if (PVR_UNTEX_ONLY)
+			break;
+
+		bool bright = false;
+		uint32_t color;
+		uint16_t flags = POLY_4VERTEX;
+
+		if (!textured || !raw_tex) {
+			/* BGR->RGB swap */
+			color = __builtin_bswap32(pbuffer->U4[0]) >> 8;
+		} else {
+			color = 0xffffff;
+		}
+
+		if (textured && !raw_tex) {
+			bright = (color & 0xff) > 0x80
+				|| (color & 0xff00) > 0x8000
+				|| (color & 0xff0000) > 0x800000;
+
+			if (!bright)
+				color = get_tex_vertex_color(color);
+		}
+
+		x0 = (int16_t)pbuffer->U4[1];
+		y0 = (int16_t)(pbuffer->U4[1] >> 16);
+
+		if ((cmd & 0x18) == 0x18) {
+			w = 16;
+			h = 16;
+		} else if (cmd & 0x10) {
+			w = 8;
+			h = 8;
+		} else if (cmd & 0x08) {
+			w = 1;
+			h = 1;
+		} else {
+			w = pbuffer->U2[4 + 2 * !!textured];
+			h = pbuffer->U2[5 + 2 * !!textured];
+		}
+
+		x1 = x_to_xoffset(x0 + w);
+		x0 = x_to_xoffset(x0);
+		y1 = y_to_yoffset(y0 + h);
+		y0 = y_to_yoffset(y0);
+
+		poly_alloc_cache(&poly);
+
+		if (bright)
+			flags |= POLY_BRIGHT;
+		if (textured)
+			flags |= POLY_TEXTURED;
+
+		poly = (struct poly){
+			.blending_mode = blending_mode,
+			.colors = { color, color, color, color },
+			.coords = {
+				[0] = { .x = x1, .y = y0 },
+				[1] = { .x = x0, .y = y0 },
+				[2] = { .x = x1, .y = y1 },
+				[3] = { .x = x0, .y = y1 },
+			},
+			.flags = flags,
+		};
+
+		if (textured) {
+			poly.bpp = pvr.settings.bpp;
+			poly.texpage_id = pvr.page_y * 16 + pvr.page_x;
+			poly.clut = pbuffer->U2[5] & 0x7fff;
+
+			poly.coords[1].u = poly.coords[3].u = pbuffer->U1[8];
+			poly.coords[0].u = poly.coords[2].u = pbuffer->U1[8] + w;
+
+			poly.coords[0].v = poly.coords[1].v = pbuffer->U1[9];
+			poly.coords[2].v = poly.coords[3].v = pbuffer->U1[9] + h;
+		}
+
+		process_poly(&poly, textured);
+		break;
+	}
+
+	default:
+		pvr_printf("Unhandled GPU CMD: 0x%lx\n", cmd);
+		break;
+	}
+}
+
 __pvr
 static void process_gpu_commands(void)
 {
-	bool multicolor, multiple, semi_trans, textured, raw_tex;
 	unsigned int cmd_offt, len_polyline = 0;
 	const union PacketBuffer *pbuffer;
-	enum blending_mode blending_mode;
-	struct poly poly;
 	uint32_t cmd, len;
-	uint16_t draw_x, draw_y;
-	bool draw_updated;
+	bool fast;
 
 #if WITH_SH4_SNAPSHOT
 	if (sh4snap_no_pvr) {
@@ -2614,24 +3712,20 @@ static void process_gpu_commands(void)
 	}
 #endif
 
+	SNAPCNT(10, 1);
 	for (cmd_offt = 0; cmd_offt < pvr.cmdbuf_offt; cmd_offt += 1 + len) {
 		pbuffer = (const union PacketBuffer *)&cmdbuf[cmd_offt];
+		SNAPCNT(0, 1);
 
 		cmd = pbuffer->U4[0] >> 24;
 		len = cmd_lengths[cmd];
 
-		multicolor = cmd & 0x10;
-		multiple = cmd & 0x08;
-		textured = cmd & 0x04;
-		semi_trans = cmd & 0x02;
-		raw_tex = cmd & 0x01;
-
 		if (unlikely((cmd >> 5) == 0x2)) {
-			if (unlikely(multiple)) {
+			if (unlikely(cmd & 0x08)) {
 				len_polyline = get_line_length((uint32_t *)pbuffer,
 							       (uint32_t *)0xffffffff,
-							       multicolor);
-				len += (len_polyline - 2) << !!multicolor;
+							       cmd & 0x10);
+				len += (len_polyline - 2) << !!(cmd & 0x10);
 			} else {
 				len_polyline = 2;
 			}
@@ -2639,341 +3733,11 @@ static void process_gpu_commands(void)
 
 		dcache_pref_line(&cmdbuf[cmd_offt + 1 + len]);
 
-		/* Everything opaque in untextured-only mode.  This is the one
-		 * assignment keeping the whole blended branch of process_poly()
-		 * and the four modes in poly_draw_now() reachable. */
-		blending_mode = (semi_trans && !PVR_UNTEX_ONLY)
-			? pvr.blending_mode : BLENDING_MODE_NONE;
+		fast = FAST_POLY && (cmd & 0xe2) == 0x20;
+		if (fast && fast_poly(pbuffer->U4, cmd))
+			continue;
 
-		switch (cmd >> 5) {
-		case 0x0:
-			switch (cmd) {
-			case 0x02:
-				cmd_clear_image(pbuffer);
-				break;
-
-			default:
-				/* VRAM access commands, or NOP */
-				break;
-			}
-			break;
-
-		case 0x7:
-			switch (cmd) {
-			case 0xe1:
-				/* Set texture page */
-				pvr.gp1 = (pvr.gp1 & ~0x7ff) | (pbuffer->U4[0] & 0x7ff);
-
-				pvr.settings.bpp = (enum texture_bpp)((pvr.gp1 >> 7) & 0x3);
-				pvr.blending_mode = (enum blending_mode)((pvr.gp1 >> 5) & 0x3);
-				pvr.page_x = pvr.gp1 & 0xf;
-				pvr.page_y = pvr.gp1 >> 4;
-				break;
-
-			case 0xe2:
-				/* TODO: Set texture window */
-				pvr.settings.mask_x = pbuffer->U4[0];
-				pvr.settings.mask_y = pbuffer->U4[0] >> 5;
-				pvr.settings.offt_x = pbuffer->U4[0] >> 10;
-				pvr.settings.offt_y = pbuffer->U4[0] >> 15;
-				break;
-
-			case 0xe3:
-				/* Set top-left corner of drawing area */
-				draw_x = pbuffer->U4[0] & 0x3ff;
-				draw_y = (pbuffer->U4[0] >> 10) & 0x1ff;
-				draw_updated = draw_x - pvr.start_x != pvr.draw_x1
-					|| draw_y - pvr.start_y != pvr.draw_y1;
-
-				pvr.draw_x1 = draw_x - pvr.start_x;
-				pvr.draw_y1 = draw_y - pvr.start_y;
-
-				if (WITH_CLIPPING) {
-					pvr.clip_test = pvr_clip_test();
-
-					if (!pvr.new_frame && draw_updated)
-						pvr_add_clip(pvr.zoffset++);
-				}
-				break;
-
-			case 0xe4:
-				/* Set bottom-right corner of drawing area */
-				draw_x = (pbuffer->U4[0] & 0x3ff) + 1;
-				draw_y = ((pbuffer->U4[0] >> 10) & 0x1ff) + 1;
-				draw_updated = draw_x - pvr.start_x != pvr.draw_x2
-					|| draw_y - pvr.start_y != pvr.draw_y2;
-
-				pvr.draw_x2 = draw_x - pvr.start_x;
-				pvr.draw_y2 = draw_y - pvr.start_y;
-
-				if (WITH_CLIPPING) {
-					pvr.clip_test = pvr_clip_test();
-
-					if (!pvr.new_frame && draw_updated)
-						pvr_add_clip(pvr.zoffset++);
-				}
-				break;
-
-			case 0xe5:
-				/* Set drawing offsets */
-				pvr.draw_dx = ((int32_t)pbuffer->U4[0] << 21) >> 21;
-				pvr.draw_dy = ((int32_t)pbuffer->U4[0] << 10) >> 21;
-				pvr.draw_offt_x = pvr.draw_dx - pvr.start_x + gpu.screen.x;
-				pvr.draw_offt_y = pvr.draw_dy - pvr.start_y + gpu.screen.y;
-				if (0)
-					pvr_printf("Set drawing offsets to %dx%d\n",
-						   pvr.draw_dx, pvr.draw_dy);
-				break;
-
-			case 0xe6:
-				/* VRAM mask settings */
-				pvr.set_mask = !!(pbuffer->U4[0] & 0x1);
-				pvr.check_mask = !!(pbuffer->U4[0] & 0x2);
-				break;
-
-			default:
-				break;
-			}
-			break;
-
-		case 4:
-		case 5:
-		case 6:
-			/* VRAM access commands */
-			break;
-
-		case 0x1: {
-			/* Monochrome/shaded non-textured polygon */
-			int16_t x, x_min = INT16_MAX, x_max = INT16_MIN;
-			int16_t y, y_min = INT16_MAX, y_max = INT16_MIN;
-			unsigned int i, nb = 3 + !!multiple;
-			const uint32_t *buf = pbuffer->U4;
-			uint32_t texcoord[4];
-			uint16_t texpage;
-			bool bright = false;
-			uint32_t val;
-
-			poly_alloc_cache(&poly);
-
-			poly = (struct poly){
-				.colors = { 0xffffff },
-			};
-
-			if (textured && !PVR_UNTEX_ONLY)
-				poly.flags |= POLY_TEXTURED;
-			if (multiple)
-				poly.flags |= POLY_4VERTEX;
-
-			if (textured && raw_tex && !multicolor) {
-				/* Skip color */
-				buf++;
-			}
-
-			for (i = 0; i < nb; i++) {
-				if (!(textured && raw_tex) && (i == 0 || multicolor)) {
-					/* BGR->RGB swap */
-					poly.colors[i] = __builtin_bswap32(*buf++) >> 8;
-
-					if (textured && !PVR_UNTEX_ONLY) {
-						bright |= (poly.colors[i] & 0xff) > 0x80
-							|| (poly.colors[i] & 0xff00) > 0x8000
-							|| (poly.colors[i] & 0xff0000) > 0x800000;
-					}
-				} else {
-					if (textured && raw_tex && multicolor)
-						buf++;
-
-					poly.colors[i] = poly.colors[0];
-				}
-
-				val = *buf++;
-				x = val;
-				y = val >> 16;
-
-				if (x < x_min)
-					x_min = x;
-				if (x > x_max)
-					x_max = x;
-				if (y < y_min)
-					y_min = y;
-				if (y > y_max)
-					y_max = y;
-
-				poly.coords[i].x = x_to_xoffset(x);
-				poly.coords[i].y = y_to_yoffset(y);
-
-				if (textured) {
-					/* Consumed either way: the packet is
-					 * this long regardless of whether we
-					 * intend to texture with it. */
-					texcoord[i] = *buf++;
-
-					if (!PVR_UNTEX_ONLY) {
-						poly.coords[i].u = (uint8_t)texcoord[i];
-						poly.coords[i].v = (uint8_t)(texcoord[i] >> 8);
-					}
-				}
-			}
-
-			if (x_max - x_min >= 1024 || y_max - y_min >= 512) {
-				/* Poly is too big */
-				break;
-			}
-
-			if (textured && !raw_tex && !bright && !PVR_UNTEX_ONLY) {
-				for (i = 0; i < nb; i++)
-					poly.colors[i] = get_tex_vertex_color(poly.colors[i]);
-			}
-
-			if (textured && !PVR_UNTEX_ONLY) {
-				texpage = texcoord[1] >> 16;
-
-				poly.clut = (texcoord[0] >> 16) & 0x7fff;
-				poly.bpp = (texpage >> 7) & 0x3;
-				poly.texpage_id = texpage & 0x1f;
-
-				if (semi_trans)
-					blending_mode = (enum blending_mode)((texpage >> 5) & 0x3);
-			}
-
-			poly.blending_mode = blending_mode;
-
-			if (bright)
-				poly.flags |= POLY_BRIGHT;
-
-			process_poly(&poly, textured && !PVR_UNTEX_ONLY);
-			break;
-		}
-
-		case 0x2: {
-			/* Monochrome/shaded line */
-			const uint32_t *buf = pbuffer->U4;
-
-			if (PVR_UNTEX_ONLY)
-				break;
-			uint32_t oldcolor, color, val;
-			int16_t x, y, oldx, oldy;
-			unsigned int i;
-
-			/* BGR->RGB swap */
-			color = __builtin_bswap32(*buf++) >> 8;
-			oldcolor = color;
-
-			val = *buf++;
-			oldx = x_to_xoffset((int16_t)val);
-			oldy = y_to_yoffset((int16_t)(val >> 16));
-
-			for (i = 0; i < len_polyline - 1; i++) {
-				if (multicolor)
-					color = __builtin_bswap32(*buf++) >> 8;
-
-				val = *buf++;
-				x = x_to_xoffset((int16_t)val);
-				y = y_to_yoffset((int16_t)(val >> 16));
-
-				if (oldx > x)
-					draw_line(x, y, color, oldx, oldy, oldcolor, blending_mode);
-				else
-					draw_line(oldx, oldy, oldcolor, x, y, color, blending_mode);
-
-				oldx = x;
-				oldy = y;
-				oldcolor = color;
-			}
-			break;
-		}
-
-		case 0x3: {
-			/* Monochrome rectangle */
-			uint16_t w, h, x0, y0, x1, y1;
-
-			/* Sprites are overwhelmingly textured; in untextured
-			 * mode they would all be flat quads and they are not
-			 * what this measures. */
-			if (PVR_UNTEX_ONLY)
-				break;
-
-			bool bright = false;
-			uint32_t color;
-			uint16_t flags = POLY_4VERTEX;
-
-			if (!textured || !raw_tex) {
-				/* BGR->RGB swap */
-				color = __builtin_bswap32(pbuffer->U4[0]) >> 8;
-			} else {
-				color = 0xffffff;
-			}
-
-			if (textured && !raw_tex) {
-				bright = (color & 0xff) > 0x80
-					|| (color & 0xff00) > 0x8000
-					|| (color & 0xff0000) > 0x800000;
-
-				if (!bright)
-					color = get_tex_vertex_color(color);
-			}
-
-			x0 = (int16_t)pbuffer->U4[1];
-			y0 = (int16_t)(pbuffer->U4[1] >> 16);
-
-			if ((cmd & 0x18) == 0x18) {
-				w = 16;
-				h = 16;
-			} else if (cmd & 0x10) {
-				w = 8;
-				h = 8;
-			} else if (cmd & 0x08) {
-				w = 1;
-				h = 1;
-			} else {
-				w = pbuffer->U2[4 + 2 * !!textured];
-				h = pbuffer->U2[5 + 2 * !!textured];
-			}
-
-			x1 = x_to_xoffset(x0 + w);
-			x0 = x_to_xoffset(x0);
-			y1 = y_to_yoffset(y0 + h);
-			y0 = y_to_yoffset(y0);
-
-			poly_alloc_cache(&poly);
-
-			if (bright)
-				flags |= POLY_BRIGHT;
-			if (textured)
-				flags |= POLY_TEXTURED;
-
-			poly = (struct poly){
-				.blending_mode = blending_mode,
-				.colors = { color, color, color, color },
-				.coords = {
-					[0] = { .x = x1, .y = y0 },
-					[1] = { .x = x0, .y = y0 },
-					[2] = { .x = x1, .y = y1 },
-					[3] = { .x = x0, .y = y1 },
-				},
-				.flags = flags,
-			};
-
-			if (textured) {
-				poly.bpp = pvr.settings.bpp;
-				poly.texpage_id = pvr.page_y * 16 + pvr.page_x;
-				poly.clut = pbuffer->U2[5] & 0x7fff;
-
-				poly.coords[1].u = poly.coords[3].u = pbuffer->U1[8];
-				poly.coords[0].u = poly.coords[2].u = pbuffer->U1[8] + w;
-
-				poly.coords[0].v = poly.coords[1].v = pbuffer->U1[9];
-				poly.coords[2].v = poly.coords[3].v = pbuffer->U1[9] + h;
-			}
-
-			process_poly(&poly, textured);
-			break;
-		}
-
-		default:
-			pvr_printf("Unhandled GPU CMD: 0x%lx\n", cmd);
-			break;
-		}
+		process_gpu_command(pbuffer, cmd, len_polyline, fast);
 	}
 
 	pvr.cmdbuf_offt = 0;
@@ -2995,6 +3759,12 @@ static inline void cmdbuf_append(uint32_t *dst, const uint32_t *src, unsigned in
 	} while (--n);
 }
 
+/* gput_poly_base*() by (cmd >> 2) & 5: bit 0 textured, bit 2 multicolor */
+static const uint16_t poly_gput[8] = {
+	[0] = gput_poly_base(),   [1] = gput_poly_base_t(),
+	[4] = gput_poly_base_g(), [5] = gput_poly_base_gt(),
+};
+
 __attribute__((section(".text.gpuchain")))
 int do_cmd_list(uint32_t *list, int list_len,
 		int *cycles_sum_out, int *cycles_last, int *last_cmd)
@@ -3005,11 +3775,31 @@ int do_cmd_list(uint32_t *list, int list_len,
 	uint32_t *list_start = list;
 	uint32_t *list_end = list + list_len;
 	const union PacketBuffer *pbuffer;
-	unsigned int i, len_polyline;
+	unsigned int i, len_polyline = 2;
+
+	if (DIRECT_GP0)
+		matrix_save();
 
 	for (; list < list_end; list += 1 + len)
 	{
 		cmd = *list >> 24;
+
+		if (!DIRECT_GP0 && likely((cmd & 0xe0) == 0x20)) {
+			/* Polygon: copy it and charge its GPU time; nothing
+			 * else in the loop below applies to GP0 20-3f. */
+			len = cmd_lengths[cmd];
+			if (unlikely(list + 1 + len > list_end)) {
+				cmd = -1;
+				break;
+			}
+			if (unlikely(pvr.cmdbuf_offt + len >= __array_size(cmdbuf)))
+				renderer_flush_queues();
+			cmdbuf_append(&cmdbuf[pvr.cmdbuf_offt], list, len + 1);
+			pvr.cmdbuf_offt += len + 1;
+			gput_sum(cpu_cycles_sum, cpu_cycles, poly_gput[(cmd >> 2) & 5]);
+			continue;
+		}
+
 		multicolor = cmd & 0x10;
 		multiple = cmd & 0x08;
 		textured = cmd & 0x04;
@@ -3032,16 +3822,20 @@ int do_cmd_list(uint32_t *list, int list_len,
 			break;
 		}
 
-		if (unlikely(pvr.cmdbuf_offt + len >= __array_size(cmdbuf))) {
-			/* No more space in command buffer?
-			 * Flush what we queued so far. */
-			renderer_flush_queues();
-		}
-
-		cmdbuf_append(&cmdbuf[pvr.cmdbuf_offt], list, len + 1);
-		pvr.cmdbuf_offt += len + 1;
-
 		pbuffer = (const union PacketBuffer *)list;
+
+		if (DIRECT_GP0 && !SNAP_NO_PVR) {
+			process_gpu_command(pbuffer, cmd, len_polyline, false);
+		} else {
+			if (unlikely(pvr.cmdbuf_offt + len >= __array_size(cmdbuf))) {
+				/* No more space in command buffer?
+				 * Flush what we queued so far. */
+				renderer_flush_queues();
+			}
+
+			cmdbuf_append(&cmdbuf[pvr.cmdbuf_offt], list, len + 1);
+			pvr.cmdbuf_offt += len + 1;
+		}
 
 		switch (cmd >> 5) {
 		case 0x0:
@@ -3126,6 +3920,9 @@ int do_cmd_list(uint32_t *list, int list_len,
 	}
 
 out:
+	if (DIRECT_GP0)
+		matrix_restore();
+
 	gpu.ex_regs[1] &= ~0x1ff;
 	gpu.ex_regs[1] |= pvr.new_gp1 & 0x1ff;
 
@@ -3329,9 +4126,15 @@ static void pvr_render_modifier_volumes(void)
  * renderer's own polygon matrix would overwrite a matrix the GTE still
  * believes is loaded -- so it is loaded around the rendering and the guest's
  * is put back afterwards, rather than left in place from `dc_vout_set_mode`. */
+/* Nested: GPUdmaChain() holds the renderer matrix over a whole chain
+ * (DIRECT_GP0 draws from do_cmd_list), and renderer_flush_queues() or
+ * do_cmd_list() inside it must not save the renderer's own matrix as the
+ * guest's. */
+static unsigned int matrix_depth;
+
 static void matrix_save(void)
 {
-	if (OPT_SH4_USE_MATRIX) {
+	if (OPT_SH4_USE_MATRIX && matrix_depth++ == 0) {
 		mat_store(&matrix_bak);
 		mat_load_default();
 	}
@@ -3339,8 +4142,20 @@ static void matrix_save(void)
 
 static void matrix_restore(void)
 {
-	if (OPT_SH4_USE_MATRIX)
+	if (OPT_SH4_USE_MATRIX && --matrix_depth == 0)
 		mat_load(&matrix_bak);
+}
+
+void renderer_batch_begin(void)
+{
+	if (DIRECT_GP0)
+		matrix_save();
+}
+
+void renderer_batch_end(void)
+{
+	if (DIRECT_GP0)
+		matrix_restore();
 }
 
 void hw_render_stop(void)

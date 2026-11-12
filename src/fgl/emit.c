@@ -3817,6 +3817,13 @@ static void emit_node(fgl_emitter *e, const ir_node *p)
 		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_EXIT_METER);
 		sh4_emit_mov_imm(&e->cg, 0, FGL_R_CYCLE);
 
+		if (p->sub) {
+			/* Load delay in a slot: the transfer already left the
+			 * target in the exit register (front.c, slot_load_exit). */
+			emit_const(e, p->imm, FGL_R_XFER);
+			sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_EXIT_FLAGS);
+			break;
+		}
 		sh4_emit_mov_imm(&e->cg, (int)p->imm, FGL_R_XFER);
 		sh4_emit_mov_l_store_gbr(&e->cg, (int)FGL_AT_EXIT_FLAGS);
 
@@ -3941,6 +3948,10 @@ uint32_t fgl_emit(fgl_emitter *e, const ir_node *ir, int n, const ir_alloc *a,
 				break;
 			}
 			if (ir[i].op == IR_CAPTURE)
+				break;
+			/* A block that hands C a flag must reach the
+			 * dispatcher (front.c, slot_load_exit). */
+			if (ir[i].op == IR_EXIT)
 				break;
 		}
 	}
